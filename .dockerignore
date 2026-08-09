@@ -1,0 +1,15 @@
+# Narrows the Docker build context. None of these enter the image anyway — the
+# Dockerfile copies at file/subdirectory level — so the only gain here is build
+# time and the amount of data sent to the daemon. `node_modules` matters most:
+# the host tree is full of pnpm symlinks whose targets do not exist in the image.
+node_modules
+**/node_modules
+dist
+**/dist
+.git
+.github
+*.md
+.DS_Store
+*.log
+*.kubeconfig
+kube-configs

@@ -1,0 +1,15 @@
+node_modules/
+dist/
+*.tsbuildinfo
+.env
+.env.*
+!.env.example
+.DS_Store
+*.log
+
+# Cluster credentials — these must NEVER enter the repository. A kubeconfig used
+# for local development carries the client certificate and key of a real
+# cluster, and a single `git add -A` would commit it. The rule lives here, not in
+# the developer's attention.
+kube-configs/
+*.kubeconfig

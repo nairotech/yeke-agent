@@ -1,0 +1,35 @@
+{
+  "name": "yeke-agent",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Cluster-side agent for YEKE: opens an outbound WebSocket tunnel to the control plane and applies requests to the local apiserver.",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/nairotech/yeke-agent.git"
+  },
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "packageManager": "pnpm@10.29.1",
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "start": "node dist/index.js",
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "tsx --test \"src/**/*.test.ts\""
+  },
+  "dependencies": {
+    "@nairotech/yeke-tunnel": "4.0.1",
+    "@kubernetes/client-node": "^1.4.0",
+    "undici": "^7.17.0",
+    "ws": "^8.21.1"
+  },
+  "devDependencies": {
+    "@types/node": "^24.10.1",
+    "@types/ws": "^8.18.1",
+    "tsx": "^4.20.6",
+    "typescript": "^5.9.3"
+  }
+}
