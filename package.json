@@ -21,7 +21,7 @@
     "test": "tsx --test \"src/**/*.test.ts\""
   },
   "dependencies": {
-    "@nairotech/yeke-tunnel": "4.0.1",
+    "@nairotech/yeke-tunnel": "4.1.0",
     "@kubernetes/client-node": "^1.4.0",
     "undici": "^7.17.0",
     "ws": "^8.21.1"
