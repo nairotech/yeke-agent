@@ -27,6 +27,11 @@
  * backpressure reaches all the way down to the kubelet and the data is not
  * moved into the agent's memory.
  */
+import { createHash, randomBytes } from "node:crypto";
+import { request as httpRequest } from "node:http";
+import type { IncomingMessage } from "node:http";
+import { request as httpsRequest } from "node:https";
+import type { Duplex } from "node:stream";
 import { WebSocket, type RawData } from "ws";
 import {
   CreditWindow,
@@ -71,6 +76,222 @@ export interface UpstreamStreamHooks {
 }
 
 /**
+ * RFC6455 token grameri — `ws@8`in bir alt-protokol adına dayattığı küme.
+ *
+ * `ws` istemcisi `protocols` argümanındaki her adı BUNA uyduruyor ve uymayanda
+ * ağa çıkmadan senkron `SyntaxError` atıyor. Exec'in `v5.channel.k8s.io`su bu
+ * sete girer; port-forward'ın `SPDY/3.1+portforward.k8s.io`su GİRMEZ — `/` bu
+ * kümede yok. Ayrım kaynak kind adına değil, adın kendisine bakılarak yapılıyor.
+ */
+const RFC6455_SUBPROTOCOL_TOKEN = /^[!#$%&'*+\-.0-9A-Z^_`|a-z~]+$/;
+
+/** WebSocket el sıkışmasının sabit sihirli dizesi (RFC6455 §1.3); accept doğrulaması bununla. */
+const WS_HANDSHAKE_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+
+/** `ws`in null-adresli (sunucu modu) kabuğunda elle dokunduğumuz iç alanlar. */
+interface WsClientInternals {
+  _isServer: boolean;
+  _bufferedAmount: number;
+  _redirects: number;
+  _protocol: string;
+  _req: unknown;
+  setSocket(
+    socket: Duplex,
+    head: Buffer,
+    options: {
+      allowSynchronousEvents: boolean;
+      generateMask?: (buffer: Buffer) => void;
+      maxBufferedChunks: number;
+      maxFragments: number;
+      maxPayload: number;
+      skipUTF8Validation: boolean;
+    },
+  ): void;
+}
+
+export interface StreamSocketOptions {
+  headers: Record<string, string | string[]>;
+  /** Agent'ın kendi TLS tipi (`./kube.js`) — core'daki `KubeTlsOptions`in ikizi; gövde bu farktan etkilenmiyor. */
+  tls: KubeTlsOptions;
+}
+
+/**
+ * apiserver'a akış WebSocket'i açar — subprotocol'de `/` VARSA el sıkışmayı elle
+ * yaparız.
+ *
+ * ─── Neden `new WebSocket(url, protocols)` doğrudan kullanılamıyor ───────────
+ *
+ * `ws@8` istemcisi önerilen her alt-protokolü `RFC6455_SUBPROTOCOL_TOKEN`e
+ * uyduruyor ve uymayanda AĞA ÇIKMADAN senkron `SyntaxError` atıyor. Port-forward'ın
+ * alt-protokolü `SPDY/3.1+portforward.k8s.io` (ölçüldü: `@nairotech/yeke-tunnel` →
+ * `K8S_PORTFORWARD_PROTOCOL_SPDY`) ve içindeki `/` o kümede yok. Sonuç:
+ * port-forward akışı doğrudan modda HİÇ kurulamıyordu; exec'in
+ * `v5.channel.k8s.io`sunda `/` olmadığı için exec çalışıyor, arıza yalnız
+ * port-forward'da görünüyordu.
+ *
+ * ─── Neden alt-protokolü header'a taşımak (Yaklaşım A) YETMEDİ (canlı ölçüm) ──
+ *
+ * `Sec-WebSocket-Protocol`ü `protocols` argümanı yerine header ile geçirmek
+ * denendi ve GERÇEK apiserver'a (k3s v1.31.5) karşı ölçüldü: apiserver seçtiği
+ * alt-protokolü 101'de YANKILIYOR, `ws` ise argüman boşken bu yankıyı
+ * "Server sent a subprotocol but none was requested" diye REDDEDİYOR. Token
+ * doğrulamasını atlatmak, ws'in İKİNCİ bir doğrulamasına takılıyordu — yani A
+ * ölü.
+ *
+ * ─── Yaklaşım B: el sıkışmayı biz sürüp soketi ws'e ADOPTE ederiz ────────────
+ *
+ * 101 yükseltmesini `http(s).request` ile elle sürüyoruz (token doğrulaması
+ * bizde YOK), `Sec-WebSocket-Accept`i doğruluyoruz, sonra ham soketi ws'in
+ * KENDİ `setSocket`ine veriyoruz — çerçeveleme, kapanış el sıkışması, ping/pong
+ * ve geri basınç yine ws'in (WS framing'i elle YAZMIYORUZ). Yalnızca el
+ * sıkışmanın alt-protokol doğrulamasını atlıyoruz.
+ *
+ * `new WebSocket(null)` ws'i "sunucu modunda" kurar; el sıkışmayı istemci olarak
+ * yaptığımız için `_isServer`ı false'a çeviriyoruz — yoksa ws giden çerçeveyi
+ * MASKELEMEZ ve apiserver maskesiz istemci çerçevesini RFC gereği reddeder.
+ *
+ * Adopte edilen ws, `new WebSocket(url, protocols)`in döndürdüğüyle AYNI olay
+ * yüzeyini taşır (`open`/`message`/`close`/`error`/`unexpected-response`,
+ * `pause`/`resume`, `send`, `close(code)`), böylece çağıran (`UpstreamStream`)
+ * iki yolu ayırt etmez.
+ *
+ * ─── Neden HER ZAMAN elle değil de KOŞULLU ───────────────────────────────────
+ *
+ * `ws`in doğrudan yolu exec için KANITLI ve canlı doğrulama yalnız port-forward
+ * için yapıldı. Az kanıtlı elle el sıkışmayı exec'in kritik yoluna da sokmak —
+ * canlı exec doğrulaması olmadan — daha büyük risk. İki dal da aynı ws olay
+ * yüzeyine çıktığı için çağıran bölünmüyor.
+ *
+ * **KÖKEN:** Bu yardımcı `apps/core/src/session/direct.ts`teki
+ * `openStreamSocket`in BİREBİR taşınmış hâli — orada core'un doğrudan modu için
+ * yazıldı ve GERÇEK k3s'e karşı ölçüldü. Agent aynı `ws@8` + aynı SPDY
+ * alt-protokolüyle aynı arızaya düştüğü için gövde değişmeden buraya taşındı;
+ * yalnız `tls` alanının tipi agent'ın kendi `KubeTlsOptions`ine uyarlandı (spread
+ * davranışı aynı). Karar belgesi: ana depoda
+ * `docs/architecture/2026-08-12-yeke-port-forward.md` §13.1.
+ */
+export function openStreamSocket(
+  url: string,
+  protocols: readonly string[],
+  options: StreamSocketOptions,
+): WebSocket {
+  const needsManualHandshake = protocols.some((p) => !RFC6455_SUBPROTOCOL_TOKEN.test(p));
+  if (!needsManualHandshake) {
+    // Kanıtlı yol: exec (`v5.channel.k8s.io`) buradan geçer, davranışı DEĞİŞMEZ.
+    return new WebSocket(url, [...protocols], { headers: options.headers, ...options.tls });
+  }
+
+  // `ws`i null-adresle "sunucu modu" kabuğu olarak kur; el sıkışmayı biz
+  // yapacağız. `autoPong`/`closeTimeout` null dalında OKUNUYOR ve ws@8.21'de
+  // vermek ZORUNLU (verilmezse `undefined.autoPong` patlar). `@types/ws@8.18`in
+  // `constructor(address: null)` aşırı yüklemesi bu üç argümanlı biçimi modellemiyor
+  // (WebSocketServer'ın kullandığı gerçek yol) — cast o boşluğu kapatıyor.
+  const WsShellCtor = WebSocket as unknown as new (
+    address: null,
+    protocols: undefined,
+    options: { autoPong: boolean; closeTimeout: number },
+  ) => WebSocket;
+  const socket = new WsShellCtor(null, undefined, { autoPong: true, closeTimeout: 30_000 });
+  const internal = socket as unknown as WsClientInternals;
+  // İstemci moduna zorla: maskeleme (`!_isServer`) ve kapanış çerçevesinin
+  // maskesi buna bağlı; `_bufferedAmount` setSocket'ten önce okunabilir.
+  internal._isServer = false;
+  internal._bufferedAmount = 0;
+  internal._redirects = 0;
+
+  const wsKey = randomBytes(16).toString("base64");
+  const expectedAccept = createHash("sha1").update(wsKey + WS_HANDSHAKE_GUID).digest("base64");
+  const parsed = new URL(url);
+  // Şema soru işareti bırakmasın: `wss:` → TLS'li `https.request`, `ws:` →
+  // düz `http.request`. Origin http olan bir apiserver (nadir) da doğru gitsin
+  // diye — "TLS'i düz porta uygulamak" tam da bu deponun "sessizce yanlış"
+  // sınıfı.
+  const secure = parsed.protocol === "wss:";
+  const requestFn = secure ? httpsRequest : httpRequest;
+  const req = requestFn({
+    protocol: secure ? "https:" : "http:",
+    hostname: parsed.hostname,
+    ...(parsed.port ? { port: parsed.port } : {}),
+    method: "GET",
+    path: `${parsed.pathname}${parsed.search}`,
+    headers: {
+      ...options.headers,
+      Connection: "Upgrade",
+      Upgrade: "websocket",
+      "Sec-WebSocket-Version": "13",
+      "Sec-WebSocket-Key": wsKey,
+      // Token doğrulaması BİZDE yok: `/` içeren adı olduğu gibi öneriyoruz.
+      "Sec-WebSocket-Protocol": protocols.join(","),
+    },
+    // TLS malzemesi yalnız `wss:`te anlamlı; `ws:`te göz ardı edilir.
+    ...(secure ? options.tls : {}),
+  });
+  // `close()`/`terminate()` CONNECTING durumunda `_req.abort()` çağırır: bekleyen
+  // isteği (ör. iptal sinyali) temizleyebilmek için referansı ws'e veriyoruz.
+  internal._req = req;
+
+  req.on("upgrade", (res: IncomingMessage, rawSocket: Duplex, head: Buffer) => {
+    // Kullanıcı el sıkışma sırasında kapattıysa (readyState CONNECTING değilse)
+    // soketi bırak — ws bu kolu kendi istemci yolunda da böyle karşılıyor.
+    if (socket.readyState !== WebSocket.CONNECTING) {
+      rawSocket.destroy();
+      return;
+    }
+    internal._req = null;
+    const upgradeHeader = res.headers.upgrade;
+    if (!upgradeHeader || upgradeHeader.toLowerCase() !== "websocket") {
+      abortManualHandshake(socket, rawSocket, "Invalid Upgrade header");
+      return;
+    }
+    if (res.headers["sec-websocket-accept"] !== expectedAccept) {
+      abortManualHandshake(socket, rawSocket, "Invalid Sec-WebSocket-Accept header");
+      return;
+    }
+    // Sunucunun seçtiği alt-protokolü ws'in `protocol` getter'ına yaz; agent'ın
+    // "open" kolundaki ikinci kapı (sürümsüz kanala düşmüş akışı açık saymama)
+    // bu değeri okuyor.
+    const serverProtocol = res.headers["sec-websocket-protocol"];
+    if (typeof serverProtocol === "string") internal._protocol = serverProtocol;
+    // Ham soketi ws'e devret: bundan sonrası (framing, close, ping/pong, geri
+    // basınç) tamamen ws'in — `setSocket` 'open'ı da kendisi yayar.
+    internal.setSocket(rawSocket, head, {
+      allowSynchronousEvents: true,
+      maxBufferedChunks: 256 * 1024,
+      maxFragments: 16 * 1024,
+      maxPayload: 100 * 1024 * 1024,
+      skipUTF8Validation: false,
+    });
+  });
+
+  // 101 OLMAYAN yanıt (ör. protokol bilinmiyorsa 403 + boş gövde): node bunu
+  // `response` olarak yayar (upgrade dinleyicisi varken 101 `upgrade`e gider).
+  // `UpstreamStream` bunu `unexpected-response` diye dinliyor ve gövdeye göre
+  // sınıflandırıyor — o olayı BİREBİR yayınlıyoruz.
+  req.on("response", (res: IncomingMessage) => {
+    socket.emit("unexpected-response", req, res);
+  });
+
+  // Ağ/TLS hatası: `err`i node üretir (tam da eski yolda olduğu gibi),
+  // `UpstreamStream`in `error` dinleyicisi bunu buradan çıkarıyor — kol korunuyor.
+  req.on("error", (err: Error) => {
+    socket.emit("error", err);
+  });
+
+  req.end();
+  return socket;
+}
+
+/**
+ * Elle el sıkışmanın başarısız kolu — ws'in kendi `abortHandshake`ının sade
+ * karşılığı: soketi kopar, `error` yay ki `UpstreamStream`ın `error`
+ * dinleyicisi çözülsün.
+ */
+function abortManualHandshake(socket: WebSocket, rawSocket: Duplex, message: string): void {
+  rawSocket.destroy();
+  socket.emit("error", new Error(message));
+}
+
+/**
  * The apiserver end of one stream.
  *
  * The class itself does not know the tunnel protocol (it sends no messages); it
@@ -91,9 +312,17 @@ export class UpstreamStream {
 
   constructor(options: UpstreamStreamOptions, hooks: UpstreamStreamHooks) {
     this.#hooks = hooks;
-    this.#socket = new WebSocket(options.url, options.protocols, {
+    // `ws@8` port-forward'ın `SPDY/3.1+portforward.k8s.io` alt-protokolünü (`/`
+    // içeriyor) RFC6455 token gramerine göre reddedip senkron throw ediyor;
+    // `openStreamSocket` yalnız BU durumda devreye giren koşullu bypass (elle WS
+    // upgrade + ham soketi ws'e `setSocket` ile adopte etme). exec'in
+    // `v5.channel.k8s.io`su token grameri içinde kaldığı için doğrudan `ws`
+    // yolunda kalır — davranış değişmiyor. Core'daki `direct.ts`in
+    // `openStreamSocket`iyle AYNI yardımcı (karar belgesi: ana depoda
+    // `docs/architecture/2026-08-12-yeke-port-forward.md` §13.1).
+    this.#socket = openStreamSocket(options.url, options.protocols, {
       headers: options.headers,
-      ...options.tls,
+      tls: options.tls,
     });
 
     // ─── `403` means TWO different things (measured) ────────────────────────
