@@ -12,8 +12,8 @@ importers:
         specifier: ^1.4.0
         version: 1.4.0
       '@nairotech/yeke-tunnel':
-        specifier: 4.0.1
-        version: 4.0.1
+        specifier: 4.1.0
+        version: 4.1.0
       undici:
         specifier: ^7.17.0
         version: 7.29.0
@@ -207,8 +207,8 @@ packages:
   '@kubernetes/client-node@1.4.0':
     resolution: {integrity: sha512-Zge3YvF7DJi264dU1b3wb/GmzR99JhUpqTvp+VGHfwZT+g7EOOYNScDJNZwXy9cszyIGPIs0VHr+kk8e95qqrA==}
 
-  '@nairotech/yeke-tunnel@4.0.1':
-    resolution: {integrity: sha512-HljObVyeWxUE4c3qpkF4MF4Z7MkQF9mCUSjSnyNOMUsml/2SsG0qGcHkf1UQ/0kPvMXW9O5U3UURQ8wrDgsV+g==}
+  '@nairotech/yeke-tunnel@4.1.0':
+    resolution: {integrity: sha512-MTY6zjGgBtzuPJ2ZYQJFLAzcUY1TDQDw+Blnh8YaIscDBusVYIug2YdYcz/aHd6N+OvAqPzyyTjCdVe9/es98A==}
 
   '@types/js-yaml@4.0.9':
     resolution: {integrity: sha512-k4MGaQl5TGo/iipqb2UDG2UwjXziSWkh0uysQelTlJpX1qGlpUZYm8PnO4DxG1qBomtJUdYJ6qR6xdIah10JLg==}
@@ -629,7 +629,7 @@ snapshots:
       - supports-color
       - utf-8-validate
 
-  '@nairotech/yeke-tunnel@4.0.1':
+  '@nairotech/yeke-tunnel@4.1.0':
     dependencies:
       zod: 4.4.3
 
