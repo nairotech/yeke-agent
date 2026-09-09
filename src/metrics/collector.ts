@@ -52,7 +52,7 @@ import {
   resolveOwner,
 } from "./owners.js";
 import { DEFAULT_RING_CAPACITY, SampleRing } from "./ring.js";
-import { type SummaryDocument, readSummary } from "./summary.js";
+import { type SummaryDocument, mergePvcReadings, readSummary } from "./summary.js";
 import {
   type Entity,
   type FrameLayout,
@@ -401,14 +401,21 @@ export class Collector {
     // never shrink, which on a busy cluster is a leak with a slow fuse.
     this.#rates.retain(liveRateKeys);
 
-    this.#entitiesLastFrame = entities.length;
-    this.#samplesLastFrame = samples.length;
+    // An RWX claim is mounted on several NODES at once, so it arrives once per
+    // node in the lists just concatenated. `readSummary` already merged the
+    // within-node duplicates; this second pass is the cross-node one, and it is
+    // the same idempotent function rather than a second rule that could drift
+    // from the first (`summary.ts`, `mergePvcReadings`).
+    const merged = mergePvcReadings(entities, samples);
+
+    this.#entitiesLastFrame = merged.entities.length;
+    this.#samplesLastFrame = merged.samples.length;
     this.#seq += 1;
     const frame = packFrame({
       seq: this.#seq,
       capturedAt,
-      entities,
-      samples,
+      entities: merged.entities,
+      samples: merged.samples,
       nodes: nodeStates,
       previous: this.#lastLayout,
       apiserverForbidden: this.#apiserverForbiddenResources().length > 0,
@@ -462,6 +469,15 @@ export class Collector {
           // The denominators come from the node object, not from the wire (K3).
           attributes: { ...entity.attributes, ...(nodeRecord?.attributes ?? {}) },
         });
+        continue;
+      }
+      // A PVC is namespaced too, and it must NOT enter this index: cAdvisor
+      // labels its series with `namespace` + `pod`, so a claim that happens to
+      // be named like a pod in the same namespace would hand the pod's disk
+      // counters to a volume. It also gets no owner walk — a claim has no uid
+      // in the Summary, and it is not a subordinate of a workload (`summary.ts`).
+      if (entity.kind === "pvc") {
+        entities.push(entity);
         continue;
       }
       if (entity.namespace) podIdByName.set(`${entity.namespace}/${entity.name}`, entity.id);

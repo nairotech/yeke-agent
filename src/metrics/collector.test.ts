@@ -21,6 +21,7 @@ import { Agent } from "undici";
 import { Collector, MIN_CORE_PROTOCOL_FOR_METRICS, shouldCollect } from "./collector.js";
 import {
   type FixturePod,
+  type SummaryFixtureOptions,
   type TlsFixture,
   cadvisorFixture,
   createTlsFixture,
@@ -117,9 +118,18 @@ interface FakeNode {
   close(): Promise<void>;
 }
 
+/** The PVC knobs the fixture takes, threaded through a fake node unchanged. */
+type PvcOptions = Pick<SummaryFixtureOptions, "pvcEvery" | "sharedPvc">;
+
 async function fakeKubeletNode(
   name: string,
-  options: { cert: Buffer; key: Buffer; pods: number; rogue?: boolean; status?: number },
+  options: {
+    cert: Buffer;
+    key: Buffer;
+    pods: number;
+    rogue?: boolean;
+    status?: number;
+  } & PvcOptions,
 ): Promise<FakeNode> {
   const pods = fixturePods(name, options.pods);
   const state = { tick: 0, io: "normal" as "normal" | "zero", psiIo: 0.1 };
@@ -141,6 +151,8 @@ async function fakeKubeletNode(
             periodMs: PERIOD_MS,
             startMs: START_MS,
             psiIo: state.psiIo,
+            ...(options.pvcEvery === undefined ? {} : { pvcEvery: options.pvcEvery }),
+            ...(options.sharedPvc === undefined ? {} : { sharedPvc: options.sharedPvc }),
           }),
         ),
       );
@@ -210,13 +222,17 @@ function valueOf(frame: InternalFrame, entity: string, metric: MetricName): numb
   return frameValue(frame, entity, metric);
 }
 
-async function harness(options: { pods?: number; rogue?: boolean; status?: number } = {}) {
+async function harness(
+  options: { pods?: number; rogue?: boolean; status?: number } & PvcOptions = {},
+) {
   const fixture = await tls();
   const node = await fakeKubeletNode("node-a", {
     cert: options.rogue ? fixture.rogueCert : fixture.serverCert,
     key: options.rogue ? fixture.rogueKey : fixture.serverKey,
     pods: options.pods ?? 3,
     ...(options.status === undefined ? {} : { status: options.status }),
+    ...(options.pvcEvery === undefined ? {} : { pvcEvery: options.pvcEvery }),
+    ...(options.sharedPvc === undefined ? {} : { sharedPvc: options.sharedPvc }),
   });
   const kubelet = new KubeletClient({
     token: { read: async () => "tok", invalidate: () => undefined },
@@ -613,6 +629,117 @@ test("rate memory does not grow with pod churn", async () => {
     assert.equal(after, before);
   } finally {
     await h.close();
+  }
+});
+
+test("one tick produces PVC entities from the pods' `volume[]`", async () => {
+  const h = await harness({ pods: 3, pvcEvery: 3 });
+  try {
+    const frame = await h.advance();
+    assert.ok(frame);
+    const pvcs = entitiesOf(frame).filter((entity) => entity.kind === "pvc");
+    assert.deepEqual(
+      pvcs.map((entity) => entity.id),
+      ["pvc/kube-system/veri-node-a-0"],
+    );
+    assert.equal(pvcs[0]?.node, "node-a");
+    assert.equal(pvcs[0]?.attributes["fs.capacity"], Math.fround(10_737_418_240));
+    assert.equal(valueOf(frame, "pvc/kube-system/veri-node-a-0", "fs.used"), Math.fround(1_073_741_824));
+  } finally {
+    await h.close();
+  }
+});
+
+test("a claim named like a pod does not steal that pod's cAdvisor counters", async () => {
+  // The cAdvisor text names a series by `namespace` + `pod`, and the collector
+  // resolves that pair to an entity id through an index built from the
+  // Summary's entities. A PVC is namespaced too, so a claim called exactly what
+  // a pod is called would land in that index and take the pod's disk counters
+  // with it. The fixture's pod 0 is `kube-system-app-0-node-a`; the claim below
+  // is given the SAME name in the SAME namespace, and it is mounted by every
+  // pod, so it is read AFTER pod 0 — which is the order that would overwrite.
+  const h = await harness({
+    pods: 3,
+    sharedPvc: { name: "kube-system-app-0-node-a", namespace: "kube-system", usedBytes: 8_192 },
+  });
+  try {
+    await h.advance();
+    const frame = await h.advance();
+    assert.ok(frame);
+    const pod = `pod/${h.node.pods[0]?.uid}`;
+    const pvc = "pvc/kube-system/kube-system-app-0-node-a";
+    assert.ok(entitiesOf(frame).some((entity) => entity.id === pvc), "the claim is missing");
+    // The pod kept its own IO rate...
+    assert.ok(
+      (valueOf(frame, pod, "io.readBps") ?? Number.NaN) > 0,
+      "the pod's disk counters went somewhere else",
+    );
+    // ...and the claim was given none: `io.readBps` is not a PVC metric.
+    assert.equal(valueOf(frame, pvc, "io.readBps"), undefined);
+    assert.equal(valueOf(frame, pvc, "fs.used"), 8_192);
+  } finally {
+    await h.close();
+  }
+});
+
+test("an RWX claim mounted on TWO nodes is one entity, and the higher reading wins", async () => {
+  const fixture = await tls();
+  const shared = { name: "paylasilan", namespace: "ornek" } as const;
+  const first = await fakeKubeletNode("node-a", {
+    cert: fixture.serverCert,
+    key: fixture.serverKey,
+    pods: 2,
+    // Only THIS node reports a capacity: the merge must keep a denominator one
+    // kubelet knows even when the other does not.
+    sharedPvc: { ...shared, usedBytes: 8_192, capacityBytes: 65_536 },
+  });
+  const second = await fakeKubeletNode("node-b", {
+    cert: fixture.serverCert,
+    key: fixture.serverKey,
+    pods: 2,
+    sharedPvc: { ...shared, usedBytes: 12_288 },
+  });
+  const kubelet = new KubeletClient({
+    token: { read: async () => "tok", invalidate: () => undefined },
+    ca: fixture.ca,
+    insecureTls: false,
+  });
+  const sink = new RecordingSink();
+  const collector = new Collector({
+    target: NO_APISERVER,
+    kubelet,
+    sink,
+    periodMs: PERIOD_MS,
+    now: () => START_MS,
+  });
+  for (const node of [first, second]) {
+    collector.seedNode({
+      name: node.name,
+      address: "127.0.0.1",
+      port: node.port,
+      ready: true,
+      attributes: {},
+    });
+  }
+
+  try {
+    const frame = await collector.tick();
+    assert.ok(frame);
+    const rows = entitiesOf(frame).filter((entity) => entity.id === "pvc/ornek/paylasilan");
+    assert.equal(rows.length, 1, "one claim produced one row per NODE");
+    assert.equal(rows[0]?.attributes["fs.capacity"], 65_536);
+    const used = samplesOf(frame).filter(
+      (sample) => sample.entity === "pvc/ornek/paylasilan" && sample.metric === "fs.used",
+    );
+    assert.equal(used.length, 1, "the same volume's bytes were sent twice");
+    // 12 288, not 8 192 and not 20 480: the mounts see one filesystem, so the
+    // reading is neither the first one nor their sum.
+    assert.equal(used[0]?.value, 12_288);
+  } finally {
+    await collector.stop();
+    await kubelet.close();
+    await first.close();
+    await second.close();
   }
 });
 

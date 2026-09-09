@@ -241,6 +241,42 @@ test("the first frame declares the whole dictionary and the next declares nothin
   assert.deepEqual(second.entityIds, first.entityIds);
 });
 
+test("a PVC reaches the wire as a `pvc` record: namespace, denominators, no owner", () => {
+  const node = nodeEntity("node-a");
+  const pvc: Entity = {
+    id: "pvc/ornek/veri",
+    kind: "pvc",
+    name: "veri",
+    namespace: "ornek",
+    node: "node-a",
+    attributes: { "fs.capacity": 10_737_418_240, "fs.inodes": 655_360 },
+  };
+  const encoder = new SampleEncoder();
+  const decoded = decodeAll(
+    encoder.encode([
+      internalFrame({
+        capturedAt: START_MS,
+        entities: [node, pvc],
+        values: [[pvc, "fs.used", 1_073_741_824]],
+      }),
+    ]),
+  )[0]!;
+
+  const declared = decoded.entities.added.find((entry) => entry.kind === "pvc")!;
+  assert.deepEqual(declared, {
+    id: declared.id,
+    kind: "pvc",
+    name: "veri",
+    namespace: "ornek",
+    node: "node-a",
+    attrs: { "fs.capacity": 10_737_418_240, "fs.inodes": 655_360 },
+  });
+  // No `uid` (the Summary has none for a claim) and no `owner`: a PVC is not a
+  // subordinate of the workload that mounts it. `deepEqual` above is what
+  // measures both absences — an extra key would fail it.
+  assert.equal(cell(decoded, declared.id, 0, "fs.used"), Math.fround(1_073_741_824));
+});
+
 test("a pod that left is removed once, and a new one takes the next alias", () => {
   const node = nodeEntity("node-a");
   const first = podEntity("uid-1", "web-1");

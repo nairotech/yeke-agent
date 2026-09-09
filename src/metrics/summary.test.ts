@@ -174,3 +174,146 @@ test("a pod with no uid is skipped rather than keyed by name", () => {
     ["pod/u-1"],
   );
 });
+
+/* ─── PVC: the `volume[]` entries with a claim behind them ─────────────────── */
+
+test("a `volume[]` entry becomes a PVC entity ONLY when it carries a `pvcRef`", () => {
+  // The default fixture gives every pod two volumes with no claim (a projected
+  // token and an emptyDir) and `pvcEvery: 3` adds a claim to pod 0 alone. So
+  // this one document contains both halves of the rule.
+  const { reading } = readTick(new CounterRates(), 0, { pvcEvery: 3 });
+  const pvcs = reading.entities.filter((entity) => entity.kind === "pvc");
+  assert.deepEqual(
+    pvcs.map((entity) => entity.id),
+    ["pvc/kube-system/veri-node-a-0"],
+    "the claim-less volumes produced an entity, or the claim did not",
+  );
+  assert.equal(pvcs[0]?.name, "veri-node-a-0");
+  assert.equal(pvcs[0]?.namespace, "kube-system");
+  assert.equal(pvcs[0]?.node, "node-a");
+
+  // The claim-less volumes carry 999 999 999 used bytes. If any reader ever
+  // counted them, the number would be unmistakable — so assert on the VALUE,
+  // not only on the entity count.
+  const used = valueOf(reading.samples, "pvc/kube-system/veri-node-a-0", "fs.used");
+  assert.equal(used, Math.fround(1_073_741_824));
+  assert.equal(
+    reading.samples.some((sample) => sample.value === Math.fround(999_999_999)),
+    false,
+    "a volume with no claim reached the samples",
+  );
+});
+
+test("a PVC's capacity and total inodes are ATTRIBUTES; used bytes and used inodes are series", () => {
+  const { reading } = readTick(new CounterRates(), 0, { pvcEvery: 3 });
+  const pvc = reading.entities.find((entity) => entity.kind === "pvc");
+  assert.equal(pvc?.attributes["fs.capacity"], Math.fround(10_737_418_240));
+  assert.equal(pvc?.attributes["fs.inodes"], Math.fround(655_360));
+  assert.equal(valueOf(reading.samples, pvc!.id, "fs.inodesUsed"), 12_000);
+  // K3's denominator rule, measured on this entity kind too: a capacity that
+  // also travelled as a series would be sent 2880 times a day unchanged. The
+  // claim's series are exactly two, and neither of them is a denominator.
+  assert.deepEqual(
+    reading.samples.filter((sample) => sample.entity === pvc!.id).map((sample) => sample.metric),
+    ["fs.used", "fs.inodesUsed"],
+  );
+});
+
+test("a PVC has no uid and no owner — it is not a subordinate of the pod that mounts it", () => {
+  const { reading } = readTick(new CounterRates(), 0, { pvcEvery: 3 });
+  const pvc = reading.entities.find((entity) => entity.kind === "pvc");
+  assert.equal(pvc?.uid, undefined);
+  assert.equal(pvc?.owner, undefined);
+});
+
+test("a driver that reports no capacity produces NO attribute — the ratio simply never exists", () => {
+  const { reading } = readTick(new CounterRates(), 0, {
+    sharedPvc: { name: "ham", namespace: "ornek", usedBytes: 4_096 },
+  });
+  const pvc = reading.entities.find((entity) => entity.id === "pvc/ornek/ham");
+  assert.equal(pvc?.attributes["fs.capacity"], undefined);
+  assert.equal(pvc?.attributes["fs.inodes"], undefined);
+  // The used bytes still arrive: half a reading is better than none, and the
+  // half that is missing is missing rather than guessed.
+  assert.equal(valueOf(reading.samples, "pvc/ornek/ham", "fs.used"), 4_096);
+  assert.equal(valueOf(reading.samples, "pvc/ornek/ham", "fs.inodesUsed"), undefined);
+});
+
+test("one claim mounted by three pods on one node is ONE entity, counted once", () => {
+  const { reading } = readTick(new CounterRates(), 0, {
+    sharedPvc: { name: "paylasilan", namespace: "ornek", usedBytes: 8_192, capacityBytes: 65_536 },
+  });
+  const shared = reading.entities.filter((entity) => entity.id === "pvc/ornek/paylasilan");
+  assert.equal(shared.length, 1, "an RWX claim produced one row per mount");
+  const samples = reading.samples.filter(
+    (sample) => sample.entity === "pvc/ornek/paylasilan" && sample.metric === "fs.used",
+  );
+  assert.equal(samples.length, 1, "the same volume's bytes were reported three times");
+  // Not summed: three mounts of one filesystem are 8 KiB, not 24 KiB.
+  assert.equal(samples[0]?.value, 8_192);
+});
+
+test("two readings of one claim: the HIGHER wins, and a `NO READING` never does", () => {
+  // Hand-built rather than generated: the fixture reports the same number for
+  // every mount (which is what a real RWX volume does), and this test is about
+  // what happens when they DIFFER — a mount measured a moment later, or a
+  // driver with a per-mount view.
+  const reading = readSummary(
+    {
+      node: { nodeName: "node-a" },
+      pods: [
+        {
+          podRef: { name: "a", namespace: "ornek", uid: "u-a" },
+          volume: [{ name: "v", usedBytes: 100, capacityBytes: 1000, pvcRef: { name: "p", namespace: "ornek" } }],
+        },
+        {
+          podRef: { name: "b", namespace: "ornek", uid: "u-b" },
+          volume: [{ name: "v", usedBytes: 140, pvcRef: { name: "p", namespace: "ornek" } }],
+        },
+        {
+          podRef: { name: "c", namespace: "ornek", uid: "u-c" },
+          volume: [{ name: "v", pvcRef: { name: "p", namespace: "ornek" } }],
+        },
+      ],
+    },
+    { readAt: START_MS, rates: new CounterRates() },
+  );
+  assert.equal(valueOf(reading.samples, "pvc/ornek/p", "fs.used"), 140);
+  // The capacity came from the FIRST mount and survived the two that did not
+  // report one: a denominator one kubelet knows is not lost to one that does not.
+  const pvc = reading.entities.find((entity) => entity.id === "pvc/ornek/p");
+  assert.equal(pvc?.attributes["fs.capacity"], 1000);
+});
+
+test("a claim's namespace falls back to the pod's when the kubelet omits it", () => {
+  // Not a guess: a pod can only reference a claim in its own namespace.
+  const reading = readSummary(
+    {
+      node: { nodeName: "node-a" },
+      pods: [
+        {
+          podRef: { name: "a", namespace: "izleme", uid: "u-a" },
+          volume: [{ name: "v", usedBytes: 5, pvcRef: { name: "yalin" } }],
+        },
+      ],
+    },
+    { readAt: START_MS, rates: new CounterRates() },
+  );
+  assert.ok(reading.entities.some((entity) => entity.id === "pvc/izleme/yalin"));
+});
+
+test("a `pvcRef` with no name is skipped — there is no key to file it under", () => {
+  const reading = readSummary(
+    {
+      node: { nodeName: "node-a" },
+      pods: [
+        {
+          podRef: { name: "a", namespace: "ornek", uid: "u-a" },
+          volume: [{ name: "v", usedBytes: 5, pvcRef: { namespace: "ornek" } }],
+        },
+      ],
+    },
+    { readAt: START_MS, rates: new CounterRates() },
+  );
+  assert.deepEqual(reading.entities.filter((entity) => entity.kind === "pvc"), []);
+});

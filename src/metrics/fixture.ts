@@ -13,7 +13,8 @@
  *
  * What is defended: every field name below is written to match
  * `k8s.io/kubelet/pkg/apis/stats/v1alpha1` exactly, including
- * `ephemeral-storage`, `process_stats`, `curproc` and `usageNanoCores`. A typo
+ * `ephemeral-storage`, `process_stats`, `curproc`, `usageNanoCores` and the
+ * `volume[]` block's `pvcRef` / `capacityBytes` / `inodesUsed`. A typo
  * here would produce a fixture that a broken reader passes, which is worse than
  * no fixture — so the generator and the reader are deliberately NOT written
  * against a shared type alias for the field names: the reader declares its own
@@ -60,6 +61,34 @@ export interface SummaryFixtureOptions {
   readonly psi?: boolean;
   /** `psi.io` `some.avg60` for the node; the IO zero probe reads it. */
   readonly psiIo?: number;
+  /**
+   * How often a pod mounts a claim of its own: pod index `% pvcEvery === 0`.
+   *
+   * Zero (the default) produces no PVC-backed volumes at all — the pods still
+   * carry the volumes a real kubelet always reports (a projected token, an
+   * emptyDir), which is what makes "an entry without a `pvcRef` produces no
+   * entity" a property of the DEFAULT fixture rather than of one test.
+   *
+   * The claim's name carries the node, so 50 nodes do not all report the same
+   * four claims: at 30 pods and `pvcEvery: 8` a node mounts four, which is the
+   * 200 claims of the roof document's target scale.
+   */
+  readonly pvcEvery?: number;
+  /**
+   * One claim mounted by EVERY pod in this document — the RWX case.
+   *
+   * Two pods on this node give the within-node duplicate; the same claim in
+   * two nodes' documents gives the cross-node one. `capacityBytes` is optional
+   * on purpose: some CSI drivers report only `usedBytes`, and a fixture that
+   * always carried a denominator could not produce the row that has none.
+   */
+  readonly sharedPvc?: {
+    readonly name: string;
+    readonly namespace: string;
+    readonly usedBytes: number;
+    readonly capacityBytes?: number;
+    readonly inodesUsed?: number;
+  };
 }
 
 function stamp(ms: number): string {
@@ -89,8 +118,49 @@ export function summaryFixture(options: SummaryFixtureOptions): unknown {
   const withPsi = (some: number): Record<string, unknown> =>
     psi ? { psi: psiBlock(some) } : {};
 
+  /**
+   * A pod's `volume[]`, in the upstream shape.
+   *
+   * The two entries that are ALWAYS there carry no `pvcRef` and a deliberately
+   * absurd `usedBytes` (999 999 999 — the same trick the loopback interface
+   * uses above): if a reader ever counted them, the number would be
+   * unmistakable rather than plausible.
+   */
+  const volumesFor = (index: number, podNamespace: string): Record<string, unknown>[] => {
+    const fs = (used: number, capacity?: number, inodesUsed?: number) => ({
+      time,
+      ...(capacity === undefined ? {} : { availableBytes: capacity - used, capacityBytes: capacity }),
+      usedBytes: used,
+      ...(inodesUsed === undefined ? {} : { inodesFree: 655_360 - inodesUsed, inodes: 655_360, inodesUsed }),
+    });
+    const list: Record<string, unknown>[] = [
+      // The projected service account token: every pod has one.
+      { name: "kube-api-access-4xq7z", ...fs(999_999_999, 21_474_836_480, 9) },
+      // An emptyDir: a volume with statistics and no claim behind it.
+      { name: "tmp", ...fs(999_999_999, 21_474_836_480, 3) },
+    ];
+    const every = options.pvcEvery ?? 0;
+    if (every > 0 && index % every === 0) {
+      list.push({
+        name: "veri",
+        ...fs(1_073_741_824 + index * 67_108_864 + options.tick * 1_048_576, 10_737_418_240, 12_000 + index * 100),
+        pvcRef: { name: `veri-${options.node}-${index}`, namespace: podNamespace },
+      });
+    }
+    const shared = options.sharedPvc;
+    if (shared) {
+      list.push({
+        name: "paylasilan",
+        ...fs(shared.usedBytes, shared.capacityBytes, shared.inodesUsed),
+        pvcRef: { name: shared.name, namespace: shared.namespace },
+      });
+    }
+    return list;
+  };
+
   const pods = options.pods.map((pod, index) => ({
     podRef: { name: pod.name, namespace: pod.namespace, uid: pod.uid },
+    volume: volumesFor(index, pod.namespace),
     startTime: stamp(startMs - 3_600_000),
     cpu: {
       time,
