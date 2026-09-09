@@ -29,7 +29,7 @@ import {
   opensslAvailable,
   summaryFixture,
 } from "./fixture.js";
-import { KubeletClient } from "./kubelet-client.js";
+import { KubeletClient, type KubeletReader, type KubeletResult, type KubeletTarget } from "./kubelet-client.js";
 import {
   type InternalFrame,
   type MetricName,
@@ -38,6 +38,7 @@ import {
   frameValue,
   samplesOf,
 } from "./types.js";
+import type { NodeRecord } from "./owners.js";
 import type { KubeTarget } from "../kube.js";
 
 const PERIOD_MS = 30_000;
@@ -745,4 +746,312 @@ test("an RWX claim mounted on TWO nodes is one entity, and the higher reading wi
 
 test("the TLS material is cleaned up", async () => {
   if (cached) await rm(cached.directory, { recursive: true, force: true });
+});
+
+/**
+ * ─── The morning the collector went silent (09.09.2026) ─────────────────────
+ *
+ * These are the gates for the failure described in `collector.ts`'s header: a
+ * healthy pod, zero restarts, an empty log and no samples for eleven minutes.
+ * Each one fails against the code as it was that morning, and each one is about
+ * a rule rather than about the particular way it broke.
+ *
+ * They use a `KubeletReader` stub instead of the TLS fixture on purpose. The
+ * three things the collector has to survive — a busy wire, a read that throws,
+ * a read that never settles — cannot be produced through a real socket, because
+ * `KubeletClient` gives every socket a ceiling and turns all of them into
+ * `unreachable`.
+ */
+const STUB_NODE: NodeRecord = {
+  name: "node-a",
+  uid: "node-uid-a",
+  address: "10.0.0.1",
+  ready: true,
+  attributes: { "cpu.allocatable": 4 },
+};
+
+/** A kubelet that answers, hangs or throws, on command and without a network. */
+class StubKubelet implements KubeletReader {
+  mode: "ok" | "throw" | "hang" = "ok";
+  reads = 0;
+  async summary<T>(): Promise<KubeletResult<T>> {
+    this.reads += 1;
+    if (this.mode === "throw") throw new Error("the kubelet answered something unreadable");
+    if (this.mode === "hang") return new Promise<KubeletResult<T>>(() => undefined);
+    return {
+      state: "ok",
+      value: {
+        node: {
+          nodeName: "node-a",
+          cpu: { time: "2026-09-09T00:00:00Z", usageNanoCores: 1_000_000 },
+          memory: { time: "2026-09-09T00:00:00Z", workingSetBytes: 1024 },
+        },
+        pods: [],
+      } as T,
+    };
+  }
+  async cadvisor<T>(
+    _target: KubeletTarget,
+    consume: (lines: AsyncIterable<string>) => Promise<T>,
+  ): Promise<KubeletResult<T>> {
+    async function* nothing(): AsyncIterable<string> {}
+    return { state: "ok", value: await consume(nothing()) };
+  }
+}
+
+function stubHarness(options: { sink?: SampleSink; livenessMs?: number } = {}) {
+  const kubelet = new StubKubelet();
+  const sink = options.sink ?? new RecordingSink();
+  let clock = START_MS;
+  const collector = new Collector({
+    target: NO_APISERVER,
+    kubelet,
+    sink,
+    periodMs: PERIOD_MS,
+    now: () => clock,
+    ...(options.livenessMs === undefined ? {} : { livenessMs: options.livenessMs }),
+  });
+  collector.seedNode(STUB_NODE);
+  return {
+    kubelet,
+    collector,
+    sink,
+    advance(periods = 1): void {
+      clock += periods * PERIOD_MS;
+    },
+    async tick(): Promise<InternalFrame | undefined> {
+      const frame = await collector.tick();
+      clock += PERIOD_MS;
+      return frame;
+    },
+  };
+}
+
+/** Captures both streams for one act, and always puts them back. */
+async function captured(act: () => Promise<void>): Promise<{ warn: string[]; log: string[] }> {
+  const warn: string[] = [];
+  const log: string[] = [];
+  const originalWarn = console.warn;
+  const originalLog = console.log;
+  console.warn = (...args: unknown[]) => void warn.push(args.join(" "));
+  console.log = (...args: unknown[]) => void log.push(args.join(" "));
+  try {
+    await act();
+  } finally {
+    console.warn = originalWarn;
+    console.log = originalLog;
+  }
+  return { warn, log };
+}
+
+test("a control plane that keeps a request open must not silence the collector", async () => {
+  const h = stubHarness();
+  const sink = h.sink as RecordingSink;
+  try {
+    // This is the production case, not a contrived one: the control plane holds
+    // long-lived apiserver WATCHES open through the tunnel (CRDs and
+    // APIServices are in the agent's own ClusterRole for it), so `busy` is true
+    // for minutes at a time. Under the rule as it was, every one of those
+    // minutes produced nothing.
+    sink.busy = true;
+    for (let round = 0; round < 6; round += 1) await h.tick();
+
+    assert.ok(
+      sink.frames.length >= 4,
+      `a permanently busy wire kept ${6 - sink.frames.length} of 6 frames off the wire`,
+    );
+    // Nothing is lost either: what the ring held went out in order.
+    assert.deepEqual(
+      sink.frames.map((frame) => frame.seq),
+      sink.frames.map((_, index) => index + 1),
+    );
+    assert.equal(h.collector.stats().droppedTotal, 0);
+  } finally {
+    await h.collector.stop();
+  }
+});
+
+test("K5's priority rule still costs the sample frame a tick", async () => {
+  const h = stubHarness();
+  const sink = h.sink as RecordingSink;
+  try {
+    sink.busy = true;
+    await h.tick();
+    assert.equal(sink.frames.length, 0, "a queued user request must go first");
+    sink.busy = false;
+    await h.tick();
+    assert.deepEqual(
+      sink.frames.map((frame) => frame.seq),
+      [1, 2],
+    );
+  } finally {
+    await h.collector.stop();
+  }
+});
+
+test("a collection pass that throws is counted, and the next one still runs", async () => {
+  const h = stubHarness();
+  try {
+    h.kubelet.mode = "throw";
+    const captures = await captured(async () => {
+      // Not `rejects`: the caller is a timer chain, and a rejection there ends
+      // the process in Node's default mode.
+      assert.equal(await h.tick(), undefined);
+    });
+    assert.equal(h.collector.stats().tickErrors, 1);
+    assert.ok(
+      captures.warn.some((line) => line.includes("collection pass failed")),
+      `the failure was silent: ${JSON.stringify(captures.warn)}`,
+    );
+
+    h.kubelet.mode = "ok";
+    const frame = await h.tick();
+    assert.ok(frame, "the collector stopped after one bad pass");
+    assert.equal((h.sink as RecordingSink).frames.length, 1);
+  } finally {
+    await h.collector.stop();
+  }
+});
+
+test("a sink that throws does not take the collector with it", async () => {
+  // The `SampleSink` contract says an implementation must not throw. The
+  // collector does not get to rely on that: it is the last thing standing
+  // between a kubelet read and a process that stops collecting.
+  class ThrowingSink implements SampleSink {
+    ready = true;
+    busy = false;
+    calls = 0;
+    push(): boolean {
+      this.calls += 1;
+      throw new Error("the wire threw");
+    }
+  }
+  const sink = new ThrowingSink();
+  const h = stubHarness({ sink });
+  try {
+    await captured(async () => {
+      for (let round = 0; round < 3; round += 1) await h.tick();
+    });
+    assert.equal(h.collector.stats().tickErrors, 3);
+    // The passes kept happening; the frames are in the ring, not lost.
+    assert.equal(sink.calls, 3);
+    assert.equal(h.collector.stats().ringSize, 3);
+  } finally {
+    await h.collector.stop();
+  }
+});
+
+test("a collection pass that never settles is abandoned, not waited for", async () => {
+  const h = stubHarness();
+  try {
+    h.kubelet.mode = "hang";
+    // Never resolves. Nothing awaits it — that is the point.
+    void h.collector.tick();
+    await new Promise((resolve) => setImmediate(resolve));
+    h.advance(1);
+    assert.equal(await h.collector.tick(), undefined, "an overlapping pass must yield");
+
+    // Four periods later the first pass is not slow, it is not coming back.
+    h.advance(4);
+    h.kubelet.mode = "ok";
+    const captures = await captured(async () => {
+      assert.ok(await h.collector.tick(), "the stuck pass held the lock for the life of the process");
+    });
+    assert.equal(h.collector.stats().tickStalls, 1);
+    assert.ok(
+      captures.warn.some((line) => line.includes("abandoning it")),
+      `the abandoned pass was silent: ${JSON.stringify(captures.warn)}`,
+    );
+  } finally {
+    await h.collector.stop();
+  }
+});
+
+test("silence is reported once, with its reason, and so is the recovery", async () => {
+  const h = stubHarness();
+  const sink = h.sink as RecordingSink;
+  try {
+    sink.ready = false;
+    const going = await captured(async () => {
+      for (let round = 0; round < 6; round += 1) await h.tick();
+    });
+    const warnings = going.warn.filter((line) => line.includes("no sample frame is reaching"));
+    assert.equal(warnings.length, 1, `expected exactly one warning, got ${JSON.stringify(going.warn)}`);
+    assert.ok(warnings[0]?.includes("sink=down"), warnings[0]);
+    assert.ok(/\d+ frames have been waiting/.test(warnings[0] ?? ""), warnings[0]);
+
+    sink.ready = true;
+    const back = await captured(async () => {
+      await h.tick();
+    });
+    assert.ok(
+      back.warn.some((line) => line.includes("reaching the control plane again")),
+      JSON.stringify(back.warn),
+    );
+  } finally {
+    await h.collector.stop();
+  }
+});
+
+test("a busy wire names itself in the silence warning", async () => {
+  // The line has to say WHICH of the three states it is in, or the operator is
+  // back to guessing — which is exactly what the morning of 09.09.2026 cost.
+  // A sink that is busy AND refuses what it is handed: the ring fills, and the
+  // warning has to name the reason rather than merely report the silence.
+  class BusyRefusingSink implements SampleSink {
+    ready = true;
+    busy = true;
+    push(): boolean {
+      return false;
+    }
+  }
+  const h = stubHarness({ sink: new BusyRefusingSink() });
+  try {
+    const captures = await captured(async () => {
+      for (let round = 0; round < 6; round += 1) await h.tick();
+    });
+    const warning = captures.warn.find((line) => line.includes("no sample frame is reaching"));
+    assert.ok(warning, JSON.stringify(captures.warn));
+    assert.ok(warning.includes("sink=busy"), warning);
+  } finally {
+    await h.collector.stop();
+  }
+});
+
+test("one liveness line every ten minutes, and it carries the counters", async () => {
+  const h = stubHarness({ livenessMs: 10 * PERIOD_MS });
+  try {
+    const captures = await captured(async () => {
+      for (let round = 0; round < 21; round += 1) await h.tick();
+    });
+    const lines = captures.log.filter((line) => line.startsWith("[metrics] ticks="));
+    assert.equal(lines.length, 2, `expected two liveness lines, got ${JSON.stringify(captures.log)}`);
+    assert.match(lines[0] ?? "", /^\[metrics\] ticks=\d+ frames=\d+ pushed=\d+ dropped=\d+ sink=(ready|busy|down)$/);
+    assert.ok(lines[1]?.includes("ticks=21"), lines[1]);
+  } finally {
+    await h.collector.stop();
+  }
+});
+
+test("flush drains the ring without waiting for the next tick", async () => {
+  const h = stubHarness();
+  const sink = h.sink as RecordingSink;
+  try {
+    sink.ready = false;
+    for (let round = 0; round < 3; round += 1) await h.tick();
+    assert.equal(h.collector.queuedFrames, 3);
+
+    // The tunnel is back and the control plane is already asking questions
+    // again — which is the normal state, not an unusual one.
+    sink.ready = true;
+    sink.busy = true;
+    h.collector.flush();
+    assert.deepEqual(
+      sink.frames.map((frame) => frame.seq),
+      [1, 2, 3],
+    );
+    assert.equal(h.collector.queuedFrames, 0);
+  } finally {
+    await h.collector.stop();
+  }
 });

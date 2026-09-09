@@ -117,6 +117,24 @@ export interface KubeletTarget {
   readonly port?: number;
 }
 
+/**
+ * The two reads the collector performs, as an interface rather than the class.
+ *
+ * Written for one reason and it is worth naming: a failure that the collector
+ * has to survive — a read that throws, a read that never settles — cannot be
+ * produced through a socket, because every socket in `KubeletClient` has its
+ * own ceiling and turns both of those into a tidy `unreachable`. Testing the
+ * collector's own robustness needs a seam ABOVE the transport. `KubeletClient`
+ * satisfies this structurally; nothing in production implements it twice.
+ */
+export interface KubeletReader {
+  summary<T>(target: KubeletTarget): Promise<KubeletResult<T>>;
+  cadvisor<T>(
+    target: KubeletTarget,
+    consume: (lines: AsyncIterable<string>) => Promise<T>,
+  ): Promise<KubeletResult<T>>;
+}
+
 export type KubeletResult<T> =
   | { readonly state: "ok"; readonly value: T }
   | { readonly state: Exclude<NodeStateCode, "ok">; readonly detail?: string };
