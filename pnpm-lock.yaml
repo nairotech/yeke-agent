@@ -12,8 +12,8 @@ importers:
         specifier: ^1.4.0
         version: 1.4.0
       '@nairotech/yeke-tunnel':
-        specifier: file:/private/tmp/claude-501/-Users-muhgumus-Desktop-NAIROTECH-PROJECTS-YEKE/007c952f-f299-437a-b740-44021593298a/scratchpad/nairotech-yeke-tunnel-5.0.0.tgz
-        version: file:../nairotech-yeke-tunnel-5.0.0.tgz
+        specifier: 5.0.0
+        version: 5.0.0
       undici:
         specifier: ^7.17.0
         version: 7.29.0
@@ -207,9 +207,8 @@ packages:
   '@kubernetes/client-node@1.4.0':
     resolution: {integrity: sha512-Zge3YvF7DJi264dU1b3wb/GmzR99JhUpqTvp+VGHfwZT+g7EOOYNScDJNZwXy9cszyIGPIs0VHr+kk8e95qqrA==}
 
-  '@nairotech/yeke-tunnel@file:../nairotech-yeke-tunnel-5.0.0.tgz':
-    resolution: {integrity: sha512-fR1Al0Vfw0MOUYxn7dr8DpFHzCNqpnyfZzch5vvqxe/ApzGjchAiK3SeYdc4vo68xOy0sPTwZrlTDZYZMjvP1w==, tarball: file:../nairotech-yeke-tunnel-5.0.0.tgz}
-    version: 5.0.0
+  '@nairotech/yeke-tunnel@5.0.0':
+    resolution: {integrity: sha512-FkikMurSEebmtqWvGSYPbPpuMH20KOCwlVpwk33XaFzGefa3drIB5+I+JMHN+lIM9EsTjUYnNm69XCMmq6zhQQ==}
 
   '@types/js-yaml@4.0.9':
     resolution: {integrity: sha512-k4MGaQl5TGo/iipqb2UDG2UwjXziSWkh0uysQelTlJpX1qGlpUZYm8PnO4DxG1qBomtJUdYJ6qR6xdIah10JLg==}
@@ -630,7 +629,7 @@ snapshots:
       - supports-color
       - utf-8-validate
 
-  '@nairotech/yeke-tunnel@file:../nairotech-yeke-tunnel-5.0.0.tgz':
+  '@nairotech/yeke-tunnel@5.0.0':
     dependencies:
       zod: 4.4.3
 
