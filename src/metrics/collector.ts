@@ -39,10 +39,40 @@
  * when nothing else needs it and loses the half hour of history the ring exists
  * to keep. K5's buffer is only worth its memory if something fills it while the
  * wire is gone.
+ *
+ * ─── Why nothing here is allowed to be permanent ────────────────────────────
+ *
+ * Measured, 09.09.2026, on a local k3s: the collector went silent and stayed
+ * silent, with the pod healthy, no restart and NOT ONE line in `kubectl logs`.
+ * The cause was not a crash. `#drain` refused to hand a frame to the wire while
+ * `sink.busy`, `busy` is "the control plane has a request in flight", and the
+ * control plane keeps long-lived resource WATCHES open through the tunnel as
+ * ordinary requests (CustomResourceDefinitions and APIServices are in the
+ * agent's own ClusterRole for exactly that reason). So `busy` was true for
+ * minutes at a stretch, the drain was attempted only once per 30-second tick,
+ * and a frame reached the control plane only when a tick happened to land in
+ * the gap between one watch closing and the next opening.
+ *
+ * Three rules come out of that morning, and each one is a call site below
+ * rather than a remembered sentence:
+ *
+ *  1. K5's priority rule is a POSTPONEMENT, not a veto. `busy` may hold the
+ *     ring back for `BUSY_YIELD_TICKS` ticks and not one more. Because the wire
+ *     pairs two internal frames into one message anyway, yielding a single tick
+ *     costs no throughput at all — it costs the user's request nothing to wait
+ *     for, and it costs the cluster's monitoring nothing to give.
+ *  2. Nothing in the tick chain may be able to stop it. `tick()` never rejects,
+ *     a pass that hangs is abandoned after `TICK_STALL_TICKS` periods, and the
+ *     timer is rescheduled from a chain that cannot reject.
+ *  3. Silence is reported. A collector that produces nothing, or produces into
+ *     a ring nothing drains, says so within three periods and says WHY — and
+ *     one line every ten minutes says what it has been doing when nothing is
+ *     wrong. The failure above cost a morning because both of those lines were
+ *     missing.
  */
 import { IoZeroProbe, readCadvisor } from "./cadvisor.js";
 import { CounterRates } from "./counters.js";
-import { KubeletClient, type KubeletTarget } from "./kubelet-client.js";
+import type { KubeletReader, KubeletTarget } from "./kubelet-client.js";
 import {
   type MetaRecord,
   type NodeRecord,
@@ -86,10 +116,50 @@ export const DEFAULT_PERIOD_MS = 30_000;
  */
 const NODE_CONCURRENCY = 8;
 
+/**
+ * One liveness line every ten minutes.
+ *
+ * Long enough that `kubectl logs yeke-agent` is not a scrolling counter, short
+ * enough that an operator opening the log an hour into a problem has six of
+ * them to compare. The line is the answer to "is this thing doing anything",
+ * which is the question that had no answer on 09.09.2026.
+ */
+export const DEFAULT_LIVENESS_MS = 600_000;
+
+/**
+ * How many ticks a queued user request may postpone the drain.
+ *
+ * One. K5 says a user request goes first, and one tick is the whole of what
+ * that costs: the wire pairs two internal frames into one message
+ * (`SAMPLES_PER_WIRE_FRAME`), so a ring drained every second tick puts exactly
+ * as many messages on the wire as one drained every tick. Beyond that the rule
+ * stops being a priority and becomes an off switch — which is precisely the
+ * failure this constant exists to make impossible.
+ */
+const BUSY_YIELD_TICKS = 1;
+
+/**
+ * Periods of nothing reaching the control plane before the collector says so.
+ *
+ * Three: two consecutive misses are a slow kubelet or a busy tunnel, and
+ * warning on those would train the operator to ignore the line.
+ */
+const SILENCE_TICKS = 3;
+
+/**
+ * Periods one collection pass may run before the next one starts without it.
+ *
+ * Every request inside a pass has its own 10-second ceiling, so four periods is
+ * not a timeout for anything that can normally happen — it is the guard against
+ * a pass that is not going to finish at all, which would otherwise hold the
+ * `#ticking` lock and stop the collector for the life of the process.
+ */
+const TICK_STALL_TICKS = 4;
+
 export interface CollectorOptions {
   /** The apiserver connection, from `resolveKubeTarget` — nodes, pods, ReplicaSets. */
   readonly target: KubeTarget;
-  readonly kubelet: KubeletClient;
+  readonly kubelet: KubeletReader;
   readonly sink: SampleSink;
   readonly periodMs?: number;
   readonly ringCapacity?: number;
@@ -104,6 +174,8 @@ export interface CollectorOptions {
   readonly now?: () => number;
   /** Overridden by the tests; production takes the default. */
   readonly ioZeroProbeRounds?: number;
+  /** How often the liveness line is written. Injected so a test need not wait ten minutes. */
+  readonly livenessMs?: number;
 }
 
 export interface CollectorStats {
@@ -128,7 +200,24 @@ export interface CollectorStats {
   readonly ringValueBytes: number;
   /** Distinct layout objects the ring is holding. One means the sharing works. */
   readonly ringLayouts: number;
+  /**
+   * Collection passes that ended in an exception.
+   *
+   * A pass that throws is COUNTED and dropped, never rethrown: the timer chain
+   * is the only thing between a kubelet read and a process that stops
+   * collecting, and it is rescheduled from a promise that cannot reject.
+   */
+  readonly tickErrors: number;
+  /** Passes abandoned for running longer than `TICK_STALL_TICKS` periods. */
+  readonly tickStalls: number;
+  /** Frames the ring has dropped over the collector's whole life (K5's gap count). */
+  readonly droppedTotal: number;
+  /** What the wire can take right now: `ready`, `busy` (a user request is in flight) or `down`. */
+  readonly sinkState: SinkState;
 }
+
+/** The three answers `SampleSink` can give, as one word for the log line. */
+export type SinkState = "ready" | "busy" | "down";
 
 export class Collector {
   readonly #options: CollectorOptions;
@@ -157,20 +246,55 @@ export class Collector {
   #lastLayout: FrameLayout | undefined;
 
   #timer: NodeJS.Timeout | undefined;
+  /**
+   * The health timer, and why it is not the tick timer.
+   *
+   * If the liveness line were written by the tick chain, a dead tick chain
+   * would take the report of its own death with it. This one runs on its own
+   * interval and can therefore say `ticks=` with a number that has not moved.
+   */
+  #healthTimer: NodeJS.Timeout | undefined;
   #running = false;
   #ticking = false;
+  /**
+   * Which pass owns the `#ticking` lock.
+   *
+   * An abandoned pass eventually finishes, and without this it would release a
+   * lock its successor is holding and push a frame captured minutes ago into
+   * the middle of the ring.
+   */
+  #tickToken = 0;
+  #tickStartedAt = 0;
   #seq = 0;
   #ticks = 0;
+  #tickErrors = 0;
+  #tickStalls = 0;
   #framesProduced = 0;
   #framesSent = 0;
+  #droppedTotal = 0;
   #entitiesLastFrame = 0;
   #samplesLastFrame = 0;
+  /** Consecutive ticks a busy sink has held the ring back. See `BUSY_YIELD_TICKS`. */
+  #busySkips = 0;
+  #lastFrameAt = 0;
+  #lastSentAt = 0;
+  #lastLivenessAt = 0;
+  /** So the silence warning is written ONCE, on the change, not every period. */
+  #warnedSilent = false;
+  readonly #livenessMs: number;
 
   constructor(options: CollectorOptions) {
     this.#options = options;
     this.#periodMs = options.periodMs ?? DEFAULT_PERIOD_MS;
     this.#now = options.now ?? Date.now;
+    this.#livenessMs = options.livenessMs ?? DEFAULT_LIVENESS_MS;
     this.#ring = new SampleRing({ capacity: options.ringCapacity ?? DEFAULT_RING_CAPACITY });
+    // Not zero: a collector constructed at T would otherwise look, for the
+    // first three periods, like one that has been silent since the epoch.
+    const startedAt = this.#now();
+    this.#lastFrameAt = startedAt;
+    this.#lastSentAt = startedAt;
+    this.#lastLivenessAt = startedAt;
   }
 
   start(): void {
@@ -211,12 +335,15 @@ export class Collector {
     this.#podWatch.start();
     this.#replicaSetWatch.start();
     this.#schedule();
+    this.#startHealthTimer();
   }
 
   async stop(): Promise<void> {
     this.#running = false;
     if (this.#timer) clearTimeout(this.#timer);
     this.#timer = undefined;
+    if (this.#healthTimer) clearInterval(this.#healthTimer);
+    this.#healthTimer = undefined;
     await Promise.all([
       this.#nodeWatch?.stop(),
       this.#podWatch?.stop(),
@@ -242,7 +369,31 @@ export class Collector {
       apiserverForbidden: this.#apiserverForbiddenResources(),
       ringValueBytes: retained.valueBytes,
       ringLayouts: retained.layouts,
+      tickErrors: this.#tickErrors,
+      tickStalls: this.#tickStalls,
+      droppedTotal: this.#droppedTotal + this.#ring.dropped,
+      sinkState: this.#sinkState(),
     };
+  }
+
+  /** Frames the ring is holding right now. The reconnect line reports it. */
+  get queuedFrames(): number {
+    return this.#ring.size;
+  }
+
+  /**
+   * Hands the ring to the wire NOW, without waiting for the next tick.
+   *
+   * Called when the tunnel comes back (`TunnelClient`): K5 says the half hour
+   * the ring kept during the outage drains when the wire returns, and "on the
+   * next tick, if the control plane happens to be idle at that instant" is not
+   * what that sentence means. `force` because the control plane re-opens its
+   * watches within milliseconds of the handshake, so waiting for an unbusy
+   * moment here is waiting for one that does not come.
+   */
+  flush(): void {
+    this.#drain(true);
+    this.#health();
   }
 
   /**
@@ -308,41 +459,95 @@ export class Collector {
   #schedule(): void {
     if (!this.#running) return;
     this.#timer = setTimeout(() => {
-      void this.tick().finally(() => this.#schedule());
+      // `catch` BEFORE `finally`, so that the chain this `void` discards can no
+      // longer be a rejected promise. `tick()` is written not to reject; this
+      // is the second lock on the same door, because an unhandled rejection in
+      // Node's default mode ends the process, and the process is the agent.
+      void this.tick()
+        .catch(() => undefined)
+        .finally(() => this.#schedule());
     }, this.#periodMs);
     // The collector must never be the reason a process refuses to exit: the
     // agent's shutdown path is a signal handler, not a drained queue.
     this.#timer.unref?.();
   }
 
+  #startHealthTimer(): void {
+    this.#healthTimer = setInterval(() => this.#health(), this.#periodMs);
+    this.#healthTimer.unref?.();
+  }
+
   /**
    * One pass. Public because the tests and the measurement harness drive it
    * directly instead of waiting for wall-clock time to pass.
+   *
+   * It does not reject. A pass that throws is counted and dropped: the caller
+   * is a timer chain whose only job is to run again, and there is no version of
+   * "the kubelet answered something unparseable" that should end a cluster's
+   * monitoring.
    */
   async tick(): Promise<InternalFrame | undefined> {
+    const startedAt = this.#now();
     // A tick that overlaps its predecessor would read a counter twice against
     // one previous reading, and the rate arithmetic would divide by an interval
-    // that never happened.
-    if (this.#ticking) return undefined;
+    // that never happened. That is worth yielding for — but not forever: a pass
+    // that never settles would hold this lock and every later tick would return
+    // here, quietly, for the life of the process.
+    if (this.#ticking) {
+      if (startedAt - this.#tickStartedAt < TICK_STALL_TICKS * this.#periodMs) return undefined;
+      this.#tickStalls += 1;
+      console.warn(
+        `[metrics] a collection pass has been running for ${startedAt - this.#tickStartedAt} ms; abandoning it and starting a new one`,
+      );
+    }
     this.#ticking = true;
+    this.#tickStartedAt = startedAt;
+    this.#tickToken += 1;
+    const token = this.#tickToken;
     try {
       const frame = await this.#collect();
+      // An abandoned pass that finished late: its successor owns the lock and
+      // its reading is minutes old. Dropping it is the point of the token — a
+      // frame out of order in the ring is a gap on the receiver's screen.
+      if (this.#tickToken !== token) return undefined;
       this.#ring.push(frame);
       this.#framesProduced += 1;
       this.#ticks += 1;
-      this.#drain();
+      this.#lastFrameAt = this.#now();
+      this.#drain(false);
       return frame;
+    } catch (err) {
+      this.#tickErrors += 1;
+      // Foreign text, verbatim; the operator reading `kubectl logs` is the
+      // audience. Every pass that throws gets a line: unlike the retry loop in
+      // `ResourceWatch`, this cannot repeat faster than once per period.
+      console.warn(
+        `[metrics] collection pass failed: ${err instanceof Error ? err.message : String(err)}`,
+      );
+      return undefined;
     } finally {
-      this.#ticking = false;
+      if (this.#tickToken === token) this.#ticking = false;
+      this.#health();
     }
   }
 
-  /** Hands frames to the wire, oldest first, while it accepts them. */
-  #drain(): void {
+  /**
+   * Hands frames to the wire, oldest first, while it accepts them.
+   *
+   * `busy` is K5's priority rule: a queued user request goes first, and the
+   * sample frame simply waits in the ring it is already in. It waits for
+   * `BUSY_YIELD_TICKS` ticks and then goes anyway — see the header for the
+   * morning that rule cost when it had no bound.
+   */
+  #drain(force: boolean): void {
     const { sink } = this.#options;
-    // `busy` is K5's priority rule: a queued user request goes first, and the
-    // sample frame simply waits in the ring it is already in.
-    while (sink.ready && !sink.busy) {
+    if (!sink.ready) return;
+    if (sink.busy && !force) {
+      this.#busySkips += 1;
+      if (this.#busySkips <= BUSY_YIELD_TICKS) return;
+    }
+    this.#busySkips = 0;
+    while (sink.ready) {
       const frame = this.#ring.peek();
       if (!frame) return;
       // The drop count is stamped at the moment of sending, not of production:
@@ -351,9 +556,55 @@ export class Collector {
       const stamped = dropped > 0 ? { ...frame, dropped } : frame;
       if (!sink.push(stamped)) return;
       this.#ring.shift();
-      if (dropped > 0) this.#ring.takeDropped();
+      if (dropped > 0) this.#droppedTotal += this.#ring.takeDropped();
       this.#framesSent += 1;
+      this.#lastSentAt = this.#now();
     }
+  }
+
+  #sinkState(): SinkState {
+    const { sink } = this.#options;
+    if (!sink.ready) return "down";
+    return sink.busy ? "busy" : "ready";
+  }
+
+  /**
+   * The two lines this collector writes about itself.
+   *
+   * Called from the end of every tick AND from its own interval, because the
+   * two failures it has to describe are different: a drain that is blocked
+   * (ticks still happening) and a tick chain that has stopped (no ticks at
+   * all). Only the second one needs a timer of its own, and only the first one
+   * can be reported from inside a tick.
+   */
+  #health(): void {
+    const now = this.#now();
+    const silenceMs = SILENCE_TICKS * this.#periodMs;
+    const producedAgo = now - this.#lastFrameAt;
+    const sentAgo = now - this.#lastSentAt;
+
+    let reason: string | undefined;
+    if (producedAgo > silenceMs) {
+      reason = `no collection pass has completed for ${producedAgo} ms (ticks=${this.#ticks}, errors=${this.#tickErrors})`;
+    } else if (this.#ring.size > 0 && sentAgo > silenceMs) {
+      reason = `${this.#ring.size} frames have been waiting for ${sentAgo} ms, sink=${this.#sinkState()}`;
+    }
+
+    if (reason !== undefined) {
+      if (!this.#warnedSilent) {
+        this.#warnedSilent = true;
+        console.warn(`[metrics] no sample frame is reaching the control plane: ${reason}`);
+      }
+    } else if (this.#warnedSilent) {
+      this.#warnedSilent = false;
+      console.warn("[metrics] sample frames are reaching the control plane again");
+    }
+
+    if (now - this.#lastLivenessAt < this.#livenessMs) return;
+    this.#lastLivenessAt = now;
+    console.log(
+      `[metrics] ticks=${this.#ticks} frames=${this.#framesProduced} pushed=${this.#framesSent} dropped=${this.#droppedTotal + this.#ring.dropped} sink=${this.#sinkState()}`,
+    );
   }
 
   async #collect(): Promise<InternalFrame> {
