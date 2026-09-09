@@ -88,6 +88,7 @@ import {
   type FrameLayout,
   type InternalFrame,
   type NodeState,
+  type NodeStateCode,
   type Sample,
   type SampleSink,
   packFrame,
@@ -282,6 +283,22 @@ export class Collector {
   /** So the silence warning is written ONCE, on the change, not every period. */
   #warnedSilent = false;
   readonly #livenessMs: number;
+  /**
+   * Per-node state most recently WRITTEN to the log.
+   *
+   * Same guard as `ResourceWatch#loggedForbidden` ("yalnız değişince,
+   * dakikada bir değil" -- `owners.ts`): without it, a node stuck
+   * `tls-unverified` would log once per 30-second tick for as long as the
+   * failure lasts, which is how F9 (09.09.2026, Kubespray cluster `c-10`)
+   * ended up with a screen that said "TLS doğrulanamadı" and a `kubectl logs`
+   * that said nothing at all -- the ONE thing the operator needed was never
+   * given a line to live on. A node absent from this map has never been
+   * reported as anything but `ok`, which is the correct starting point: a
+   * node that is `tls-unverified` on its very FIRST tick is still a change
+   * from that assumed-good baseline and must be logged on that first tick,
+   * not held back until a second one repeats it.
+   */
+  readonly #loggedNodeState = new Map<string, NodeStateCode>();
 
   constructor(options: CollectorOptions) {
     this.#options = options;
@@ -620,13 +637,15 @@ export class Collector {
       // as unreachable rather than omitted: a node missing from the list looks
       // like a node that was deleted.
       if (!node.address) {
-        nodeStates.push({
+        const state: NodeState = {
           node: node.name,
           state: "unreachable",
           detail: "no InternalIP",
           psi: false,
           ioUnmeasurable: false,
-        });
+        };
+        nodeStates.push(state);
+        this.#logNodeState(node.name, undefined, state);
         continue;
       }
       targets.push(
@@ -684,12 +703,15 @@ export class Collector {
     samples: Sample[];
     rateKeys: Set<string>;
   }> {
-    const empty = (state: NodeState) => ({
-      state,
-      entities: [] as Entity[],
-      samples: [] as Sample[],
-      rateKeys: new Set<string>(),
-    });
+    const empty = (state: NodeState) => {
+      this.#logNodeState(target.node, target.address, state);
+      return {
+        state,
+        entities: [] as Entity[],
+        samples: [] as Sample[],
+        rateKeys: new Set<string>(),
+      };
+    };
 
     const summaryResult = await this.#options.kubelet.summary<SummaryDocument>(target);
     if (summaryResult.state !== "ok") {
@@ -768,17 +790,54 @@ export class Collector {
     // absent for this frame. Reporting the node as unreachable here would erase
     // data that was successfully collected.
 
-    return {
-      state: {
-        node: target.node,
-        state: "ok",
-        psi: reading.psiPresent,
-        ioUnmeasurable,
-      },
-      entities,
-      samples,
-      rateKeys,
+    const state: NodeState = {
+      node: target.node,
+      state: "ok",
+      psi: reading.psiPresent,
+      ioUnmeasurable,
     };
+    this.#logNodeState(target.node, target.address, state);
+    return { state, entities, samples, rateKeys };
+  }
+
+  /**
+   * Logs a node's TLS or connectivity failure once, on the state CHANGE only
+   * -- the same guard as `ResourceWatch#setForbidden` in `owners.ts`
+   * ("yalnız değişince, dakikada bir değil"). At the default 30-second
+   * period, logging every tick would mean a line every 30 seconds for as
+   * long as the failure lasts; the change guard makes it exactly one line per
+   * transition regardless of how many ticks the node spends in that state.
+   *
+   * `tls-unverified` and `unreachable` are the two states this method
+   * covers, because they are the two states F9 found completely silent in
+   * `kubectl logs` (09.09.2026, Kubespray cluster `c-10`, agent 0.37.0): the
+   * screen said "TLS doğrulanamadı" and the log said nothing at all, with no
+   * hint of the OpenSSL code, the node's address, or what to do about it.
+   * `forbidden` and `unauthorized` are not touched here: `forbidden` on the
+   * kubelet path already has no per-node log line before this fix either, and
+   * widening this fix's scope to cover it is not what F9 asked for.
+   */
+  #logNodeState(node: string, address: string | undefined, state: NodeState): void {
+    const previous = this.#loggedNodeState.get(node) ?? "ok";
+    this.#loggedNodeState.set(node, state.state);
+    if (state.state === previous) return;
+
+    const at = address ? `(${address})` : "(no address)";
+    if (state.state === "tls-unverified") {
+      console.warn(
+        `[metrics] kubelet ${node} ${at}: TLS verification failed: ${state.detail}; ` +
+          "set YEKE_KUBELET_INSECURE_TLS=true to collect over unverified TLS, or enable kubelet " +
+          "serving certificate rotation (kubeadm: serverTLSBootstrap; kubespray: kubelet_rotate_server_certificates)",
+      );
+      return;
+    }
+    if (state.state === "unreachable") {
+      console.warn(`[metrics] kubelet ${node} ${at}: unreachable: ${state.detail ?? "unknown reason"}`);
+      return;
+    }
+    if (state.state === "ok" && (previous === "tls-unverified" || previous === "unreachable")) {
+      console.warn(`[metrics] kubelet ${node} ${at}: recovered from ${previous}, reporting normally again`);
+    }
   }
 
   #probeFor(node: string): IoZeroProbe {

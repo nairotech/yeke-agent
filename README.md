@@ -251,6 +251,23 @@ in one line at startup and the control plane shows it on screen. The two
 alternatives are to give your kubelets CA-signed serving certificates, or to
 leave those nodes without statistics.
 
+Kubespray installs carry the same default under a different name: its variable
+is `kubelet_rotate_server_certificates` (off unless you turn it on in your
+inventory), and it is why Kubespray's own bundled metrics-server also runs with
+`--kubelet-insecure-tls` out of the box. This was measured in production on a
+Kubespray-built cluster (F9, 09.09.2026): the screen correctly said
+`tls-unverified`, but nothing explained why or what to do about it, in either
+direction. A node's `tls-unverified` / `unreachable` state is now logged once
+per CHANGE — entering the state and leaving it, never once per 30-second tick —
+by `Collector#logNodeState` in `src/metrics/collector.ts`, following the same
+change-guard `ResourceWatch#setForbidden` already used for the apiserver 403
+case (`src/metrics/owners.ts`). The TLS line names the node, its address, the
+OpenSSL verify code and both remedies, e.g.:
+
+```
+[metrics] kubelet node-3 (10.0.4.12): TLS verification failed: DEPTH_ZERO_SELF_SIGNED_CERT — self-signed certificate; set YEKE_KUBELET_INSECURE_TLS=true to collect over unverified TLS, or enable kubelet serving certificate rotation (kubeadm: serverTLSBootstrap; kubespray: kubelet_rotate_server_certificates)
+```
+
 `YEKE_METRICS_ENABLED=false` turns the collector off entirely: no timer, no
 kubelet requests, and none of the three watches it needs. The tunnel is
 unaffected — your cluster stays manageable, the screen simply has no series on
