@@ -6,6 +6,7 @@
  * side needs no inbound firewall rule, no port-forward and no VPN; outbound 443
  * is enough.
  */
+import { readFile } from "node:fs/promises";
 import { WebSocket, type RawData } from "ws";
 import { request } from "undici";
 import {
@@ -14,6 +15,8 @@ import {
   CreditWindow,
   MAX_REQUEST_BODY_BYTES,
   RESPONSE_CREDIT_WINDOW_BYTES,
+  SAMPLE_FRAME_REQUEST_ID,
+  SAMPLE_MIN_PROTOCOL_VERSION,
   TUNNEL_LIVENESS_TIMEOUT_MS,
   TUNNEL_PING_INTERVAL_MS,
   TUNNEL_PROTOCOL_VERSION,
@@ -29,7 +32,17 @@ import {
 } from "@nairotech/yeke-tunnel";
 import type { AgentConfig } from "./config.js";
 import { failureOf } from "./failure.js";
-import { readKubernetesVersion, resolveKubeTarget, type KubeTarget } from "./kube.js";
+import {
+  SA_DIR,
+  readKubernetesVersion,
+  resolveKubeTarget,
+  serviceAccountToken,
+  type KubeTarget,
+} from "./kube.js";
+import { Collector, shouldCollect } from "./metrics/collector.js";
+import { KubeletClient } from "./metrics/kubelet-client.js";
+import type { InternalFrame, SampleSink } from "./metrics/types.js";
+import { SampleEncoder } from "./metrics/wire.js";
 import { UpstreamStream } from "./stream.js";
 
 /**
@@ -199,6 +212,188 @@ class RequestBody {
   }
 }
 
+/**
+ * How many internal frames share one wire frame.
+ *
+ * K5: the collector samples every 30 seconds and the wire carries a frame every
+ * 60, with two samples per entity. The pairing is here rather than in the
+ * collector because it is a WIRE decision — halving the number of control
+ * messages and dictionaries, not the number of readings — and the collector's
+ * ring must keep filling at its own rate while the tunnel is down.
+ */
+const SAMPLES_PER_WIRE_FRAME = 2;
+
+/** What the tunnel client needs from a collector; the tests supply their own. */
+export interface MetricsCollector {
+  start(): void;
+  stop(): Promise<void>;
+}
+
+/**
+ * Builds the collector once the handshake says the control plane can receive
+ * samples.
+ *
+ * A seam, and not a generality for its own sake: the collector reaches a real
+ * apiserver and 50 real kubelets, and a test of the WIRE side (dictionary
+ * deltas, reconnects, priority) must be able to hand frames to the sink without
+ * any of that. Returning `undefined` is a legitimate answer — see
+ * `inClusterCollector`.
+ */
+export type CollectorFactory = (context: {
+  readonly target: KubeTarget;
+  readonly sink: SampleSink;
+  readonly config: AgentConfig;
+}) => Promise<MetricsCollector | undefined>;
+
+/**
+ * The production collector: the agent's own ServiceAccount, in its own pod.
+ *
+ * `kubeconfig` mode gets no collector and says so once. The kubelet reads
+ * authenticate with the projected SA token and verify the kubelet's certificate
+ * against the projected CA (K4); outside a pod neither file exists, so every
+ * node would report `unauthorized` forever. Announcing the absence is the rule
+ * this repository follows over routing around it — a developer running the
+ * agent against a kubeconfig should see one line explaining why no metrics
+ * appear, not fifty node failures a minute.
+ */
+const inClusterCollector: CollectorFactory = async ({ target, sink, config }) => {
+  if (config.kubeMode !== "in-cluster") {
+    console.log(
+      "[metrics] collector not started: kubelet reads need an in-cluster service account (YEKE_KUBE_MODE=kubeconfig)",
+    );
+    return undefined;
+  }
+  const ca = await readFile(`${SA_DIR}/ca.crt`);
+  const kubelet = new KubeletClient({
+    token: serviceAccountToken(`${SA_DIR}/token`),
+    ca,
+    insecureTls: config.kubeletInsecureTls,
+  });
+  const collector = new Collector({ target, kubelet, sink });
+  return {
+    start: () => collector.start(),
+    // The connection pool belongs to this collector and nothing else holds it;
+    // leaving it open would keep 50 keep-alive sockets to kubelets after the
+    // agent decided to stop reading them.
+    stop: async () => {
+      await collector.stop();
+      await kubelet.close();
+    },
+  };
+};
+
+/**
+ * What `SampleWire` needs from the tunnel client, as functions rather than a
+ * back-reference: the sink asks its questions at the moment it is asked one,
+ * and a captured socket or protocol number would answer for the session that
+ * has already ended.
+ */
+interface SampleWireHooks {
+  readonly isOpen: () => boolean;
+  readonly protocol: () => number;
+  readonly hasUserRequest: () => boolean;
+  readonly sendMessage: (message: ControlMessage) => void;
+  readonly sendFrame: (payload: Uint8Array) => void;
+}
+
+/**
+ * The `SampleSink` the collector writes into: the wire, seen from the collector.
+ *
+ * ─── The two flags, on this side of the seam ────────────────────────────────
+ *
+ *  · `ready` is "there is a socket AND its peer can read samples". Both halves
+ *    matter: the protocol number is per SESSION, so it is cleared on every
+ *    disconnect (`TunnelClient.#cleanupAfterDisconnect`). Without that clearing
+ *    a reconnect to an OLDER control plane would keep the previous session's
+ *    answer and the agent would send frames into a peer that drops them.
+ *  · `busy` is `#inFlight`, the user requests being applied. Streams are
+ *    deliberately NOT counted: an open `kubectl exec` lives for minutes, and a
+ *    shell left open in one browser tab would otherwise silence a cluster's
+ *    monitoring for as long as it stays open.
+ *
+ * ─── The one frame this class holds, and how its loss is counted ────────────
+ *
+ * Pairing means the first of the two frames is accepted and held here, OUT of
+ * the ring. If the connection drops before its partner arrives that frame is
+ * gone, and the ring — which is where `dropped` normally comes from — never
+ * knew about it. So the loss is counted here and added to the `dropped` of the
+ * next frame that gets through. The rejected alternative was to pair it with
+ * the first frame after the reconnect: the two sample times would then straddle
+ * the whole outage, and a receiver drawing a rate between them would draw a
+ * number nobody measured.
+ */
+class SampleWire implements SampleSink {
+  readonly #encoder = new SampleEncoder();
+  readonly #hooks: SampleWireHooks;
+  #pending: InternalFrame[] = [];
+  #droppedBeforeWire = 0;
+  /** Wire frames written. A frame split by size counts as its parts. */
+  framesSent = 0;
+  /** Frames the encoder refused. A rising number is a shape bug, not a network one. */
+  encodeFailures = 0;
+
+  constructor(hooks: SampleWireHooks) {
+    this.#hooks = hooks;
+  }
+
+  get ready(): boolean {
+    return this.#hooks.isOpen() && this.#hooks.protocol() >= SAMPLE_MIN_PROTOCOL_VERSION;
+  }
+
+  get busy(): boolean {
+    return this.#hooks.hasUserRequest();
+  }
+
+  push(frame: InternalFrame): boolean {
+    if (!this.ready) return false;
+    // Accepted, not yet sent: the collector drops it from the ring on `true`,
+    // so from here on this class is responsible for it (see the header).
+    this.#pending.push(frame);
+    if (this.#pending.length < SAMPLES_PER_WIRE_FRAME) return true;
+    const batch = this.#pending;
+    this.#pending = [];
+    return this.#write(batch);
+  }
+
+  /**
+   * The session ended. The half-built pair is dropped and counted; the
+   * dictionary starts again at 1 for the next one.
+   */
+  sessionEnded(): void {
+    this.#droppedBeforeWire += this.#pending.length;
+    this.#pending = [];
+    this.#encoder.reset();
+  }
+
+  #write(frames: readonly InternalFrame[]): boolean {
+    const dropped = this.#droppedBeforeWire;
+    this.#droppedBeforeWire = 0;
+    try {
+      for (const { message, payload } of this.#encoder.encode(frames, {
+        droppedBeforeWire: dropped,
+      })) {
+        // The order is the contract: the control message first, the binary
+        // frame second. The receiver holds the message until the frame arrives
+        // and pairs them by arrival order, because WebSocket preserves it.
+        this.#hooks.sendMessage(message);
+        this.#hooks.sendFrame(payload);
+        this.framesSent += 1;
+      }
+      return true;
+    } catch (err) {
+      // An unencodable frame is DROPPED, not retried. Returning false would
+      // leave it at the head of the ring and every following tick would throw
+      // on the same frame — a permanent stall of the whole series to preserve
+      // one minute of it. The loss joins the count the next frame carries, and
+      // the line below is the operator's copy of it.
+      this.encodeFailures += 1;
+      this.#droppedBeforeWire = dropped + frames.length;
+      console.warn(`[metrics] sample frame dropped, not encodable: ${(err as Error).message}`);
+      return true;
+    }
+  }
+}
+
 export class TunnelClient {
   #config: AgentConfig;
   #target: KubeTarget | null = null;
@@ -220,10 +415,40 @@ export class TunnelClient {
   /** When the last message was received from the control plane; the sole criterion for the keepalive decision. */
   #lastSeenAt = Date.now();
   #liveness: NodeJS.Timeout | null = null;
+  readonly #createCollector: CollectorFactory;
+  readonly #sampleWire: SampleWire;
+  /**
+   * The collector, once started — and it is started AT MOST ONCE.
+   *
+   * It survives reconnects on purpose: its ring is the 30 minutes of history
+   * K5 exists to keep, and rebuilding the collector on every reconnect would
+   * throw that history away exactly when the outage that produced it ended. It
+   * also holds three watches against the apiserver; restarting them per socket
+   * would turn a flapping tunnel into a LIST storm on the customer's control
+   * plane.
+   *
+   * The same reasoning covers the downgrade case, which is otherwise easy to
+   * miss: if a reconnect lands on a control plane that negotiates v4 (a
+   * rollback), the sink stops being ready and the collector keeps filling its
+   * ring with nothing draining. That is bounded by construction — 60 frames,
+   * oldest dropped, and the count rides the first frame that gets through when
+   * v5 returns. Tearing the collector down for a peer that may be back in a
+   * minute would cost the customer more than it saves.
+   */
+  #collector: MetricsCollector | undefined;
+  #collectorStarting = false;
 
-  constructor(config: AgentConfig) {
+  constructor(config: AgentConfig, hooks: { readonly createCollector?: CollectorFactory } = {}) {
     this.#config = config;
     this.#backoff = config.reconnectMinMs;
+    this.#createCollector = hooks.createCollector ?? inClusterCollector;
+    this.#sampleWire = new SampleWire({
+      isOpen: () => this.#socket?.readyState === WebSocket.OPEN,
+      protocol: () => this.#protocol,
+      hasUserRequest: () => this.#inFlight.size > 0,
+      sendMessage: (message) => this.#send(message),
+      sendFrame: (payload) => this.#sendBody(SAMPLE_FRAME_REQUEST_ID, payload),
+    });
   }
 
   /**
@@ -250,6 +475,14 @@ export class TunnelClient {
     return this.#protocol;
   }
 
+  /** Diagnostic: sample frames written to the wire, and frames the encoder refused. */
+  get metricsStats(): { readonly framesSent: number; readonly encodeFailures: number } {
+    return {
+      framesSent: this.#sampleWire.framesSent,
+      encodeFailures: this.#sampleWire.encodeFailures,
+    };
+  }
+
   async start(): Promise<void> {
     this.#target = await resolveKubeTarget(this.#config);
     console.log(`[agent] apiserver: ${this.#target.baseUrl}`);
@@ -260,6 +493,11 @@ export class TunnelClient {
     this.#stopped = true;
     this.#stopLiveness();
     this.#abortAll();
+    // Before the target closes: the collector's watches and kubelet reads go
+    // through it, and stopping them after its dispatcher is gone would produce
+    // a burst of connection errors on the way out.
+    await this.#collector?.stop();
+    this.#collector = undefined;
     this.#socket?.close();
     await this.#target?.close();
   }
@@ -346,6 +584,64 @@ export class TunnelClient {
     // re-establishes the watches from scratch, so cancelling all of them is the
     // correct behaviour.
     this.#abortAll();
+    // The negotiated version belongs to the SESSION, not to the agent. Left
+    // standing, it would answer for the next peer before that peer has spoken —
+    // and a reconnect onto an older control plane (a rollback, a load balancer
+    // with two versions behind it) would then be handed sample frames it cannot
+    // read. Zero is the honest value until the next `welcome`.
+    this.#protocol = 0;
+    // Aliases are connection-local (see `SampleEncoder`): the next session's
+    // first frame carries the dictionary in full.
+    this.#sampleWire.sessionEnded();
+  }
+
+  /**
+   * Starts the metrics collector, if this session and this operator allow it.
+   *
+   * Four gates, in the order they can be answered:
+   *
+   *  1. `YEKE_METRICS_ENABLED=false` — the operator's own switch. Nothing is
+   *     started, nothing is read, and no kubelet in the cluster sees a request.
+   *  2. `shouldCollect(protocol)` — K5's rule, and the reason it is a call and
+   *     not a remembered sentence (`collector.ts`).
+   *  3. Already running, or already starting. A `welcome` arrives once per
+   *     session and the collector outlives sessions.
+   *  4. The factory's own answer: `undefined` means "not here" (a kubeconfig
+   *     developer machine), and it has already said why.
+   *
+   * Nothing here may take the tunnel down. A collector that cannot start is a
+   * cluster without monitoring; a tunnel that cannot start is an unmanageable
+   * cluster, and the second is not an acceptable price for the first.
+   */
+  async #startCollector(): Promise<void> {
+    if (!this.#config.metricsEnabled) return;
+    if (!shouldCollect(this.#protocol)) return;
+    if (this.#collector || this.#collectorStarting) return;
+    const target = this.#target;
+    if (!target) return;
+
+    this.#collectorStarting = true;
+    try {
+      const collector = await this.#createCollector({
+        target,
+        sink: this.#sampleWire,
+        config: this.#config,
+      });
+      if (!collector) return;
+      // `stop()` may have been called while the factory was reading the CA off
+      // disk; starting now would leave watches running after shutdown.
+      if (this.#stopped) {
+        await collector.stop();
+        return;
+      }
+      collector.start();
+      this.#collector = collector;
+      console.log(`[metrics] collector started (control plane protocol v${this.#protocol})`);
+    } catch (err) {
+      console.error(`[metrics] collector not started: ${(err as Error).message}`);
+    } finally {
+      this.#collectorStarting = false;
+    }
   }
 
   /**
@@ -423,6 +719,10 @@ export class TunnelClient {
         console.log(
           `[agent] registered — cluster=${message.clusterId} session=${message.sessionId} protocol=v${this.#protocol}`,
         );
+        // The handshake is the ONLY place this decision is made: the collector
+        // spends the customer's CPU and their kubelets' capacity, and a peer
+        // that cannot read `sample` would drop every frame of it in silence.
+        void this.#startCollector();
         break;
       case "req": {
         // Both the body buffer and the abort controller are registered **here**,

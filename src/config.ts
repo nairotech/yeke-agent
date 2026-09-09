@@ -33,6 +33,24 @@ export interface AgentConfig {
    * precedent is the direct-mode import's `acknowledgeInsecureTLS`.
    */
   kubeletInsecureTls: boolean;
+  /**
+   * The operator's off switch for the metrics collector.
+   *
+   * On by default, because a cluster card with no series on it is a product
+   * that looks broken, and the collector's cost is bounded by design (two
+   * kubelet reads per node per 30 seconds, a 50m CPU budget, a ring with a
+   * ceiling). But it stays a SWITCH, because the collector is the only part of
+   * the agent that reads on a timer instead of on a user's request: an operator
+   * investigating load on their own control plane has to be able to make it
+   * stop without deleting the agent that keeps their cluster reachable.
+   *
+   * Note the asymmetry with `kubeletInsecureTls`, and that it is deliberate.
+   * There, only the exact string `true` grants a weakening, so a typo cannot
+   * lower anyone's security. Here, only the exact string `false` withdraws a
+   * feature, so a typo cannot silently blind a fleet's monitoring. In both
+   * cases the typo lands on the safe side, which is not the same side.
+   */
+  metricsEnabled: boolean;
 }
 
 // These two errors are thrown at startup, they bring the process down, and they
@@ -66,5 +84,6 @@ export function loadConfig(): AgentConfig {
     // all, and treating `1`, `yes` or `TRUE` as consent would mean a typo in a
     // manifest could disable certificate verification across a fleet.
     kubeletInsecureTls: process.env.YEKE_KUBELET_INSECURE_TLS === "true",
+    metricsEnabled: process.env.YEKE_METRICS_ENABLED !== "false",
   };
 }
