@@ -179,7 +179,9 @@ export class SampleEncoder {
     const newest = frames[frames.length - 1];
     if (!newest) return [];
 
-    const collector = collectorStatusOf(newest.nodes);
+    const collector = collectorStatusOf(newest.nodes, {
+      apiserverForbidden: newest.apiserverForbidden,
+    });
     const dropped =
       frames.reduce((total, frame) => total + frame.dropped, 0) + (options.droppedBeforeWire ?? 0);
 
@@ -390,7 +392,8 @@ function wireNodeState(code: NodeStateCode): SampleCollectorNodeState {
 
 /**
  * The collector's declaration about itself, from the per-node states of one
- * tick.
+ * tick plus one whole-collector fact `apiserverForbidden` (see `InternalFrame`
+ * and `ResourceWatch` in `owners.ts`).
  *
  * ─── Why `active` is the narrow case and not the default ────────────────────
  *
@@ -413,7 +416,25 @@ function wireNodeState(code: NodeStateCode): SampleCollectorNodeState {
  *    (by design — the agent cannot be unsure about its own state, and the
  *    receiver's "I do not know" is the absence of the message). "I have a node
  *    list and it is empty" is a degradation of the collector, whatever the
- *    cause.
+ *    cause — UNLESS the cause is known, see below.
+ *
+ * ─── Why `apiserverForbidden` overrides the per-node picture ────────────────
+ *
+ * A per-node `nodes: NodeState[]` alone cannot tell "I have zero nodes because
+ * the cluster is between scale-events" apart from "I have zero nodes because
+ * the apiserver refuses to list `nodes` at all" — an empty list looks the same
+ * either way, and before this fix both produced `degraded`, which sends the
+ * operator to "wait, it will recover" rather than to "re-apply the manifest".
+ * The second case is exactly K1's closed list (`nodes`, `pods`,
+ * `apps/replicasets` list/watch): when the apiserver refuses one of those
+ * three with 403, `ResourceWatch.forbidden` is true and the collector already
+ * knows the specific, actionable reason — so `apiserverForbidden: true` forces
+ * `state: "forbidden"` even where the per-node data alone would have said
+ * `degraded` (empty `nodes`) or, in the rarer case of a mid-session RBAC
+ * revocation, even `active` (stale, previously-discovered nodes whose kubelets
+ * still answer). A 401, a 5xx or a network error on the same watches is NOT
+ * this signal — `ResourceWatch` only sets it on a 403 — and stays `degraded`,
+ * because those are not evidence the manifest is missing.
  *
  * ─── Why `nodes` carries only the nodes that are NOT ok ─────────────────────
  *
@@ -428,7 +449,10 @@ function wireNodeState(code: NodeStateCode): SampleCollectorNodeState {
  * ("did not look"), and with no node answering, the honest answer is the second
  * one. A `false` there would be a measurement the agent never made.
  */
-export function collectorStatusOf(nodes: readonly NodeState[]): SampleCollectorStatus {
+export function collectorStatusOf(
+  nodes: readonly NodeState[],
+  options: { readonly apiserverForbidden?: boolean } = {},
+): SampleCollectorStatus {
   const answering = nodes.filter((node) => node.state === "ok");
   const failing = nodes
     .filter((node) => node.state !== "ok")
@@ -440,11 +464,16 @@ export function collectorStatusOf(nodes: readonly NodeState[]): SampleCollectorS
     answering.length === 0 ? undefined : answering.every((node) => !node.ioUnmeasurable);
 
   const refused =
-    nodes.length > 0 &&
-    answering.length === 0 &&
-    nodes.every((node) => node.state === "forbidden" || node.state === "unauthorized");
+    options.apiserverForbidden === true ||
+    (nodes.length > 0 &&
+      answering.length === 0 &&
+      nodes.every((node) => node.state === "forbidden" || node.state === "unauthorized"));
   const healthy =
-    answering.length > 0 && failing.length === 0 && psiAvailable === true && ioMeasurable === true;
+    !refused &&
+    answering.length > 0 &&
+    failing.length === 0 &&
+    psiAvailable === true &&
+    ioMeasurable === true;
 
   return {
     state: refused ? "forbidden" : healthy ? "active" : "degraded",

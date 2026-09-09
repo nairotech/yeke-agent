@@ -323,12 +323,32 @@ export interface ResourceWatchOptions<T> {
   readonly target: KubeTarget;
   /** e.g. `/api/v1/pods`, `/apis/apps/v1/replicasets`, `/api/v1/nodes`. */
   readonly path: string;
+  /**
+   * Short label for this watch's resource, e.g. `"nodes"`, `"pods"`,
+   * `"replicasets"`. Used only for the forbidden/restored log line — the
+   * operator reading `kubectl logs` needs to know WHICH of the closed list's
+   * three watches the ClusterRole is missing, not just that one of them is.
+   */
+  readonly resource: string;
   /** `true` for pods and ReplicaSets; `false` for nodes (K4 allows the body). */
   readonly metadataOnly: boolean;
   readonly decode: (raw: unknown) => T | undefined;
   readonly handlers: WatchHandlers<T>;
   /** Backoff after a failed watch. Injected so the tests do not sleep. */
   readonly retryMs?: number;
+}
+
+/**
+ * An apiserver response outside 2xx, carrying the status code so the catch
+ * site can tell a 403 (RBAC — the manifest needs re-applying) apart from a 401
+ * (identity, already handled by `invalidateCredential`), a 5xx or a watch
+ * that simply timed out. A bare `Error` with the code baked into the message
+ * would make that distinction a string parse; this makes it a field.
+ */
+class ApiserverHttpError extends Error {
+  constructor(readonly statusCode: number) {
+    super(`HTTP ${statusCode}`);
+  }
 }
 
 /**
@@ -356,6 +376,22 @@ export class ResourceWatch<T> {
    * failing.
    */
   failures = 0;
+  /**
+   * True when the MOST RECENT attempt (LIST or WATCH) was refused with 403.
+   *
+   * Not latched across error types: a 401, a 5xx or a network error after a
+   * 403 clears it, because those are not evidence the manifest is missing —
+   * only a 403 is. A successful LIST also clears it. This is what
+   * `Collector` reads to tell the wire the whole collector is `forbidden`
+   * rather than merely `degraded` (`collectorStatusOf` in `wire.ts`).
+   */
+  #forbidden = false;
+  /** So the log line below fires on a CHANGE, not on every five-second retry. */
+  #loggedForbidden = false;
+
+  get forbidden(): boolean {
+    return this.#forbidden;
+  }
 
   constructor(options: ResourceWatchOptions<T>) {
     this.#options = options;
@@ -380,10 +416,17 @@ export class ResourceWatch<T> {
     while (this.#running) {
       try {
         const resourceVersion = await this.#list();
+        this.#setForbidden(false);
         await this.#watch(resourceVersion);
       } catch (err) {
         if (!this.#running) return;
         this.failures += 1;
+        // A 403 on `nodes`/`pods`/`apps/replicasets` LIST or WATCH is the
+        // closed-list RBAC failure K1 names: the manifest was not re-applied
+        // after the ClusterRole gained these verbs. Anything else — 401
+        // (already handled below), a 5xx, a timeout, DNS — is not evidence of
+        // that, and stays `degraded` at the collector level.
+        this.#setForbidden(err instanceof ApiserverHttpError && err.statusCode === 403);
         // Foreign text, verbatim. The operator reading `kubectl logs` is the
         // audience; the control plane is told through the collector's state,
         // not through this line.
@@ -395,6 +438,23 @@ export class ResourceWatch<T> {
         await delay(this.#retryMs);
       }
     }
+  }
+
+  /**
+   * Updates `#forbidden` and, only on a CHANGE, logs which resource is
+   * denied. Without the change guard this would log every five seconds for
+   * as long as the manifest stays stale — "durum değişince, dakikada bir
+   * değil".
+   */
+  #setForbidden(forbidden: boolean): void {
+    this.#forbidden = forbidden;
+    if (forbidden === this.#loggedForbidden) return;
+    this.#loggedForbidden = forbidden;
+    console.warn(
+      forbidden
+        ? `[metrics] apiserver denied ${this.#options.resource} (403) — re-apply the agent manifest to grant list/watch on ${this.#options.resource}`
+        : `[metrics] apiserver access to ${this.#options.resource} restored`,
+    );
   }
 
   async #list(): Promise<string> {
@@ -438,7 +498,7 @@ export class ResourceWatch<T> {
     }
     if (response.statusCode >= 300) {
       await response.body.dump();
-      throw new Error(`HTTP ${response.statusCode}`);
+      throw new ApiserverHttpError(response.statusCode);
     }
 
     for await (const line of ndjson(response.body)) {
@@ -486,11 +546,11 @@ export class ResourceWatch<T> {
       // The apiserver path's own hook: the cached identity is dropped and the
       // next call resolves it again (`KubeTarget.invalidateCredential`).
       this.#options.target.invalidateCredential("apiserver returned 401");
-      throw new Error("HTTP 401");
+      throw new ApiserverHttpError(401);
     }
     if (response.statusCode >= 300) {
       await response.body.dump();
-      throw new Error(`HTTP ${response.statusCode}`);
+      throw new ApiserverHttpError(response.statusCode);
     }
     return response.body.json();
   }

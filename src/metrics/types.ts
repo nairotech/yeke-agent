@@ -284,6 +284,21 @@ export interface InternalFrame {
   readonly values: Float32Array;
   readonly nodes: readonly NodeState[];
   readonly dropped: number;
+  /**
+   * True when the apiserver denied one of the three closed-list watches
+   * (`nodes`, `pods`, `apps/replicasets`) with 403 on the most recent attempt.
+   *
+   * This is NOT the same signal as a per-node `forbidden` in `nodes` above:
+   * that one is the KUBELET refusing `nodes/stats`/`nodes/metrics` for one
+   * node, reported per node because it can be an RBAC boundary inside the
+   * fleet. This one is the APISERVER refusing node/pod/ReplicaSet discovery
+   * itself — without it the collector cannot even enumerate what to read, so
+   * it is a whole-collector fact, not a per-node one, and `collectorStatusOf`
+   * turns it into `state: "forbidden"` regardless of what `nodes` says (a node
+   * watch denied by RBAC typically means `nodes` is empty anyway, but a
+   * mid-session revocation can leave stale, still-answering entries in it).
+   */
+  readonly apiserverForbidden: boolean;
 }
 
 /** A frame's entities. Named so call sites do not reach through the layout. */
@@ -349,6 +364,8 @@ export function packFrame(input: {
   readonly samples: readonly Sample[];
   readonly nodes: readonly NodeState[];
   readonly previous?: FrameLayout | undefined;
+  /** Defaults to `false`: most callers (every existing fixture) do not care. */
+  readonly apiserverForbidden?: boolean;
 }): InternalFrame {
   const entityIds: string[] = [];
   const metrics: MetricName[] = [];
@@ -377,6 +394,7 @@ export function packFrame(input: {
     values,
     nodes: input.nodes,
     dropped: 0,
+    apiserverForbidden: input.apiserverForbidden ?? false,
   };
 }
 

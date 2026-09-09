@@ -9,7 +9,19 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { type MetaRecord, decodeMeta, decodeNode, parseQuantity, resolveOwner } from "./owners.js";
+import { createServer, type Server } from "node:http";
+import type { AddressInfo } from "node:net";
+import { Agent } from "undici";
+import {
+  type MetaRecord,
+  type NodeRecord,
+  ResourceWatch,
+  decodeMeta,
+  decodeNode,
+  parseQuantity,
+  resolveOwner,
+} from "./owners.js";
+import type { KubeTarget } from "../kube.js";
 
 function record(
   uid: string,
@@ -205,4 +217,177 @@ test("a node with no InternalIP decodes without an address", () => {
   });
   assert.equal(node?.address, undefined);
   assert.equal(node?.ready, false);
+});
+
+/**
+ * `ResourceWatch` against a fake apiserver: what a closed-list LIST/WATCH
+ * failure looks like from the outside, and specifically whether a 403 is
+ * told apart from every other way the apiserver can refuse.
+ *
+ * A plain `http` server, not TLS: `ResourceWatch` dials `target.baseUrl`
+ * through undici's `request`, which speaks both schemes, and the point of
+ * these tests is the status-code branch, not the transport. `status` is
+ * mutable so a test can simulate the manifest being re-applied mid-run
+ * without tearing the server down and racing a port back into use.
+ */
+interface FakeApiserver {
+  port: number;
+  status: number;
+  close(): Promise<void>;
+}
+
+async function fakeApiserver(status: number): Promise<FakeApiserver> {
+  const state = { status };
+  const server: Server = createServer((_req, res) => {
+    if (state.status === 200) {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ metadata: { resourceVersion: "1" }, items: [] }));
+      return;
+    }
+    res.writeHead(state.status, { "content-type": "application/json" });
+    res.end(JSON.stringify({ kind: "Status", status: "Failure", code: state.status }));
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  return {
+    port: (server.address() as AddressInfo).port,
+    get status() {
+      return state.status;
+    },
+    set status(value: number) {
+      state.status = value;
+    },
+    close: () =>
+      new Promise<void>((resolve) => {
+        server.closeAllConnections?.();
+        server.close(() => resolve());
+      }),
+  };
+}
+
+function targetFor(port: number): KubeTarget {
+  return {
+    baseUrl: `http://127.0.0.1:${port}`,
+    authHeaders: async () => ({}),
+    dispatcher: new Agent(),
+    tlsOptions: () => ({ rejectUnauthorized: true }),
+    invalidateCredential: () => undefined,
+    close: async () => undefined,
+  };
+}
+
+const NOOP_HANDLERS = {
+  applied: () => undefined,
+  deleted: () => undefined,
+  resynced: () => undefined,
+};
+
+async function waitUntil(condition: () => boolean, timeoutMs = 2000): Promise<void> {
+  const start = Date.now();
+  while (!condition()) {
+    if (Date.now() - start > timeoutMs) {
+      throw new Error("timed out waiting for the condition");
+    }
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+}
+
+test("a closed-list watch denied with 403 is classified forbidden, not just a failure", async () => {
+  const api = await fakeApiserver(403);
+  const watch = new ResourceWatch<MetaRecord>({
+    target: targetFor(api.port),
+    path: "/api/v1/pods",
+    resource: "pods",
+    metadataOnly: true,
+    decode: (raw) => decodeMeta(raw, "Pod"),
+    handlers: NOOP_HANDLERS,
+    retryMs: 10,
+  });
+  try {
+    watch.start();
+    // MEASURED (this is the "kırmızı gör" step): before this fix `ResourceWatch`
+    // had no `forbidden` signal at all -- a 403 and a 500 both just incremented
+    // `failures` and were indistinguishable to any caller.
+    await waitUntil(() => watch.failures >= 1);
+    assert.equal(watch.forbidden, true);
+  } finally {
+    await watch.stop();
+    await api.close();
+  }
+});
+
+test("a 500 on the same watch stays a plain failure, not forbidden", async () => {
+  const api = await fakeApiserver(500);
+  const watch = new ResourceWatch<NodeRecord>({
+    target: targetFor(api.port),
+    path: "/api/v1/nodes",
+    resource: "nodes",
+    metadataOnly: false,
+    decode: decodeNode,
+    handlers: NOOP_HANDLERS,
+    retryMs: 10,
+  });
+  try {
+    watch.start();
+    await waitUntil(() => watch.failures >= 1);
+    // 401/5xx/network are the "degraded, not forbidden" half of the rule: only
+    // a 403 is evidence the manifest needs re-applying.
+    assert.equal(watch.forbidden, false);
+  } finally {
+    await watch.stop();
+    await api.close();
+  }
+});
+
+test("a 401 on the same watch is degraded, not forbidden, and still invalidates the credential", async () => {
+  const api = await fakeApiserver(401);
+  let invalidated = 0;
+  const target: KubeTarget = {
+    ...targetFor(api.port),
+    invalidateCredential: () => {
+      invalidated += 1;
+    },
+  };
+  const watch = new ResourceWatch<MetaRecord>({
+    target,
+    path: "/apis/apps/v1/replicasets",
+    resource: "replicasets",
+    metadataOnly: true,
+    decode: (raw) => decodeMeta(raw, "ReplicaSet"),
+    handlers: NOOP_HANDLERS,
+    retryMs: 10,
+  });
+  try {
+    watch.start();
+    await waitUntil(() => watch.failures >= 1);
+    assert.equal(watch.forbidden, false);
+    assert.ok(invalidated >= 1, "a 401 must still drop the cached credential");
+  } finally {
+    await watch.stop();
+    await api.close();
+  }
+});
+
+test("forbidden clears once the watch's LIST succeeds again", async () => {
+  const api = await fakeApiserver(403);
+  const watch = new ResourceWatch<MetaRecord>({
+    target: targetFor(api.port),
+    path: "/api/v1/pods",
+    resource: "pods",
+    metadataOnly: true,
+    decode: (raw) => decodeMeta(raw, "Pod"),
+    handlers: NOOP_HANDLERS,
+    retryMs: 10,
+  });
+  try {
+    watch.start();
+    await waitUntil(() => watch.forbidden === true);
+
+    // The manifest gets re-applied: the next LIST succeeds.
+    api.status = 200;
+    await waitUntil(() => watch.forbidden === false);
+    assert.equal(watch.forbidden, false);
+  } finally {
+    await watch.stop();
+    await api.close();
+  }
 });

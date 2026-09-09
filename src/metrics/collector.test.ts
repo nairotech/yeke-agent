@@ -12,10 +12,12 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createServer, type Server } from "node:https";
+import { createServer as createHttpServer } from "node:http";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AddressInfo } from "node:net";
+import { Agent } from "undici";
 import { Collector, MIN_CORE_PROTOCOL_FOR_METRICS, shouldCollect } from "./collector.js";
 import {
   type FixturePod,
@@ -66,6 +68,44 @@ const NO_APISERVER: KubeTarget = {
   invalidateCredential: () => undefined,
   close: async () => undefined,
 };
+
+/**
+ * A fake apiserver that answers every LIST/WATCH with one HTTP status — for
+ * exercising `ResourceWatch`'s classification of that status through the real
+ * `Collector.start()` path, not just the wire's `collectorStatusOf` math.
+ * Plain `http`, not TLS: the point is the status code, not the transport.
+ */
+async function fakeApiserver(status: number): Promise<{ target: KubeTarget; close(): Promise<void> }> {
+  const server = createHttpServer((_req, res) => {
+    res.writeHead(status, { "content-type": "application/json" });
+    res.end(JSON.stringify({ kind: "Status", status: "Failure", code: status }));
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const port = (server.address() as AddressInfo).port;
+  return {
+    target: {
+      baseUrl: `http://127.0.0.1:${port}`,
+      authHeaders: async () => ({}),
+      dispatcher: new Agent(),
+      tlsOptions: () => ({ rejectUnauthorized: true }),
+      invalidateCredential: () => undefined,
+      close: async () => undefined,
+    },
+    close: () =>
+      new Promise<void>((resolve) => {
+        server.closeAllConnections?.();
+        server.close(() => resolve());
+      }),
+  };
+}
+
+async function waitUntil(condition: () => boolean, timeoutMs = 2000): Promise<void> {
+  const start = Date.now();
+  while (!condition()) {
+    if (Date.now() - start > timeoutMs) throw new Error("timed out waiting for the condition");
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+}
 
 interface FakeNode {
   readonly name: string;
@@ -331,6 +371,50 @@ test("a 403 is reported per node as the 'reapply the manifest' state", async () 
     assert.equal(frame!.values.length, 0);
   } finally {
     await h.close();
+  }
+});
+
+test("apiserver 403 on the node watch marks the frame apiserverForbidden, with no nodes at all", async () => {
+  // The real-world shape of the bug this fix addresses: an old manifest was
+  // never re-applied, so `nodes` LIST/WATCH is 403'd from the apiserver side.
+  // The collector never discovers a node to poll -- `#nodes` stays empty for
+  // every tick -- and BEFORE this fix that produced a frame indistinguishable
+  // from "no nodes exist yet", which `collectorStatusOf` reports `degraded`.
+  const api = await fakeApiserver(403);
+  const kubelet = new KubeletClient({
+    token: { read: async () => "tok", invalidate: () => undefined },
+    insecureTls: true,
+  });
+  const sink = new RecordingSink();
+  let clock = START_MS;
+  const collector = new Collector({
+    target: api.target,
+    kubelet,
+    sink,
+    periodMs: PERIOD_MS,
+    now: () => clock,
+  });
+  try {
+    collector.start();
+    // Give the three watches' first LIST attempt time to land a 403.
+    await waitUntil(() => collector.stats().apiserverForbidden.includes("nodes"));
+
+    const frame = await collector.tick();
+    clock += PERIOD_MS;
+
+    assert.deepEqual(frame?.nodes, []);
+    // MEASURED (the "kırmızı gör" step): before this fix `InternalFrame` had
+    // no `apiserverForbidden` field, so this was always `undefined` here.
+    assert.equal(frame?.apiserverForbidden, true);
+    assert.deepEqual(collector.stats().apiserverForbidden.slice().sort(), [
+      "nodes",
+      "pods",
+      "replicasets",
+    ]);
+  } finally {
+    await collector.stop();
+    await kubelet.close();
+    await api.close();
   }
 });
 

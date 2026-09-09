@@ -88,6 +88,7 @@ test("what the ring holds is countable without a garbage collector", () => {
       values: new Float32Array(1000),
       nodes: [],
       dropped: 0,
+      apiserverForbidden: false,
     });
   }
   const retained = ring.retained();
