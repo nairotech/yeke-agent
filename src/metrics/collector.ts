@@ -117,6 +117,13 @@ export interface CollectorStats {
   readonly samplesLastFrame: number;
   /** Failed LIST/WATCH attempts against the apiserver, across the three watches. */
   readonly watchFailures: number;
+  /**
+   * Which of `nodes`/`pods`/`replicasets` the apiserver most recently denied
+   * with 403, right now. Empty in the common case. This is what turns into
+   * `apiserverForbidden` on the frame and, from there, `state: "forbidden"`
+   * on the wire (`collectorStatusOf`, `wire.ts`).
+   */
+  readonly apiserverForbidden: readonly string[];
   /** Bytes of sample data the ring is holding right now (exact). */
   readonly ringValueBytes: number;
   /** Distinct layout objects the ring is holding. One means the sharing works. */
@@ -173,6 +180,7 @@ export class Collector {
     this.#nodeWatch = new ResourceWatch<NodeRecord>({
       target: this.#options.target,
       path: "/api/v1/nodes",
+      resource: "nodes",
       // K4 permits the full node object: addresses, allocatable, conditions.
       metadataOnly: false,
       decode: decodeNode,
@@ -191,10 +199,11 @@ export class Collector {
       },
     });
 
-    this.#podWatch = this.#metadataWatch("/api/v1/pods", "Pod", this.#pods);
+    this.#podWatch = this.#metadataWatch("/api/v1/pods", "Pod", "pods", this.#pods);
     this.#replicaSetWatch = this.#metadataWatch(
       "/apis/apps/v1/replicasets",
       "ReplicaSet",
+      "replicasets",
       undefined,
     );
 
@@ -230,9 +239,23 @@ export class Collector {
         (this.#nodeWatch?.failures ?? 0) +
         (this.#podWatch?.failures ?? 0) +
         (this.#replicaSetWatch?.failures ?? 0),
+      apiserverForbidden: this.#apiserverForbiddenResources(),
       ringValueBytes: retained.valueBytes,
       ringLayouts: retained.layouts,
     };
+  }
+
+  /**
+   * Which of the three closed-list watches the apiserver most recently
+   * refused with 403, right now. Empty when none is (the common case, and
+   * every case before the manifest goes stale).
+   */
+  #apiserverForbiddenResources(): readonly string[] {
+    const resources: string[] = [];
+    if (this.#nodeWatch?.forbidden) resources.push("nodes");
+    if (this.#podWatch?.forbidden) resources.push("pods");
+    if (this.#replicaSetWatch?.forbidden) resources.push("replicasets");
+    return resources;
   }
 
   /** Feeds the index directly. The measurement harness and the tests use it. */
@@ -252,12 +275,14 @@ export class Collector {
   #metadataWatch(
     path: string,
     kind: string,
+    resource: string,
     into: Map<string, MetaRecord> | undefined,
   ): ResourceWatch<MetaRecord> {
     return new ResourceWatch<MetaRecord>({
       target: this.#options.target,
       metadataOnly: true,
       path,
+      resource,
       decode: (raw) => decodeMeta(raw, kind),
       handlers: {
         applied: (record) => {
@@ -386,6 +411,7 @@ export class Collector {
       samples,
       nodes: nodeStates,
       previous: this.#lastLayout,
+      apiserverForbidden: this.#apiserverForbiddenResources().length > 0,
     });
     this.#lastLayout = frame.layout;
     return frame;

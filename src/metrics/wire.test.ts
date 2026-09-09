@@ -575,3 +575,40 @@ test("the collector's state is a claim about the whole cluster, per node where i
     { state: "degraded", ioMeasurable: false, psiAvailable: false },
   );
 });
+
+test("apiserver 403 on a closed-list watch reports the collector forbidden, not degraded", () => {
+  // This is exactly the shape a 403'd `nodes` LIST produces: the collector
+  // never discovers a node to poll, so the per-node list is empty. Before
+  // this fix an empty node list could not be told apart from "the cluster
+  // has none yet", and both produced `degraded` -- the wrong advice ("wait,
+  // it will recover") for an RBAC problem whose fix is "re-apply the
+  // manifest" (`ResourceWatch.forbidden` in `owners.ts`).
+  assert.deepEqual(collectorStatusOf([], { apiserverForbidden: true }), { state: "forbidden" });
+
+  // Explicitly false, or omitted (the default): the empty-node-list case is
+  // unaffected and stays `degraded`, exactly as before this fix.
+  assert.deepEqual(collectorStatusOf([], { apiserverForbidden: false }), { state: "degraded" });
+  assert.deepEqual(collectorStatusOf([]), { state: "degraded" });
+
+  // A mid-session RBAC revocation: the node watch is now denied, but a node
+  // discovered before the revocation is still in the index and its kubelet
+  // still answers. Per-node data alone would say `active`; the apiserver
+  // problem is real regardless and the STATE says `forbidden` -- but what
+  // that one node actually reported is not thrown away, same as the existing
+  // "some nodes answer, one is blind" case above.
+  assert.deepEqual(collectorStatusOf([okNode("node-a")], { apiserverForbidden: true }), {
+    state: "forbidden",
+    ioMeasurable: true,
+    psiAvailable: true,
+  });
+
+  // A plain failure on the same watch (401/5xx/network) is NOT this signal --
+  // `ResourceWatch` only sets `forbidden` on a 403 -- so it stays `degraded`.
+  assert.deepEqual(
+    collectorStatusOf(
+      [{ node: "node-a", state: "unreachable", psi: false, ioUnmeasurable: false }],
+      { apiserverForbidden: false },
+    ),
+    { state: "degraded", nodes: [{ name: "node-a", state: "unreachable" }] },
+  );
+});
