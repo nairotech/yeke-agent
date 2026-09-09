@@ -23,9 +23,9 @@
  *
  * The projected ServiceAccount token rotates, and a token cached in memory
  * starts returning 401 some time after the kubelet swaps the file. This is not
- * a hypothesis: it is the documented failure of the OpenTelemetry kubeletstats
- * receiver (open-telemetry/opentelemetry-collector-contrib #26120), and K4
- * names it.
+ * a hypothesis: it is the documented failure of the OTel Collector's
+ * kubeletstats receiver (otel collector-contrib issue #26120), and K4 names
+ * it.
  *
  * `serviceAccountToken` from `src/kube.ts` is reused rather than re-written, so
  * that a token read failure is classified as an IDENTITY failure here exactly
@@ -50,7 +50,7 @@
  * this code: kubeadm does not sign kubelet serving certificates with the
  * cluster CA by default (`serverTLSBootstrap` is off), which is why
  * metrics-server ships `--kubelet-insecure-tls` in most installation guides and
- * the OpenTelemetry receiver's documentation suggests
+ * the OTel kubeletstats receiver's documentation suggests
  * `insecure_skip_verify: true`.
  *
  * YEKE does not do that silently. A node whose certificate cannot be verified
