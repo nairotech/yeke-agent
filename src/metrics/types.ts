@@ -451,14 +451,25 @@ export function packFrame(input: {
  *  · `ready` — is there a wire at all? False while the tunnel is down. Frames
  *    accumulate in the ring (K5's 30-minute buffer).
  *  · `busy`  — is a USER request in flight? K5 gives a queued `req` priority
- *    over a sample frame. The collector simply does not send this tick; the
- *    ring already holds the frame, so yielding costs nothing and needs no
- *    second queue.
+ *    over a sample frame. The collector does not send THIS tick; the ring
+ *    already holds the frame, so one tick of yielding costs nothing and needs
+ *    no second queue.
  *
  * Collapsing them into one boolean was rejected: the same `false` would then
  * mean "disconnected" and "wait your turn", and every reader downstream would
  * have to guess which. A flag with two meanings is a bug waiting for its
  * second reader.
+ *
+ * ─── `busy` is bounded on the READER's side, and why that is written here ───
+ *
+ * "Yielding costs nothing" is true of one tick and false of a hundred. The
+ * sentence above was read as a veto, and the veto silenced a cluster for
+ * eleven minutes on 09.09.2026 (`collector.ts`, header): the control plane
+ * holds long-lived apiserver watches open through the tunnel, so `busy` is not
+ * a brief queue — it is the normal state of a control plane with a screen
+ * open. The bound lives in `Collector.#drain`, and it is named here because
+ * this is the doc comment a future implementer of the sink will read before
+ * deciding what `busy` is allowed to mean.
  */
 export interface SampleSink {
   readonly ready: boolean;
@@ -467,9 +478,10 @@ export interface SampleSink {
    * Hands one frame to the wire.
    *
    * Returns false when the frame was NOT accepted; the collector keeps it in
-   * the ring and retries on the next tick. An implementation must not throw:
-   * the collector's tick is the only thing standing between a kubelet read and
-   * an unhandled rejection.
+   * the ring and retries on the next tick. An implementation must not throw —
+   * and since 09.09.2026 the collector does not rely on that: a pass that
+   * throws is counted and the timer chain runs again either way. The rule
+   * stands as a rule; it is no longer the only thing holding the door shut.
    */
   push(frame: InternalFrame): boolean;
 }
