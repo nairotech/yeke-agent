@@ -227,6 +227,17 @@ const SAMPLES_PER_WIRE_FRAME = 2;
 export interface MetricsCollector {
   start(): void;
   stop(): Promise<void>;
+  /** Frames the ring is holding, for the line the reconnect writes. */
+  readonly queuedFrames: number;
+  /**
+   * Drain the ring onto the wire now.
+   *
+   * The reconnect path calls it: K5's half hour of buffered history drains
+   * "when the tunnel returns", and the collector's own next tick can be thirty
+   * seconds away — thirty seconds in which the control plane's screen has a
+   * hole it did not need to have.
+   */
+  flush(): void;
 }
 
 /**
@@ -272,6 +283,10 @@ const inClusterCollector: CollectorFactory = async ({ target, sink, config }) =>
   const collector = new Collector({ target, kubelet, sink });
   return {
     start: () => collector.start(),
+    get queuedFrames() {
+      return collector.queuedFrames;
+    },
+    flush: () => collector.flush(),
     // The connection pool belongs to this collector and nothing else holds it;
     // leaving it open would keep 50 keep-alive sockets to kubelets after the
     // agent decided to stop reading them.
@@ -616,7 +631,18 @@ export class TunnelClient {
   async #startCollector(): Promise<void> {
     if (!this.#config.metricsEnabled) return;
     if (!shouldCollect(this.#protocol)) return;
-    if (this.#collector || this.#collectorStarting) return;
+    if (this.#collectorStarting) return;
+    // A reconnect. The collector outlived the session on purpose (see the field
+    // below), so there is nothing to start — but there IS a ring holding
+    // everything the outage produced, and K5 says it drains when the wire comes
+    // back. The line is the operator's copy of that: `started` happens once in
+    // the life of a pod and `resumed` says how much history is on its way.
+    if (this.#collector) {
+      const queued = this.#collector.queuedFrames;
+      console.log(`[metrics] collector resumed, ${queued} frames queued`);
+      this.#collector.flush();
+      return;
+    }
     const target = this.#target;
     if (!target) return;
 
