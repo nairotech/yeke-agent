@@ -338,7 +338,14 @@ export class KubeletClient {
         if (TLS_VERIFY_CODES.has(code)) {
           this.counters.tlsUnverified += 1;
           // K4: no data for this node. Not a partial reading, not a zero.
-          return { state: "tls-unverified", detail };
+          //
+          // The OpenSSL code is prefixed onto the message here, not left for
+          // the caller to look up separately: `collector.ts` logs this
+          // `detail` verbatim on a state change, and the code is the part of
+          // it that survives across Node releases (see the header comment on
+          // `TLS_VERIFY_CODES` above) -- the operator reading `kubectl logs`
+          // gets a stable string to search for, not just foreign prose.
+          return { state: "tls-unverified", detail: `${code} — ${detail}` };
         }
         if (code === "UND_ERR_HEADERS_TIMEOUT" || code === "UND_ERR_BODY_TIMEOUT") {
           this.counters.timeout += 1;

@@ -33,6 +33,7 @@ import { KubeletClient, type KubeletReader, type KubeletResult, type KubeletTarg
 import {
   type InternalFrame,
   type MetricName,
+  type NodeStateCode,
   type SampleSink,
   entitiesOf,
   frameValue,
@@ -773,9 +774,18 @@ const STUB_NODE: NodeRecord = {
 /** A kubelet that answers, hangs or throws, on command and without a network. */
 class StubKubelet implements KubeletReader {
   mode: "ok" | "throw" | "hang" = "ok";
+  /**
+   * When set, `summary()` returns this per-node state instead of running
+   * `mode`. Lets a test drive `tls-unverified` / `unreachable` state CHANGES
+   * tick by tick, without a real socket -- the same seam-above-the-transport
+   * reasoning as the rest of this stub (see the block comment above).
+   */
+  nodeState: Exclude<NodeStateCode, "ok"> | undefined;
+  nodeStateDetail: string | undefined;
   reads = 0;
   async summary<T>(): Promise<KubeletResult<T>> {
     this.reads += 1;
+    if (this.nodeState) return { state: this.nodeState, detail: this.nodeStateDetail };
     if (this.mode === "throw") throw new Error("the kubelet answered something unreadable");
     if (this.mode === "hang") return new Promise<KubeletResult<T>>(() => undefined);
     return {
@@ -1051,6 +1061,116 @@ test("flush drains the ring without waiting for the next tick", async () => {
       [1, 2, 3],
     );
     assert.equal(h.collector.queuedFrames, 0);
+  } finally {
+    await h.collector.stop();
+  }
+});
+
+/**
+ * F9, 09.09.2026: a live agent on a Kubespray cluster (`c-10`) reported "1
+ * node: TLS doğrulanamadı" on the screen with NOTHING in `kubectl logs` —
+ * `#classify` produced `{ state: "tls-unverified", detail }` and the detail
+ * was never logged anywhere. These three tests are the state-change guard
+ * added for it (`Collector#logNodeState`), following the precedent already
+ * set by `ResourceWatch#setForbidden` in `owners.ts`.
+ */
+test("a kubelet TLS rejection is logged once on the state change, with the remedy, node and address", async () => {
+  const h = stubHarness();
+  h.kubelet.nodeState = "tls-unverified";
+  h.kubelet.nodeStateDetail = "DEPTH_ZERO_SELF_SIGNED_CERT — self-signed certificate";
+  try {
+    const captures = await captured(async () => {
+      await h.tick();
+    });
+    const tlsLines = captures.warn.filter((line) => line.includes("TLS verification failed"));
+    assert.equal(tlsLines.length, 1, JSON.stringify(captures.warn));
+    const line = tlsLines[0] ?? "";
+    assert.ok(line.includes("node-a"), line);
+    assert.ok(line.includes("10.0.0.1"), line);
+    assert.ok(line.includes("DEPTH_ZERO_SELF_SIGNED_CERT"), line);
+    assert.ok(line.includes("YEKE_KUBELET_INSECURE_TLS=true"), line);
+    assert.ok(line.includes("serverTLSBootstrap"), line);
+    assert.ok(line.includes("kubelet_rotate_server_certificates"), line);
+  } finally {
+    await h.collector.stop();
+  }
+});
+
+test("13 consecutive TLS rejections still produce exactly one line (owners.ts#setForbidden precedent)", async () => {
+  const h = stubHarness();
+  h.kubelet.nodeState = "tls-unverified";
+  h.kubelet.nodeStateDetail = "DEPTH_ZERO_SELF_SIGNED_CERT — self-signed certificate";
+  try {
+    const captures = await captured(async () => {
+      // One tick to enter the state, thirteen more that repeat it. At the
+      // default 30-second period this is seven minutes of an operator
+      // watching "0/1 node reporting" with the failure logged only once.
+      for (let round = 0; round < 14; round += 1) await h.tick();
+    });
+    const tlsLines = captures.warn.filter((line) => line.includes("TLS verification failed"));
+    assert.equal(
+      tlsLines.length,
+      1,
+      `14 consecutive rejections logged more than once: ${JSON.stringify(captures.warn)}`,
+    );
+  } finally {
+    await h.collector.stop();
+  }
+});
+
+test("a node's return to ok after a TLS rejection is logged once, and does not repeat the failure line", async () => {
+  const h = stubHarness();
+  h.kubelet.nodeState = "tls-unverified";
+  h.kubelet.nodeStateDetail = "DEPTH_ZERO_SELF_SIGNED_CERT — self-signed certificate";
+  try {
+    await captured(async () => {
+      await h.tick();
+    });
+
+    // Certificate rotation completed, or YEKE_KUBELET_INSECURE_TLS was set:
+    // the next read succeeds.
+    h.kubelet.nodeState = undefined;
+    const recovered = await captured(async () => {
+      await h.tick();
+    });
+    const nodeLines = recovered.warn.filter((line) => line.includes("node-a") && line.includes("10.0.0.1"));
+    assert.equal(nodeLines.length, 1, JSON.stringify(recovered.warn));
+    assert.ok(nodeLines[0]?.includes("recovered from tls-unverified"), nodeLines[0]);
+    assert.ok(!nodeLines[0]?.includes("TLS verification failed"), nodeLines[0]);
+
+    // And it does not repeat while the node stays healthy.
+    const steady = await captured(async () => {
+      for (let round = 0; round < 5; round += 1) await h.tick();
+    });
+    assert.deepEqual(
+      steady.warn.filter((line) => line.includes("node-a") && line.includes("10.0.0.1")),
+      [],
+    );
+  } finally {
+    await h.collector.stop();
+  }
+});
+
+test("an unreachable kubelet is logged once on the change too, with the reason and address", async () => {
+  const h = stubHarness();
+  h.kubelet.nodeState = "unreachable";
+  h.kubelet.nodeStateDetail = "UND_ERR_CONNECT_TIMEOUT";
+  try {
+    const captures = await captured(async () => {
+      for (let round = 0; round < 6; round += 1) await h.tick();
+    });
+    const lines = captures.warn.filter((line) => line.includes("unreachable") && line.includes("node-a"));
+    assert.equal(lines.length, 1, `6 consecutive ticks logged more than once: ${JSON.stringify(captures.warn)}`);
+    assert.ok(lines[0]?.includes("10.0.0.1"), lines[0]);
+    assert.ok(lines[0]?.includes("UND_ERR_CONNECT_TIMEOUT"), lines[0]);
+
+    h.kubelet.nodeState = undefined;
+    const recovered = await captured(async () => {
+      await h.tick();
+    });
+    const nodeLines = recovered.warn.filter((line) => line.includes("node-a") && line.includes("10.0.0.1"));
+    assert.equal(nodeLines.length, 1, JSON.stringify(recovered.warn));
+    assert.ok(nodeLines[0]?.includes("recovered from unreachable"), nodeLines[0]);
   } finally {
     await h.collector.stop();
   }
