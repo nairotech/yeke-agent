@@ -234,6 +234,10 @@ interface Harness {
   sink: SampleSink | undefined;
   starts: number;
   stops: number;
+  /** How many times the reconnect path asked the collector to drain its ring. */
+  flushes: number;
+  /** What the ring is pretending to hold, for the `resumed` line. */
+  queued: number;
   close(): Promise<void>;
 }
 
@@ -253,7 +257,7 @@ async function harness(
     metricsEnabled: options.metricsEnabled ?? true,
   };
 
-  const state = { sink: undefined as SampleSink | undefined, starts: 0, stops: 0 };
+  const state = { sink: undefined as SampleSink | undefined, starts: 0, stops: 0, queued: 0, flushes: 0 };
   const createCollector: CollectorFactory = async (context) => {
     state.sink = context.sink;
     const collector: MetricsCollector = {
@@ -262,6 +266,12 @@ async function harness(
       },
       stop: async () => {
         state.stops += 1;
+      },
+      get queuedFrames() {
+        return state.queued;
+      },
+      flush: () => {
+        state.flushes += 1;
       },
     };
     return collector;
@@ -282,6 +292,12 @@ async function harness(
     },
     get stops() {
       return state.stops;
+    },
+    get flushes() {
+      return state.flushes;
+    },
+    set queued(value: number) {
+      state.queued = value;
     },
     async close() {
       await client.stop();
@@ -497,6 +513,34 @@ test("a reconnect restarts the dictionary, keeps counting seq, and counts the fr
     // reported as lost rather than quietly forgotten.
     assert.equal(decoded.dropped, 1);
   } finally {
+    await h.close();
+  }
+});
+
+test("a reconnect resumes the collector and drains what the outage produced", async () => {
+  const h = await harness();
+  const originalLog = console.log;
+  const lines: string[] = [];
+  console.log = (...args: unknown[]) => void lines.push(args.join(" "));
+  try {
+    await until("the collector has started", () => h.starts === 1);
+    // Fourteen frames is seven minutes of a cluster nobody could see.
+    h.queued = 14;
+
+    h.core.drop();
+    await until("the agent reconnected", () => h.core.sessions === 2);
+    await until("the collector was resumed", () => h.flushes === 1);
+
+    // Started once in the life of the pod; resumed on every reconnect, saying
+    // how much history is on its way. Both lines matter to the operator, and
+    // the absence of the second one is what made 09.09.2026 unreadable.
+    assert.equal(h.starts, 1, "the reconnect rebuilt the collector and threw the ring away");
+    assert.ok(
+      lines.some((line) => line.includes("[metrics] collector resumed, 14 frames queued")),
+      JSON.stringify(lines),
+    );
+  } finally {
+    console.log = originalLog;
     await h.close();
   }
 });
