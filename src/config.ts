@@ -11,6 +11,28 @@ export interface AgentConfig {
   kubeContext?: string;
   reconnectMinMs: number;
   reconnectMaxMs: number;
+  /**
+   * Accept kubelet server certificates that the cluster CA cannot verify.
+   *
+   * Off by default, and the default is the decision. The metrics collector
+   * verifies each kubelet's serving certificate against
+   * `/var/run/secrets/kubernetes.io/serviceaccount/ca.crt`; in a large share of
+   * real clusters that fails through no fault of the cluster's owner, because
+   * kubeadm does not sign kubelet serving certificates with the cluster CA
+   * unless `serverTLSBootstrap` is turned on. That is why metrics-server ships
+   * `--kubelet-insecure-tls` in most installation guides.
+   *
+   * The rejected alternative was to fall back to an unverified connection
+   * automatically when verification fails. It would make the product work
+   * everywhere on the first day and would silently downgrade the security of
+   * every cluster where the certificate was correct until the day it was not.
+   * The rule this repository follows is the opposite one: an obstacle is
+   * reported, never routed around. Without this flag the affected nodes carry
+   * the `tls-unverified` state and produce no data; with it, the acceptance is
+   * announced in the startup log and shown on the screen as a chip. The
+   * precedent is the direct-mode import's `acknowledgeInsecureTLS`.
+   */
+  kubeletInsecureTls: boolean;
 }
 
 // These two errors are thrown at startup, they bring the process down, and they
@@ -40,5 +62,9 @@ export function loadConfig(): AgentConfig {
     kubeContext: process.env.YEKE_KUBE_CONTEXT,
     reconnectMinMs: Number(process.env.YEKE_RECONNECT_MIN_MS ?? 1_000),
     reconnectMaxMs: Number(process.env.YEKE_RECONNECT_MAX_MS ?? 30_000),
+    // Exactly the string `true`. A weakness is accepted deliberately or not at
+    // all, and treating `1`, `yes` or `TRUE` as consent would mean a typo in a
+    // manifest could disable certificate verification across a fleet.
+    kubeletInsecureTls: process.env.YEKE_KUBELET_INSECURE_TLS === "true",
   };
 }

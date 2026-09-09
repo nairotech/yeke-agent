@@ -101,6 +101,52 @@ configure, and it does not update itself.
 
 ---
 
+## What the agent does under its own identity
+
+Almost everything that reaches your apiserver through this agent carries a
+USER's identity: the control plane supplies it and the request goes out with
+`Impersonate-User` / `Impersonate-Group`, so RBAC decides and your audit log
+names the person (`src/tunnel-client.ts`, the `impersonate` branches).
+
+There are exactly three jobs that run under the agent's OWN ServiceAccount, and
+this is the complete list:
+
+1. **A `SelfSubjectReview` health probe** — "who am I, and did my token work?".
+   It reads the agent's own identity and nothing else. Sent by the control plane
+   through the tunnel as a request with no impersonation identity.
+2. **CRD and APIService metadata watches** — the agent's connection carries a
+   watch on `customresourcedefinitions` and `apiservices` so the control plane
+   knows when a cluster's API surface changed. It observes that objects changed;
+   it does not read what is in them. Also originated by the control plane.
+3. **Kubelet statistics collection**, together with the node list and the
+   pod/ReplicaSet metadata watches it needs to attribute a number to a workload.
+   This one lives in the agent itself (`src/metrics/`): it reads
+   `/stats/summary` and `/metrics/cadvisor` from each kubelet and watches
+   `nodes`, `pods` and `replicasets`.
+
+Properties that hold for all three, and that you can check in the source:
+
+- **No object bodies.** Pods and ReplicaSets are requested as
+  `PartialObjectMetadata` (`src/metrics/owners.ts`), so the apiserver serves
+  `metadata` and never sends `spec`, `status` or `data`. Node objects ARE read in
+  full, because the collector needs each node's address and `allocatable`; a node
+  object carries no Secret. This is also why the collector does not report a
+  container restart count: that number lives in a pod's `status`, and `status` is
+  a body.
+- **No Secrets, and no writes.** None of the three creates, updates, patches or
+  deletes anything.
+- **Nothing bypasses your RBAC on the way out.** Numbers collected under the
+  agent's identity are not shown to a user until that user's own authorization
+  has been confirmed with a `SelfSubjectAccessReview` submitted under their
+  identity. A user who cannot list pods in a namespace does not see that
+  namespace's series — or its name.
+
+The list is closed on purpose. Adding a fourth entry is a design decision that
+requires revising the document that defines it, not a patch: if a feature needs
+more than these three, the feature is wrong rather than the rule.
+
+---
+
 ## Protocol and versioning
 
 The wire contract lives in `@nairotech/yeke-tunnel`, published to npm under
@@ -174,6 +220,7 @@ a default are required; the agent refuses to start without them.
 | `YEKE_KUBE_CONTEXT` | current context | Only used in `kubeconfig` mode |
 | `YEKE_RECONNECT_MIN_MS` | `1000` | Initial reconnect backoff |
 | `YEKE_RECONNECT_MAX_MS` | `30000` | Backoff ceiling |
+| `YEKE_KUBELET_INSECURE_TLS` | `false` | Accept kubelet serving certificates the cluster CA cannot verify. Off by default; see below |
 | `YEKE_VERSION` | `unknown` | Set at image build time; reported to the control plane |
 
 For kubeconfig mode the agent resolves identity itself and supports `exec`
@@ -182,6 +229,19 @@ credential plugins (GKE `gke-gcloud-auth-plugin`, EKS `aws eks get-token`,
 `username`/`password`. The removed `auth-provider` forms (`gcp`, `oidc`, `azure`)
 are refused loudly at startup rather than dropped silently; the rationale is in
 `selectCredentialLoader`.
+
+`YEKE_KUBELET_INSECURE_TLS` concerns the metrics collector only. Each kubelet's
+serving certificate is verified against the cluster CA; a node whose certificate
+does not verify produces NO data and is reported with the state
+`tls-unverified` rather than being quietly skipped or silently downgraded. In
+many clusters that verification fails through no fault of yours — kubeadm does
+not sign kubelet serving certificates with the cluster CA unless
+`serverTLSBootstrap` is enabled, which is why metrics-server ships
+`--kubelet-insecure-tls` in most installation guides. Setting this variable to
+the exact string `true` accepts that weakness explicitly; the agent announces it
+in one line at startup and the control plane shows it on screen. The two
+alternatives are to give your kubelets CA-signed serving certificates, or to
+leave those nodes without statistics.
 
 ---
 
@@ -205,8 +265,22 @@ pnpm test
 docker build -t yeke-agent:dev .
 ```
 
-`pnpm test` runs the boundary and pin gates (`src/boundary.test.ts`) together
-with the identity-classification tests (`src/kube.test.ts`).
+`pnpm test` runs the boundary and pin gates (`src/boundary.test.ts`), the
+identity-classification tests (`src/kube.test.ts`) and the metrics collector's
+own suite (`src/metrics/*.test.ts`). The TLS tests in that suite need `openssl`
+on PATH: they generate a throwaway CA and two serving certificates rather than
+carrying a private key in a public repository, and when `openssl` is missing
+they FAIL with a message saying the claim was not measured, instead of passing
+quietly.
+
+There is also a measurement harness for the collector, which is not a gate:
+
+```bash
+pnpm exec tsx src/metrics/measure.ts --nodes 50 --pods 30 --minutes 5
+```
+
+It forks a process serving 50 fake kubelets and reports the collector's CPU and
+memory. Its header says what it does and does not prove.
 
 To try it against a local cluster without a registry:
 
