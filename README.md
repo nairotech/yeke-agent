@@ -124,6 +124,13 @@ this is the complete list:
    `/stats/summary` and `/metrics/cadvisor` from each kubelet and watches
    `nodes`, `pods` and `replicasets`.
 
+   PersistentVolumeClaim fullness comes from this same read and adds nothing to
+   the list: a kubelet's Summary reports the volumes of the pods on its node,
+   and the ones bound to a claim carry that claim's name. The agent therefore
+   needs no `persistentvolumeclaims` permission of its own — and a user still
+   sees a claim's series only after their own authorization has been confirmed
+   (the third property below).
+
 Properties that hold for all three, and that you can check in the source:
 
 - **No object bodies.** Pods and ReplicaSets are requested as

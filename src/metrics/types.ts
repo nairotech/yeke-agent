@@ -42,7 +42,15 @@
  * beside the values, in `NodeState`, and not inside the number.
  */
 
-/** Entity kinds the collector can produce. `pvc` is Phase 2 (K3 table). */
+/**
+ * Entity kinds the collector can produce.
+ *
+ * `pvc` is not a fourth READ: it falls out of the Summary the collector
+ * already fetches, from the `volume[]` entries of every pod that carry a
+ * `pvcRef`. An entry without one (emptyDir, configMap, the projected service
+ * account token) is measured by the same kubelet and is NOT an entity here —
+ * it has no name an operator can look up and no lifetime of its own.
+ */
 export type EntityKind = "node" | "pod" | "pvc";
 
 /**
@@ -61,6 +69,8 @@ export type EntityKind = "node" | "pod" | "pvc";
  *  · `fs.rootUsed`      bytes, gauge — node rootfs
  *  · `fs.imageUsed`     bytes, gauge — node image filesystem
  *  · `fs.ephemeralUsed` bytes, gauge — pod ephemeral-storage
+ *  · `fs.used`          bytes, gauge — a PVC's used bytes
+ *  · `fs.inodesUsed`    count, gauge — a PVC's used inodes
  *  · `net.rxBps`        bytes per second, DERIVED from a counter
  *  · `net.txBps`        bytes per second, DERIVED from a counter
  *  · `net.errors`       errors per second, DERIVED from a counter (rx+tx)
@@ -72,6 +82,13 @@ export type EntityKind = "node" | "pod" | "pvc";
  *  · `io.writeBps`      bytes per second, DERIVED from a counter
  *  · `cpu.throttled`    ratio in [0,1], DERIVED from two counters
  *  · `restarts`         count — DECLARED, NOT PRODUCED IN PHASE 1, see below
+ *
+ * `fs.used` is the PVC's used bytes and it is deliberately NOT `fs.rootUsed`,
+ * which already means something else (a node's root filesystem). One name for
+ * two filesystems would make "which disk is this" unanswerable from a chart,
+ * and the two are never on the same entity, so nothing forces them to share a
+ * name. Its denominator (`capacityBytes`) is an ATTRIBUTE, not a series —
+ * `fs.capacity`, below.
  *
  * Three of these carry a `Bps` suffix and one does not (`net.errors`) even
  * though both are rates. The suffix is kept where the underlying counter is a
@@ -96,6 +113,8 @@ export const METRIC_NAMES = [
   "fs.rootUsed",
   "fs.imageUsed",
   "fs.ephemeralUsed",
+  "fs.used",
+  "fs.inodesUsed",
   "net.rxBps",
   "net.txBps",
   "net.errors",
@@ -142,8 +161,22 @@ export const ATTRIBUTE_NAMES = [
   "cpu.capacity",
   /** node: bytes (`status.capacity.memory`). */
   "mem.capacity",
-  /** node rootfs, or (Phase 2) a PVC's `capacityBytes` from the Summary. */
+  /**
+   * bytes — a node's rootfs capacity, or a PVC's `capacityBytes`.
+   *
+   * One name for two entity kinds, unlike `fs.rootUsed` / `fs.used` above,
+   * and the asymmetry is on purpose: a denominator is read as "capacity of
+   * the thing this row is about", so it is never ambiguous on a row. A metric
+   * is read on a CHART, next to other charts, where the entity's kind is not
+   * in front of the reader.
+   *
+   * ABSENT is a real case, not a defect: some CSI drivers report only
+   * `usedBytes` for a volume. The consequence is carried all the way to the
+   * screen — no capacity, no ratio, no invented denominator.
+   */
   "fs.capacity",
+  /** count — a PVC's total inodes (`inodes`); the denominator of `fs.inodesUsed`. */
+  "fs.inodes",
 ] as const;
 
 export type AttributeName = (typeof ATTRIBUTE_NAMES)[number];
@@ -165,7 +198,13 @@ export interface EntityOwner {
  *  · node -> `node/<nodeName>`   (`NodeStats.nodeName`; the node object supplies
  *                                 the uid as a field, not as the key)
  *  · pod  -> `pod/<uid>`         (`PodStats.podRef.uid`)
- *  · pvc  -> `pvc/<ns>/<name>`   (`VolumeStats.pvcRef`, Phase 2)
+ *  · pvc  -> `pvc/<ns>/<name>`   (`VolumeStats.pvcRef`)
+ *
+ * The PVC key is a NAME and not a uid because the Summary does not carry a
+ * PVC's uid, and — unlike a pod — a PersistentVolumeClaim's name is not
+ * recycled behind an operator's back: deleting one and creating another with
+ * the same name in the same namespace is a deliberate act on a durable
+ * object, not the routine churn a rollout produces every day.
  *
  * The rejected alternative was to key everything by uid. It fails for nodes,
  * because the Summary never carries a node uid; the collector would then be

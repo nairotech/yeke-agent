@@ -34,6 +34,10 @@
  * runs under tsx too):
  *
  *   pnpm exec tsx src/metrics/measure.ts --nodes 50 --pods 30 --minutes 5
+ *
+ * `--pvc-every N` decides how many claims the fleet carries (default 8, i.e.
+ * 200 at 50x30); `--pvc-every 0` reproduces the pre-PVC measurement, which is
+ * how the two numbers in the PVC round were compared.
  */
 import { fork } from "node:child_process";
 import { createServer, type Server } from "node:https";
@@ -53,6 +57,8 @@ interface Argv {
   pods: number;
   minutes: number;
   periodMs: number;
+  /** Every Nth pod mounts a claim of its own; 0 disables PVCs entirely. */
+  pvcEvery: number;
 }
 
 function parseArgv(argv: readonly string[]): Argv {
@@ -66,6 +72,9 @@ function parseArgv(argv: readonly string[]): Argv {
     pods: read("pods", 30),
     minutes: read("minutes", 5),
     periodMs: read("period", 30_000),
+    // 30 pods / 8 = four claims per node = 200 at 50 nodes, which is the
+    // roof document's target. `--pvc-every 0` measures the fleet without any.
+    pvcEvery: read("pvc-every", 8),
   };
 }
 
@@ -77,6 +86,7 @@ interface ServeRequest {
   readonly certPath: string;
   readonly keyPath: string;
   readonly periodMs: number;
+  readonly pvcEvery: number;
 }
 
 async function serve(config: ServeRequest): Promise<void> {
@@ -99,7 +109,18 @@ async function serve(config: ServeRequest): Promise<void> {
         res.writeHead(200, { "content-type": "application/json" });
         res.end(
           JSON.stringify(
-            summaryFixture({ node: name, pods, tick, periodMs: config.periodMs, startMs }),
+            summaryFixture({
+              node: name,
+              pods,
+              tick,
+              periodMs: config.periodMs,
+              startMs,
+              // Four claims per node at the default 30 pods, so a 50-node run
+              // carries the roof document's 200 PVCs. Every pod also reports
+              // two volumes with no claim behind them, which is what a real
+              // kubelet does and what the reader has to filter every tick.
+              pvcEvery: config.pvcEvery,
+            }),
           ),
         );
         return;
@@ -205,6 +226,7 @@ async function main(): Promise<void> {
       certPath: join(directory, "server.crt"),
       keyPath: join(directory, "server.key"),
       periodMs: argv.periodMs,
+      pvcEvery: argv.pvcEvery,
     } satisfies ServeRequest);
   });
 
@@ -230,7 +252,8 @@ async function main(): Promise<void> {
 
   console.log(
     `[measure] ${argv.nodes} kubelets x ${argv.pods} pods, period ${argv.periodMs} ms, ` +
-      `${argv.minutes} minute(s); servers in pid ${child.pid}`,
+      `every ${argv.pvcEvery}th pod mounts a claim, ${argv.minutes} minute(s); ` +
+      `servers in pid ${child.pid}`,
   );
 
   /* Run A -- DRAIN: average CPU over wall-clock time. */
@@ -287,6 +310,8 @@ async function main(): Promise<void> {
     "=== collector measurement =======================================",
     `nodes                 ${argv.nodes}`,
     `pods per node         ${argv.pods}  (total ${argv.nodes * argv.pods})`,
+    `pvc claims            ${argv.pvcEvery > 0 ? argv.nodes * Math.ceil(argv.pods / argv.pvcEvery) : 0}` +
+      `  (every ${argv.pvcEvery}th pod; each pod also reports two volumes with no claim)`,
     `period                ${argv.periodMs} ms`,
     "",
     "--- run A: sink draining ---------------------------------------",

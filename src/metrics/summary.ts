@@ -33,7 +33,23 @@
  *  · `systemContainers[]` (kubelet, runtime, pods). Node totals already contain
  *    them, and they are not entities the product has a screen for.
  *  · `swap`. Not in the Phase 1 metric set.
- *  · `volume[]` / `pvcRef`. Phase 2 (K3's table).
+ *  · `volume[]` entries WITHOUT a `pvcRef`. See below.
+ *
+ * ─── `volume[]`: only the entries with a `pvcRef` become entities ───────────
+ *
+ * A pod's `volume[]` lists everything mounted into it — the projected service
+ * account token, configMaps, secrets, emptyDirs — and the kubelet measures all
+ * of them. Only the ones carrying a `pvcRef` are turned into entities, and the
+ * ones without are dropped rather than aggregated somewhere: they have no name
+ * an operator can look up (`kube-api-access-4xq7z`), no lifetime of their own,
+ * and their bytes are already inside the pod's `ephemeral-storage` reading. An
+ * "other volumes" series would be a number nobody can act on, counted twice.
+ *
+ * The same PVC can appear in SEVERAL pods (an RWX volume, or two pods of a
+ * StatefulSet member set). It is ONE entity and its statistics are not
+ * repeated — `mergePvcReadings` below is where that rule lives, and it runs
+ * both here (two pods on this node) and in the collector (two pods on two
+ * nodes).
  */
 import { CounterRates } from "./counters.js";
 import {
@@ -124,6 +140,16 @@ interface PodReference {
 interface ProcessStats {
   process_count?: number;
 }
+/** `PVCReference` upstream: the claim a volume was bound from. */
+interface PvcReference {
+  name?: string;
+  namespace?: string;
+}
+/** `VolumeStats` upstream: an `FsStats` plus the volume's name and its claim. */
+interface VolumeStats extends FsStats {
+  name?: string;
+  pvcRef?: PvcReference;
+}
 interface PodStats {
   podRef?: PodReference;
   startTime?: string;
@@ -133,6 +159,7 @@ interface PodStats {
   network?: NetworkStats;
   "ephemeral-storage"?: FsStats;
   process_stats?: ProcessStats;
+  volume?: VolumeStats[];
 }
 export interface SummaryDocument {
   node?: NodeStats;
@@ -351,16 +378,156 @@ export function readSummary(
     writer.gauge(id, "psi.io", podPsiIo);
 
     writeNetwork(writer, rates, rateKeys, id, pod.network, readAt);
+    readVolumes(entities, writer, pod, namespace, nodeName);
   }
+
+  // Two pods on THIS node can mount the same claim; the merge is what makes
+  // that one entity with one set of numbers instead of two rows that differ
+  // only by which pod the kubelet listed first.
+  const merged = mergePvcReadings(entities, writer.samples);
 
   return {
     nodeName,
-    entities,
-    samples: writer.samples,
+    entities: merged.entities,
+    samples: merged.samples,
     psiPresent,
     psiIo,
     rateKeys,
   };
+}
+
+/**
+ * The `volume[]` entries that carry a `pvcRef`, as entities and samples.
+ *
+ * The namespace comes from the `pvcRef` when the kubelet supplies one and from
+ * the POD otherwise. That fallback is not a guess: a pod can only reference a
+ * claim in its own namespace, so the two are the same string by construction
+ * and the fallback exists for a kubelet that leaves the field empty.
+ *
+ * A volume with a `pvcRef` but no NAME is skipped: there is no key to file it
+ * under, and inventing one (the volume's mount name, say) would give the
+ * control plane an entity that no `kubectl get pvc` can find.
+ */
+function readVolumes(
+  entities: Entity[],
+  writer: SampleWriter,
+  pod: PodStats,
+  podNamespace: string,
+  nodeName: string,
+): void {
+  for (const volume of pod.volume ?? []) {
+    const claim = volume.pvcRef;
+    // No claim: an emptyDir, a configMap, a projected token. Measured by the
+    // kubelet, not an entity here (see the file header).
+    if (!claim?.name) continue;
+    const namespace = claim.namespace ?? podNamespace;
+    const id = `pvc/${namespace}/${claim.name}`;
+
+    const attributes: Partial<Record<AttributeName, number>> = {};
+    const capacity = numberOf(volume.capacityBytes);
+    if (has(capacity)) attributes["fs.capacity"] = float32(capacity);
+    const inodes = numberOf(volume.inodes);
+    if (has(inodes)) attributes["fs.inodes"] = float32(inodes);
+
+    entities.push({
+      id,
+      kind: "pvc",
+      name: claim.name,
+      namespace,
+      // No `uid`: the Summary does not carry one for a claim (`types.ts`).
+      // No `owner` either, and that is a decision rather than an omission — a
+      // PVC is not a subordinate of the workload that mounts it. It outlives
+      // the pod, it can be mounted by several workloads at once, and hanging
+      // it under one of them would put a storage question inside a compute
+      // object's row.
+      ...(nodeName ? { node: nodeName } : {}),
+      attributes,
+    });
+
+    writer.gauge(id, "fs.used", numberOf(volume.usedBytes));
+    writer.gauge(id, "fs.inodesUsed", numberOf(volume.inodesUsed));
+  }
+}
+
+/**
+ * Collapses repeated PVC entities and their samples into one of each.
+ *
+ * ─── Why the values are MAXIMA and not the first reading ────────────────────
+ *
+ * Every mount of one claim observes the SAME filesystem, so two readings of it
+ * differ only by the instant each kubelet measured, or by a driver that
+ * reports a per-mount view. The maximum is the reading that never UNDERSTATES
+ * fullness, and understating fullness is the failure that costs something: an
+ * operator who is not told a volume is filling. Taking the first reading
+ * instead would make the answer depend on which node the collector happened to
+ * read first — a `Map` iteration order that changes the day a node joins.
+ *
+ * Attributes are merged the same way, for a duller reason: capacity is
+ * identical on every mount, so the maximum is that same number, and the rule
+ * also covers the case where one kubelet reports it and another does not.
+ *
+ * The function is idempotent — running it over an already-merged list changes
+ * nothing — which is what lets it run twice: once per node here, and once over
+ * the union of all nodes in the collector.
+ */
+export function mergePvcReadings(
+  entities: readonly Entity[],
+  samples: readonly Sample[],
+): { entities: Entity[]; samples: Sample[] } {
+  const pvcIds = new Set<string>();
+  for (const entity of entities) if (entity.kind === "pvc") pvcIds.add(entity.id);
+  if (pvcIds.size === 0) return { entities: [...entities], samples: [...samples] };
+
+  const mergedEntities: Entity[] = [];
+  const entityAt = new Map<string, number>();
+  for (const entity of entities) {
+    if (entity.kind !== "pvc") {
+      mergedEntities.push(entity);
+      continue;
+    }
+    const at = entityAt.get(entity.id);
+    if (at === undefined) {
+      entityAt.set(entity.id, mergedEntities.length);
+      mergedEntities.push(entity);
+      continue;
+    }
+    mergedEntities[at] = withMergedAttributes(mergedEntities[at]!, entity);
+  }
+
+  const mergedSamples: Sample[] = [];
+  const sampleAt = new Map<string, number>();
+  for (const sample of samples) {
+    if (!pvcIds.has(sample.entity)) {
+      mergedSamples.push(sample);
+      continue;
+    }
+    const key = `${sample.entity} ${sample.metric}`;
+    const at = sampleAt.get(key);
+    if (at === undefined) {
+      sampleAt.set(key, mergedSamples.length);
+      mergedSamples.push(sample);
+      continue;
+    }
+    mergedSamples[at] = higherOf(mergedSamples[at]!, sample);
+  }
+
+  return { entities: mergedEntities, samples: mergedSamples };
+}
+
+/** The higher of two readings; a `NO_READING` never wins over a number. */
+function higherOf(left: Sample, right: Sample): Sample {
+  if (!has(left.value)) return right;
+  if (!has(right.value)) return left;
+  return right.value > left.value ? right : left;
+}
+
+function withMergedAttributes(left: Entity, right: Entity): Entity {
+  const attributes: Partial<Record<AttributeName, number>> = { ...left.attributes };
+  for (const [name, value] of Object.entries(right.attributes) as [AttributeName, number][]) {
+    const existing = attributes[name];
+    if (existing === undefined || value > existing) attributes[name] = value;
+  }
+  return { ...left, attributes };
 }
 
 /**
