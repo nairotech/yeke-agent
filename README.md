@@ -159,10 +159,10 @@ the wire.
 The dependency here is pinned to an **exact version**, not a range:
 
 ```json
-"@nairotech/yeke-tunnel": "4.0.1"
+"@nairotech/yeke-tunnel": "5.0.0"
 ```
 
-`^4.0.1` would say "any minor of protocol v4", and the day a minor changed a
+`^5.0.0` would say "any minor of protocol v5", and the day a minor changed a
 frame, an agent built from an unchanged commit would start speaking a different
 wire than the one this commit was tested against. While the agent lived in the
 product monorepo it was compiled from the same checkout as the control plane, so
@@ -221,6 +221,7 @@ a default are required; the agent refuses to start without them.
 | `YEKE_RECONNECT_MIN_MS` | `1000` | Initial reconnect backoff |
 | `YEKE_RECONNECT_MAX_MS` | `30000` | Backoff ceiling |
 | `YEKE_KUBELET_INSECURE_TLS` | `false` | Accept kubelet serving certificates the cluster CA cannot verify. Off by default; see below |
+| `YEKE_METRICS_ENABLED` | `true` | Set to the exact string `false` to stop the metrics collector before it reads anything; see below |
 | `YEKE_VERSION` | `unknown` | Set at image build time; reported to the control plane |
 
 For kubeconfig mode the agent resolves identity itself and supports `exec`
@@ -242,6 +243,14 @@ the exact string `true` accepts that weakness explicitly; the agent announces it
 in one line at startup and the control plane shows it on screen. The two
 alternatives are to give your kubelets CA-signed serving certificates, or to
 leave those nodes without statistics.
+
+`YEKE_METRICS_ENABLED=false` turns the collector off entirely: no timer, no
+kubelet requests, and none of the three watches it needs. The tunnel is
+unaffected — your cluster stays manageable, the screen simply has no series on
+it. The collector is also not started at all when the control plane is older
+than tunnel protocol v5 (it cannot receive the frames) or when the agent runs in
+`kubeconfig` mode (kubelet reads need the pod's own ServiceAccount); in both
+cases the agent says so in one line and carries on.
 
 ---
 

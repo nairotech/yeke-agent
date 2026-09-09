@@ -82,7 +82,16 @@ import { Agent, type Dispatcher } from "undici";
 import type { AgentConfig } from "./config.js";
 import { AgentFailure } from "./failure.js";
 
-const SA_DIR = "/var/run/secrets/kubernetes.io/serviceaccount";
+/**
+ * Where the kubelet projects the pod's own identity.
+ *
+ * Exported because a SECOND reader appeared with the metrics collector: the
+ * kubelet client authenticates with the same token and verifies the kubelet's
+ * serving certificate against the same CA (K4). Writing the path twice would be
+ * a twin, and the day a distribution moves the mount, one of the two copies
+ * would keep pointing at nothing.
+ */
+export const SA_DIR = "/var/run/secrets/kubernetes.io/serviceaccount";
 /** Projected SA tokens rotate; they must be re-read before they expire. */
 const TOKEN_TTL_MS = 60_000;
 
