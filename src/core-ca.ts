@@ -30,6 +30,31 @@
  * time, with a message that says so, rather than left to fail later at the TLS
  * handshake where the operator would see a generic verification error with no
  * file name attached to it.
+ *
+ * ─── K16: an expired certificate is SKIPPED here, not rejected ───────────────
+ *
+ * Core's `loadPublicCa` (this file's twin) brings the process down over an
+ * expired certificate, and that is right for it: the file is the operator's
+ * own, edited by hand, and the person who can fix it is right there at
+ * startup. This file's rule is deliberately looser, for a reason specific to
+ * WHO owns the file on this side: the agent does not own `YEKE_CORE_CA_FILE`,
+ * it is a `ConfigMap` YEKE itself manages, and the rotation procedure this
+ * repository supports (architecture decision, §3.10) leaves the OLD root in
+ * that file for a while on purpose, as the safe transition state, before an
+ * operator removes it in a later step. That old root expiring one day is
+ * therefore a NORMAL event, not an incident — and until this rule changed,
+ * it was a ticking time bomb: the running pod kept working, but the next time
+ * it restarted for any unrelated reason (a node drain, an OOM kill, a
+ * kubectl rollout) the agent refused to start at all, over a certificate
+ * nothing downstream was still relying on. So here, an expired certificate
+ * (root or intermediate) is skipped with a warning instead — `ca` only ever
+ * carries certificates that are still valid, and `roots` only ever reports
+ * roots that are still valid, so a caller cannot end up trusting or
+ * publishing (`hello.coreCaRoots`, K15) a fingerprint that cannot verify
+ * anything. `CORE_CA_NO_ROOT` still fires if, after expired certificates are
+ * removed, no valid root is left — the message says which of the two ways
+ * that happened (never had one, or all of them expired) since the operator's
+ * fix differs: add a root vs. add a NEW root before the old one disappears.
  */
 import { readFileSync } from "node:fs";
 import { X509Certificate } from "node:crypto";
@@ -43,23 +68,21 @@ export interface CoreCaRoot {
 
 export interface CoreCaBundle {
   /**
-   * Every `CERTIFICATE` block in the file, in file order, each ending in
-   * `\n`. Handed to `ws` as-is: `new WebSocket(url, { ca: [...tls.rootCertificates, ...bundle.ca] })`
+   * Every still-VALID `CERTIFICATE` block in the file, in file order, each
+   * ending in `\n`. Handed to `ws` as-is: `new WebSocket(url, { ca: [...tls.rootCertificates, ...bundle.ca] })`
    * (K2 in the architecture decision — an ADDITION to the default trust
    * store, never a replacement). Intermediates are harmless to include here
    * and can help Node assemble the chain, so they are kept rather than
    * filtered out; only `roots` below is restricted to self-signed entries.
+   * An EXPIRED block (root or intermediate) never reaches this array — see
+   * "K16" in the file header — so a caller never has to filter it out again.
    */
   readonly ca: readonly string[];
-  /** The self-signed (root) certificates among `ca`, for the startup log. */
+  /** The self-signed (root) certificates among `ca`, for the startup log and for `hello.coreCaRoots` (K15). Only valid (unexpired) roots — see "K16" above. */
   readonly roots: readonly CoreCaRoot[];
 }
 
-export type CoreCaErrorCode =
-  | "CORE_CA_FILE_UNREADABLE"
-  | "CORE_CA_PEM_INVALID"
-  | "CORE_CA_NO_ROOT"
-  | "CORE_CA_EXPIRED";
+export type CoreCaErrorCode = "CORE_CA_FILE_UNREADABLE" | "CORE_CA_PEM_INVALID" | "CORE_CA_NO_ROOT";
 
 /**
  * Thrown by `loadCoreCa`. English and ASCII, like every error this repository
@@ -129,24 +152,55 @@ export function loadCoreCa(file: string, now: () => number = Date.now): CoreCaBu
     }
   }
 
-  const roots = certificates.filter(isSelfSigned);
+  // K16: an expired certificate (root or intermediate) is dropped here,
+  // BEFORE the root check below — not rejected. The agent does not own this
+  // file (see the file header); a root going stale in a `ConfigMap` it did
+  // not put there is an expected step of the rotation procedure, not an
+  // operator's mistake for it to report and refuse to start over. Filtering
+  // first, then checking for a surviving root, is what makes "an expired
+  // root, alone in the file" and "an expired root next to a valid one"
+  // resolve differently without duplicating the self-signed check.
+  const nowMs = now();
+  const validBlocks: string[] = [];
+  const validCertificates: X509Certificate[] = [];
+  for (const [index, cert] of certificates.entries()) {
+    const validTo = Date.parse(cert.validTo);
+    if (Number.isFinite(validTo) && validTo < nowMs) {
+      // English/ASCII, like every line this repository logs (see the header):
+      // its reader is the operator running `kubectl logs yeke-agent`, and this
+      // is the one piece of the rotation procedure (architecture decision
+      // §3.10) that is otherwise invisible — the old root is still in the
+      // ConfigMap, still being read every reconnect, and now silently inert.
+      console.warn(
+        `[agent] core CA: skipping expired certificate ${cert.subject.replace(/\n/g, ", ")} valid until ${cert.validTo}`,
+      );
+      continue;
+    }
+    validBlocks.push(blocks[index]!);
+    validCertificates.push(cert);
+  }
+
+  const roots = validCertificates.filter(isSelfSigned);
   if (roots.length === 0) {
+    // Which of the two ways there is no usable root matters to the operator's
+    // fix: a file that never had one needs a root added; a file whose only
+    // root(s) just expired needs a NEW root added before the old one is
+    // removed (the rotation order this repository documents), not the same
+    // root re-added — it would parse fine and still be just as expired.
+    const hadAnyRoot = certificates.some(isSelfSigned);
+    if (hadAnyRoot) {
+      throw new CoreCaError(
+        "CORE_CA_NO_ROOT",
+        `YEKE_CORE_CA_FILE has no valid root certificate left: ${file} — all roots expired; add a new, ` +
+          "unexpired root to the file (the rotation procedure keeps the old one in place until the new " +
+          "one is confirmed working, then removes it — never the other way around).",
+      );
+    }
     throw new CoreCaError(
       "CORE_CA_NO_ROOT",
       `YEKE_CORE_CA_FILE has no self-signed root certificate: ${file} — Node.js clients (agent, CLI) ` +
         "cannot anchor trust on an intermediate; add the root certificate to the file.",
     );
-  }
-
-  const nowMs = now();
-  for (const cert of certificates) {
-    const validTo = Date.parse(cert.validTo);
-    if (Number.isFinite(validTo) && validTo < nowMs) {
-      throw new CoreCaError(
-        "CORE_CA_EXPIRED",
-        `YEKE_CORE_CA_FILE contains an expired certificate: ${file} — ${cert.subject} valid until ${cert.validTo}`,
-      );
-    }
   }
 
   return {
@@ -155,7 +209,7 @@ export function loadCoreCa(file: string, now: () => number = Date.now): CoreCaBu
     // trailing newline of the last block, and `ws`/`tls` tolerate both, but
     // normalizing here means a test comparing `ca` against the source text
     // does not have to special-case the last element.
-    ca: blocks.map((block) => `${block.trim()}\n`),
+    ca: validBlocks.map((block) => `${block.trim()}\n`),
     roots: roots.map((cert) => ({
       subject: cert.subject,
       fingerprint256: cert.fingerprint256,

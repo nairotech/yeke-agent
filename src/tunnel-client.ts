@@ -28,6 +28,7 @@ import {
   parseControlMessage,
   serializeControlMessage,
   type ControlMessage,
+  type HelloMessage,
   type RequestMessage,
   type StreamOpenMessage,
   type TunnelFailure,
@@ -615,12 +616,44 @@ export class TunnelClient {
       console.log("[agent] core connection opened");
       this.#lastSeenAt = Date.now();
       this.#startLiveness(socket);
-      this.#send({
+      // K15 (architecture decision §3.15): the sha256 fingerprints of the
+      // ROOTS this very connection's `ca` option carries — read from `coreCa`
+      // above, the local binding `#loadCoreCaForConnect` just refreshed for
+      // THIS attempt, not from `this.#coreCa` again (a later reconnect must
+      // not relabel an earlier session's `hello`). `[]`, never omitted, when
+      // no corporate CA is configured, so core can tell "an agent that knows
+      // this field and has nothing to report" apart from "an agent that
+      // predates the field" (which sends no `coreCaRoots` at all).
+      //
+      // `@nairotech/yeke-tunnel` stays pinned to 5.0.0 in this repository's
+      // package.json for this change: the 5.1.0 release that adds
+      // `coreCaRoots` to `HelloMessage`'s zod schema is published from the
+      // monorepo separately and had not reached the registry yet when this
+      // landed (see the architecture decision's release order, §5) — bumping
+      // the pin here ahead of that publish would make `pin: the installed
+      // contract is the pinned version` in `boundary.test.ts` fail against
+      // whatever 5.1.0 happens to resolve to locally. Nothing about SENDING
+      // the field depends on the installed package's schema: on the wire,
+      // `serializeControlMessage` is a plain `JSON.stringify` with no
+      // validation on the way out (only `parseControlMessage`, on the
+      // RECEIVING side, strips unknown keys — irrelevant here, core is the
+      // receiver and core's copy of the schema does know the field). The one
+      // real obstacle is TypeScript: 5.0.0's `HelloMessage` type has no
+      // `coreCaRoots` property, so an object literal passed straight to
+      // `#send(message: ControlMessage)` would fail an excess-property check.
+      // Resolved in the narrowest way available — an explicit intersection
+      // type on this local `hello` binding, not `as any`/`as unknown as` —
+      // so TypeScript still checks every OTHER field of this object against
+      // the real 5.0.0 shape; only the one additive field is exempted, and by
+      // name.
+      const hello: HelloMessage & { readonly coreCaRoots: readonly string[] } = {
         t: "hello",
         protocol: TUNNEL_PROTOCOL_VERSION,
         agentVersion: AGENT_VERSION,
         kubernetesVersion: this.#target ? await readKubernetesVersion(this.#target) : undefined,
-      });
+        coreCaRoots: coreCa ? coreCa.roots.map((root) => root.fingerprint256) : [],
+      };
+      this.#send(hello);
     });
 
     socket.on("message", (data, isBinary) => {
