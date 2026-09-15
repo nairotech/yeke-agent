@@ -1116,3 +1116,83 @@ test("the agent's own CA addition does not drop the operator's NODE_EXTRA_CA_CER
     await rm(directory, { recursive: true, force: true });
   }
 });
+
+/**
+ * ─── Independent finding, 15.09.2026: the startup CA line goes stale across
+ * a rotation ────────────────────────────────────────────────────────────
+ *
+ * "The startup CA log line is written once, on the first successful load"
+ * (the test above this section) measured exactly that — once, ever — and a
+ * full rotation (architecture decision §3.10) changes the loaded root SET
+ * *twice* while the pod is never restarted. Measured directly: the file
+ * changed from one root to two, six reconnects later there was still no
+ * second line, and the one line that existed still said "1 root(s)". §3.14
+ * claims this line is what makes "which CA is distributed" auditable; that
+ * claim does not survive a rotation under the old rule.
+ */
+test("the startup CA line is re-printed once when the loaded root SET changes (rotation), and stays silent on a reconnect that re-reads an UNCHANGED file", async () => {
+  const fixtureA = await chainA();
+  const fixtureB = await chainB();
+  process.env.KUBECONFIG = await kubeconfig();
+  const directory = await mkdtemp(join(tmpdir(), "yeke-agent-tunnel-ca-rotation-log-"));
+  const caFile = join(directory, "ca.crt");
+  await writeFile(caFile, fixtureA.rootCert);
+
+  // The server keeps presenting fixture A's certificate for the whole test:
+  // this measures whether the agent NOTICES its loaded root set changing,
+  // not whether TLS trust changes — rotation step 1 (§3.10) adds a new root
+  // without core's own certificate moving yet, for exactly this reason.
+  const core = await secureFakeCore({ cert: fixtureA.serverChainPem, key: fixtureA.leafKey, protocol: 5 });
+  const originalLog = console.log;
+  const lines: string[] = [];
+  console.log = (...args: unknown[]) => void lines.push(args.join(" "));
+  const client = new TunnelClient(caTestConfig(core.url, caFile));
+  const caLines = () => lines.filter((line) => line.startsWith("[agent] core CA:"));
+  try {
+    await client.start();
+    await until("the first connection succeeds", () => client.protocolVersion === 5);
+    assert.equal(
+      caLines().length,
+      1,
+      `expected exactly one startup CA line after the first load:\n${JSON.stringify(lines, null, 2)}`,
+    );
+    assert.ok(caLines()[0]?.includes("1 root(s)"));
+
+    // Rotation step 1: the OLD root stays, a NEW (unrelated) one is added.
+    await writeFile(caFile, Buffer.concat([fixtureA.rootCert, fixtureB.rootCert]));
+    core.drop();
+    await until(
+      "the reconnect re-read the two-root file and re-trusted fixture A's certificate",
+      () => core.sessions === 2 && client.protocolVersion === 5,
+    );
+    assert.equal(
+      caLines().length,
+      2,
+      `expected a SECOND startup CA line once the loaded root set changed:\n${JSON.stringify(lines, null, 2)}`,
+    );
+    assert.ok(
+      caLines()[1]?.includes("2 root(s)"),
+      `the new line must report the new set, not repeat the old one:\n${JSON.stringify(lines, null, 2)}`,
+    );
+
+    // A routine reconnect with the file UNCHANGED (still the two-root set)
+    // must stay silent — the "not on every reconnect" half of the rule,
+    // undisturbed by this fix.
+    core.drop();
+    await until(
+      "the second reconnect re-read the same two-root file",
+      () => core.sessions === 3 && client.protocolVersion === 5,
+    );
+    assert.equal(
+      caLines().length,
+      2,
+      `a reconnect against an UNCHANGED file must not repeat the startup CA line:\n${JSON.stringify(lines, null, 2)}`,
+    );
+  } finally {
+    console.log = originalLog;
+    await client.stop();
+    await core.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
