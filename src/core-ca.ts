@@ -1,8 +1,9 @@
 /**
  * Loads and validates `YEKE_CORE_CA_FILE`: the certificate authority the agent
- * must trust IN ADDITION to the public roots bundled with Node.js, when core's
- * TLS certificate is signed by an organization's own CA rather than a publicly
- * trusted one.
+ * must trust IN ADDITION to whatever this Node process already trusts by
+ * default (see `defaultCoreCaCertificates` below — not just the roots
+ * bundled with Node.js), when core's TLS certificate is signed by an
+ * organization's own CA rather than a publicly trusted one.
  *
  * ─── Why this is a twin of core's `loadPublicCa`, not a shared package ───────
  *
@@ -58,6 +59,7 @@
  */
 import { readFileSync } from "node:fs";
 import { X509Certificate } from "node:crypto";
+import * as tls from "node:tls";
 
 /** The self-signed certificates found in the file — what the startup log names. */
 export interface CoreCaRoot {
@@ -69,11 +71,13 @@ export interface CoreCaRoot {
 export interface CoreCaBundle {
   /**
    * Every still-VALID `CERTIFICATE` block in the file, in file order, each
-   * ending in `\n`. Handed to `ws` as-is: `new WebSocket(url, { ca: [...tls.rootCertificates, ...bundle.ca] })`
+   * ending in `\n`. Handed to `ws` as-is: `new WebSocket(url, { ca: [...defaultCoreCaCertificates(), ...bundle.ca] })`
    * (K2 in the architecture decision — an ADDITION to the default trust
-   * store, never a replacement). Intermediates are harmless to include here
-   * and can help Node assemble the chain, so they are kept rather than
-   * filtered out; only `roots` below is restricted to self-signed entries.
+   * store, never a replacement — see `defaultCoreCaCertificates` below for
+   * why that base set is not simply `tls.rootCertificates`). Intermediates
+   * are harmless to include here and can help Node assemble the chain, so
+   * they are kept rather than filtered out; only `roots` below is restricted
+   * to self-signed entries.
    * An EXPIRED block (root or intermediate) never reaches this array — see
    * "K16" in the file header — so a caller never has to filter it out again.
    */
@@ -111,6 +115,37 @@ function isSelfSigned(cert: X509Certificate): boolean {
     // certificate is not usable as a root either way.
     return false;
   }
+}
+
+/**
+ * The set of certificates this Node process trusts by default — what
+ * `tunnel-client.ts` builds `ca: [...defaultCoreCaCertificates(), ...bundle.ca]`
+ * on top of, per K2 (an ADDITION to the default trust store, never a
+ * replacement).
+ *
+ * NOT `tls.rootCertificates`: that constant is only the roots bundled with
+ * this particular Node build (the same fixed Mozilla list every Node ships),
+ * while `ca` is a TLS option that, the moment it is set AT ALL, replaces the
+ * running process's actual default trust store rather than adding to it. So
+ * building the corporate-CA addition on top of `rootCertificates` was itself
+ * silently discarding two things an operator may already be relying on: a
+ * `NODE_EXTRA_CA_CERTS` root (a corporate TLS-inspecting proxy's CA, most
+ * commonly) and a Node binary built with `--use-system-ca` — verified
+ * independently, 15.09.2026: a request that succeeded with only
+ * `NODE_EXTRA_CA_CERTS` set failed with `SELF_SIGNED_CERT_IN_CHAIN` the
+ * moment `YEKE_CORE_CA_FILE` was also configured, because `ca` had quietly
+ * dropped the extra root instead of joining it.
+ *
+ * `tls.getCACertificates("default")` (Node 22.15 / 23.10+) is the ACTUAL
+ * running set: bundled roots plus every extra source Node itself already
+ * merged in. Building on that instead makes this option's own "addition,
+ * never a replacement" promise hold at its outer edge too, not only for the
+ * one corporate CA this file adds. A Node build without `getCACertificates`
+ * falls back to the bundled set — the same limitation those older builds
+ * already had before this fix, not a new one.
+ */
+export function defaultCoreCaCertificates(): readonly string[] {
+  return typeof tls.getCACertificates === "function" ? tls.getCACertificates("default") : tls.rootCertificates;
 }
 
 /**
