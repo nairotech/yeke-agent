@@ -1307,3 +1307,84 @@ test("a duplicated root does not count twice toward the 16-root wire limit: 16 d
     await rm(directory, { recursive: true, force: true });
   }
 });
+
+/**
+ * ─── Independent finding, 15.09.2026: the K16 skip warning repeated on
+ * every reconnect ────────────────────────────────────────────────────────
+ *
+ * Measured: 10 reconnects against an unchanged file with one expired root
+ * in it produced 10 identical `[agent] core CA: skipping expired
+ * certificate ...` lines. `loadCoreCa` used to print that line itself, and
+ * `#loadCoreCaForConnect` calls it fresh on every attempt (§3.10); the
+ * architecture decision's own K6b live-measurement criterion says "one
+ * line", the same rate the K15 root-set line already follows. `loadCoreCa`
+ * now only reports what it skipped (`CoreCaBundle.skippedExpired`); this
+ * test measures that `TunnelClient` prints it at the K6b rate.
+ */
+test("K16 finding: the 'skipping expired certificate(s)' warning is printed once per distinct skipped SET, not on every reconnect", async () => {
+  const fixtureA = await chainA();
+  process.env.KUBECONFIG = await kubeconfig();
+  const directory = await mkdtemp(join(tmpdir(), "yeke-agent-tunnel-ca-skip-log-"));
+  const caFile = join(directory, "ca.crt");
+  const expiredX = await createExpiredRootCert(directory, { commonName: "expired-x" });
+  await writeFile(caFile, Buffer.concat([expiredX, fixtureA.rootCert]));
+
+  const core = await secureFakeCore({ cert: fixtureA.serverChainPem, key: fixtureA.leafKey, protocol: 5 });
+  const originalWarn = console.warn;
+  const lines: string[] = [];
+  console.warn = (...args: unknown[]) => void lines.push(args.join(" "));
+  const client = new TunnelClient(caTestConfig(core.url, caFile));
+  const skipLines = () => lines.filter((line) => line.includes("skipping expired certificate"));
+  try {
+    await client.start();
+    await until("the first connection succeeds", () => client.protocolVersion === 5);
+    assert.equal(
+      skipLines().length,
+      1,
+      `expected exactly one skip warning after the first load:\n${JSON.stringify(lines, null, 2)}`,
+    );
+
+    // Two routine reconnects against the SAME (unchanged) file must not
+    // repeat it — this is the 10-reconnects-10-lines regression, shortened.
+    core.drop();
+    await until("the second connection succeeds", () => core.sessions === 2 && client.protocolVersion === 5);
+    core.drop();
+    await until("the third connection succeeds", () => core.sessions === 3 && client.protocolVersion === 5);
+    assert.equal(
+      skipLines().length,
+      1,
+      `reconnects against an UNCHANGED file must not repeat the skip warning:\n${JSON.stringify(lines, null, 2)}`,
+    );
+
+    // The skipped SET changes (a second, DIFFERENT expired root joins the
+    // file): the warning must fire again, exactly once, for the new set.
+    const expiredY = await createExpiredRootCert(directory, { commonName: "expired-y" });
+    await writeFile(caFile, Buffer.concat([expiredX, expiredY, fixtureA.rootCert]));
+    core.drop();
+    await until(
+      "the fourth connection re-read the changed file",
+      () => core.sessions === 4 && client.protocolVersion === 5,
+    );
+    assert.equal(
+      skipLines().length,
+      2,
+      `expected a SECOND skip warning once the skipped set changed:\n${JSON.stringify(lines, null, 2)}`,
+    );
+
+    // Another reconnect against THIS (now unchanged) two-cert file stays
+    // silent again.
+    core.drop();
+    await until("the fifth connection succeeds", () => core.sessions === 5 && client.protocolVersion === 5);
+    assert.equal(
+      skipLines().length,
+      2,
+      `a reconnect against the unchanged two-cert file must not repeat the warning:\n${JSON.stringify(lines, null, 2)}`,
+    );
+  } finally {
+    console.warn = originalWarn;
+    await client.stop();
+    await core.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+

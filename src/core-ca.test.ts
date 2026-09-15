@@ -190,7 +190,7 @@ test("K16: only an expired root is CORE_CA_NO_ROOT and names the all-roots-expir
   }
 });
 
-test("K16: a valid root alongside an expired root — only the valid one survives, and the skip is warned exactly once", async () => {
+test("K16: a valid root alongside an expired root — only the valid one survives, and the expired one is reported in `skippedExpired`", async () => {
   const directory = await mkdtemp(join(tmpdir(), "yeke-agent-core-ca-"));
   try {
     const shortLived = await createRootCert(directory, { commonName: "core-ca-test-short", days: 1 });
@@ -205,24 +205,19 @@ test("K16: a valid root alongside an expired root — only the valid one survive
     // what its name says.
     assert.ok(Date.parse(longCert.validTo) > afterShortExpiry());
 
-    const originalWarn = console.warn;
-    const warnLines: string[] = [];
-    console.warn = (...args: unknown[]) => void warnLines.push(args.join(" "));
-    let bundle;
-    try {
-      bundle = loadCoreCa(file, afterShortExpiry);
-    } finally {
-      console.warn = originalWarn;
-    }
+    // Independent finding, 15.09.2026: `loadCoreCa` no longer calls
+    // `console.warn` itself — it has no memory between calls to know
+    // whether it already said this, and `TunnelClient` (which does) is what
+    // now decides whether to print anything, based on this very field. See
+    // "K16" in `core-ca.ts`'s file header and the `tunnel-client.test.ts`
+    // test that measures the actual log line.
+    const bundle = loadCoreCa(file, afterShortExpiry);
 
     assert.equal(bundle.roots.length, 1, "the expired root must not appear in `roots`");
     assert.equal(bundle.ca.length, 1, "the expired root's PEM block must not appear in `ca` either");
     assert.equal(bundle.roots[0]?.fingerprint256, longCert.fingerprint256);
-    assert.equal(
-      warnLines.filter((line) => line.includes("skipping expired certificate")).length,
-      1,
-      `expected exactly one skip warning:\n${JSON.stringify(warnLines, null, 2)}`,
-    );
+    assert.equal(bundle.skippedExpired.length, 1, "the expired root must be reported in `skippedExpired`");
+    assert.equal(bundle.skippedExpired[0]?.fingerprint256, shortCert.fingerprint256);
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
@@ -255,6 +250,8 @@ test("K16: an expired intermediate is skipped while a valid root is kept", async
     assert.equal(bundle.ca.length, 1, "only the still-valid root block remains; the expired intermediate is dropped");
     assert.equal(bundle.roots.length, 1);
     assert.equal(bundle.roots[0]?.fingerprint256, rootCert.fingerprint256);
+    assert.equal(bundle.skippedExpired.length, 1, "the expired intermediate must be reported in `skippedExpired`");
+    assert.equal(bundle.skippedExpired[0]?.fingerprint256, intermediateCert.fingerprint256);
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
