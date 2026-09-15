@@ -1,16 +1,27 @@
 /**
  * The twin of core's `public-ca.test.ts` (architecture decision, §7.1/§7.3):
  * measures the same three rules (readability, PEM validity, the root
- * requirement) and the expiry check that core's `loadPublicCa` enforces,
- * against THIS repository's `loadCoreCa`. The two repositories cannot share
- * code (`boundary.test.ts` pins the agent's only YEKE dependency to the
- * tunnel contract), so the rule is implemented twice and has to be measured
- * twice — this file is that second measurement.
+ * requirement) against THIS repository's `loadCoreCa`. The two repositories
+ * cannot share code (`boundary.test.ts` pins the agent's only YEKE
+ * dependency to the tunnel contract), so the rule is implemented twice and
+ * has to be measured twice — this file is that second measurement.
+ *
+ * The expiry rule is where the two files deliberately DIVERGE (K16,
+ * architecture decision §3.16, "P6 düzeltmesi"): core's `loadPublicCa`
+ * refuses to start over an expired certificate; this repository's
+ * `loadCoreCa` skips one with a warning and only fails (`CORE_CA_NO_ROOT`)
+ * if no valid root survives the filtering — see the "K16" section of
+ * `core-ca.ts`'s own file header for why. The tests below measure THIS
+ * file's rule, not core's.
  *
  * Certificate fixtures are generated with `openssl` at test time (root →
  * intermediate → leaf); a fixture with a fixed date would be a clock bomb —
  * it really does expire one day. When `openssl` is missing the tests FAIL and
- * say so BY NAME, the same rule `metrics/kubelet-client.test.ts` follows.
+ * say so BY NAME, the same rule `metrics/kubelet-client.test.ts` follows. The
+ * one exception is `createExpiredRootCert` (K16's "only an expired root" and
+ * "valid + expired root" cases use the `now` seam instead, precisely to
+ * avoid a fixture that is only accidentally still expired) — see
+ * `core-ca-fixture.ts`.
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
@@ -21,7 +32,12 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import { CoreCaError, describeCoreCa, loadCoreCa } from "./core-ca.js";
-import { type ChainTlsFixture, createChainTlsFixture, opensslAvailable } from "./core-ca-fixture.js";
+import {
+  type ChainTlsFixture,
+  createChainTlsFixture,
+  createRootCert,
+  opensslAvailable,
+} from "./core-ca-fixture.js";
 
 const run = promisify(execFile);
 
@@ -148,7 +164,7 @@ test("root + intermediate: both blocks are kept in `ca`, exactly the root is in 
   }
 });
 
-test("an expired root is CORE_CA_EXPIRED (the `now` seam, not a stale fixture)", async () => {
+test("K16: only an expired root is CORE_CA_NO_ROOT and names the all-roots-expired case (the `now` seam, not a stale fixture)", async () => {
   const fixture = await chain();
   const directory = await mkdtemp(join(tmpdir(), "yeke-agent-core-ca-"));
   try {
@@ -159,13 +175,86 @@ test("an expired root is CORE_CA_EXPIRED (the `now` seam, not a stale fixture)",
       () => loadCoreCa(file, afterExpiry),
       (err: unknown) => {
         assert.ok(err instanceof CoreCaError);
-        assert.equal(err.code, "CORE_CA_EXPIRED");
+        // Not CORE_CA_EXPIRED (that code no longer exists, K16): the root is
+        // SKIPPED, and what remains to report is that none is left.
+        assert.equal(err.code, "CORE_CA_NO_ROOT");
+        assert.match(err.message, /all roots expired/);
         return true;
       },
     );
     // The same file, read with today's real seam, still passes — the fixture
     // is not actually expired; only the injected clock says so.
     assert.doesNotThrow(() => loadCoreCa(file));
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("K16: a valid root alongside an expired root — only the valid one survives, and the skip is warned exactly once", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "yeke-agent-core-ca-"));
+  try {
+    const shortLived = await createRootCert(directory, { commonName: "core-ca-test-short", days: 1 });
+    const longLived = await createRootCert(directory, { commonName: "core-ca-test-long", days: 3650 });
+    const file = await withFile(directory, "mixed.crt", Buffer.concat([shortLived, longLived]));
+
+    const shortCert = new X509Certificate(shortLived);
+    const longCert = new X509Certificate(longLived);
+    const afterShortExpiry = () => Date.parse(shortCert.validTo) + 1_000;
+    // Sanity on the fixture itself: the long-lived root must still be valid
+    // at the moment the test injects, or the test would not be measuring
+    // what its name says.
+    assert.ok(Date.parse(longCert.validTo) > afterShortExpiry());
+
+    const originalWarn = console.warn;
+    const warnLines: string[] = [];
+    console.warn = (...args: unknown[]) => void warnLines.push(args.join(" "));
+    let bundle;
+    try {
+      bundle = loadCoreCa(file, afterShortExpiry);
+    } finally {
+      console.warn = originalWarn;
+    }
+
+    assert.equal(bundle.roots.length, 1, "the expired root must not appear in `roots`");
+    assert.equal(bundle.ca.length, 1, "the expired root's PEM block must not appear in `ca` either");
+    assert.equal(bundle.roots[0]?.fingerprint256, longCert.fingerprint256);
+    assert.equal(
+      warnLines.filter((line) => line.includes("skipping expired certificate")).length,
+      1,
+      `expected exactly one skip warning:\n${JSON.stringify(warnLines, null, 2)}`,
+    );
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("K16: an expired intermediate is skipped while a valid root is kept", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "yeke-agent-core-ca-mixed-"));
+  try {
+    // A dedicated chain, not the shared `chain()` fixture: this is the one
+    // caller that needs the root and intermediate to expire at DIFFERENT
+    // times (see `createChainTlsFixture`'s `intermediateDays` doc).
+    const fixture = await createChainTlsFixture(directory, {
+      commonName: "core-ca-test-mixed",
+      intermediateDays: 1,
+    });
+    const file = await withFile(
+      directory,
+      "root-and-expiring-intermediate.crt",
+      Buffer.concat([fixture.rootCert, fixture.intermediateCert]),
+    );
+    const intermediateCert = new X509Certificate(fixture.intermediateCert);
+    const rootCert = new X509Certificate(fixture.rootCert);
+    const afterIntermediateExpiry = () => Date.parse(intermediateCert.validTo) + 1_000;
+    assert.ok(
+      Date.parse(rootCert.validTo) > afterIntermediateExpiry(),
+      "the root must still be valid at the moment the intermediate expires",
+    );
+
+    const bundle = loadCoreCa(file, afterIntermediateExpiry);
+    assert.equal(bundle.ca.length, 1, "only the still-valid root block remains; the expired intermediate is dropped");
+    assert.equal(bundle.roots.length, 1);
+    assert.equal(bundle.roots[0]?.fingerprint256, rootCert.fingerprint256);
   } finally {
     await rm(directory, { recursive: true, force: true });
   }

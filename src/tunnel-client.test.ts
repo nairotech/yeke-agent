@@ -19,10 +19,13 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { execFile } from "node:child_process";
+import { X509Certificate } from "node:crypto";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { createServer as createHttpsServer, type Server as HttpsServer } from "node:https";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { promisify } from "node:util";
 import type { AddressInfo } from "node:net";
 import { WebSocketServer, type WebSocket as CoreSocket } from "ws";
 import {
@@ -38,8 +41,11 @@ import type { AgentConfig } from "./config.js";
 import {
   type ChainTlsFixture,
   createChainTlsFixture,
+  createExpiredRootCert,
   opensslAvailable,
 } from "./core-ca-fixture.js";
+
+const run = promisify(execFile);
 import {
   TunnelClient,
   type CollectorFactory,
@@ -87,6 +93,25 @@ async function settle(): Promise<void> {
 interface Received {
   readonly control?: ControlMessage;
   readonly binary?: Buffer;
+  /**
+   * The exact bytes a control message arrived as, before `parseControlMessage`
+   * ran it through the installed `@nairotech/yeke-tunnel` zod schema and
+   * STRIPPED whatever field that schema does not know about.
+   *
+   * K15's `hello.coreCaRoots` is exactly such a field while this repository
+   * is pinned to tunnel 5.0.0 (see `tunnel-client.ts`'s comment at the send
+   * site): `.control` alone can never show it, because by the time a test
+   * reads `.control` the stripping has already happened. Undefined for a
+   * binary frame.
+   */
+  readonly raw?: string;
+}
+
+/** The raw `hello` this fake core received, parsed WITHOUT the schema's stripping — see `Received.raw`. */
+function rawHello(core: FakeCore): { readonly coreCaRoots?: unknown } {
+  const entry = core.received.find((received) => received.control?.t === "hello");
+  assert.ok(entry?.raw, "no `hello` control message was received");
+  return JSON.parse(entry.raw) as { coreCaRoots?: unknown };
 }
 
 interface FakeCore {
@@ -115,7 +140,8 @@ async function fakeCore(protocol: number | undefined): Promise<FakeCore> {
         received.push({ binary: Buffer.from(data as Buffer) });
         return;
       }
-      received.push({ control: parseControlMessage(data.toString()) });
+      const raw = data.toString();
+      received.push({ control: parseControlMessage(raw), raw });
     });
     connection.send(
       serializeControlMessage({
@@ -651,7 +677,8 @@ async function secureFakeCore(options: {
         received.push({ binary: Buffer.from(data as Buffer) });
         return;
       }
-      received.push({ control: parseControlMessage(data.toString()) });
+      const raw = data.toString();
+      received.push({ control: parseControlMessage(raw), raw });
     });
     connection.send(
       serializeControlMessage({
@@ -738,6 +765,47 @@ test("YEKE_CORE_CA_FILE naming the root trusts a server presenting leaf+intermed
   }
 });
 
+test("K15: hello reports the sha256 fingerprint of the loaded root, matching openssl's own fingerprint", async () => {
+  const fixture = await chainA();
+  process.env.KUBECONFIG = await kubeconfig();
+  const directory = await mkdtemp(join(tmpdir(), "yeke-agent-tunnel-ca-hello-"));
+  const caFile = join(directory, "ca.crt");
+  await writeFile(caFile, fixture.rootCert);
+
+  const core = await secureFakeCore({ cert: fixture.serverChainPem, key: fixture.leafKey, protocol: 5 });
+  const client = new TunnelClient(caTestConfig(core.url, caFile));
+  try {
+    await client.start();
+    await until("the handshake completes", () => client.protocolVersion === 5);
+    await until("the hello control message arrived", () => core.received.some((r) => r.control?.t === "hello"));
+
+    const { stdout } = await run("openssl", ["x509", "-in", caFile, "-fingerprint", "-sha256", "-noout"]);
+    const opensslFingerprint = stdout.trim().split("=")[1];
+
+    assert.deepEqual(rawHello(core).coreCaRoots, [opensslFingerprint]);
+  } finally {
+    await client.stop();
+    await core.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("K15: hello reports an empty coreCaRoots array when no corporate CA is configured", async () => {
+  process.env.KUBECONFIG = await kubeconfig();
+  const core = await fakeCore(5);
+  const client = new TunnelClient(caTestConfig(core.url));
+  try {
+    await client.start();
+    await until("the handshake completes", () => client.protocolVersion === 5);
+    await until("the hello control message arrived", () => core.received.some((r) => r.control?.t === "hello"));
+
+    assert.deepEqual(rawHello(core).coreCaRoots, []);
+  } finally {
+    await client.stop();
+    await core.close();
+  }
+});
+
 test("without YEKE_CORE_CA_FILE the same server is untrusted, and the error line names the remedy", async () => {
   const fixture = await chainA();
   process.env.KUBECONFIG = await kubeconfig();
@@ -785,6 +853,14 @@ test("the file is re-read on every connection attempt: a wrong root fails, and f
 
     await until("the reconnect re-read the file and picked up the corrected root", () => client.protocolVersion === 5);
     assert.equal(core.sessions, 1, "exactly the reconnect that followed the fix reached the server");
+
+    // K15 addendum: the hello that follows the fix must carry fixture B's
+    // root — the fresh read this test's title is about, not a value cached
+    // from the failed first attempt (which never got far enough to send a
+    // hello at all: `open` never fires on a TLS handshake that fails).
+    await until("the hello control message arrived", () => core.received.some((r) => r.control?.t === "hello"));
+    const rootB = new X509Certificate(fixtureB.rootCert);
+    assert.deepEqual(rawHello(core).coreCaRoots, [rootB.fingerprint256]);
   } finally {
     await client.stop();
     await core.close();
@@ -861,6 +937,40 @@ test("the startup CA log line is written once, on the first successful load, nam
     );
   } finally {
     console.log = originalLog;
+    await client.stop();
+    await core.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("K16: an expired root alongside a valid one does not stop the agent from starting or connecting; the expired one is skipped with a warning", async () => {
+  const fixture = await chainA();
+  process.env.KUBECONFIG = await kubeconfig();
+  const directory = await mkdtemp(join(tmpdir(), "yeke-agent-tunnel-ca-expired-"));
+  const caFile = join(directory, "ca.crt");
+  // Before K16, ANY expired certificate in this file — even alongside a
+  // perfectly good root — made `loadCoreCa` throw on the very first load,
+  // and that first load's failure is the one `#loadCoreCaForConnect` lets
+  // propagate out of `start()` (see its own comment): the agent would never
+  // have come up at all. This is the regression that decision would be.
+  const expiredRoot = await createExpiredRootCert(directory);
+  await writeFile(caFile, Buffer.concat([expiredRoot, fixture.rootCert]));
+
+  const core = await secureFakeCore({ cert: fixture.serverChainPem, key: fixture.leafKey, protocol: 5 });
+  const originalWarn = console.warn;
+  const lines: string[] = [];
+  console.warn = (...args: unknown[]) => void lines.push(args.join(" "));
+  const client = new TunnelClient(caTestConfig(core.url, caFile));
+  try {
+    await client.start();
+    await until("the agent connects using the still-valid root, despite the expired one in the file", () => client.protocolVersion === 5);
+    assert.equal(core.sessions, 1);
+    assert.ok(
+      lines.some((line) => line.includes("skipping expired certificate")),
+      `no warning line reported the skipped expired root:\n${JSON.stringify(lines, null, 2)}`,
+    );
+  } finally {
+    console.warn = originalWarn;
     await client.stop();
     await core.close();
     await rm(directory, { recursive: true, force: true });
