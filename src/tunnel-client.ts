@@ -7,10 +7,9 @@
  * is enough.
  */
 import { readFile } from "node:fs/promises";
-import { rootCertificates } from "node:tls";
 import { WebSocket, type RawData } from "ws";
 import { request } from "undici";
-import { type CoreCaBundle, describeCoreCa, loadCoreCa } from "./core-ca.js";
+import { type CoreCaBundle, defaultCoreCaCertificates, describeCoreCa, loadCoreCa } from "./core-ca.js";
 import {
   AGENT_CLUSTER_HEADER,
   AGENT_TOKEN_HEADER,
@@ -601,13 +600,18 @@ export class TunnelClient {
         [AGENT_TOKEN_HEADER]: this.#config.token,
         [AGENT_CLUSTER_HEADER]: this.#config.clusterId,
       },
-      // An ADDITION to Node's bundled public roots, never a replacement (K2):
-      // the option is omitted entirely when no corporate CA is configured, so
-      // a CA-less agent's TLS behaviour is byte-for-byte what it was before
-      // this field existed — `ca: []` would not be equivalent, since Node
-      // treats a `ca` option (even empty) as replacing the default trust
-      // store rather than leaving it alone.
-      ...(coreCa ? { ca: [...rootCertificates, ...coreCa.ca] } : {}),
+      // An ADDITION to Node's own default trust store, never a replacement
+      // (K2): the option is omitted entirely when no corporate CA is
+      // configured, so a CA-less agent's TLS behaviour is byte-for-byte what
+      // it was before this field existed — `ca: []` would not be equivalent,
+      // since Node treats a `ca` option (even empty) as replacing the
+      // default trust store rather than leaving it alone. The base of the
+      // union is `defaultCoreCaCertificates()`, not `tls.rootCertificates` —
+      // see that function's comment (`core-ca.ts`) for why the difference
+      // matters: the bundled-roots-only list silently dropped an operator's
+      // own `NODE_EXTRA_CA_CERTS` or `--use-system-ca` trust the moment this
+      // option was also set.
+      ...(coreCa ? { ca: [...defaultCoreCaCertificates(), ...coreCa.ca] } : {}),
     });
     this.#socket = socket;
 

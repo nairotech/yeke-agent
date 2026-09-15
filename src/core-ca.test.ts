@@ -25,13 +25,13 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { execFile } from "node:child_process";
+import { execFile, execFileSync } from "node:child_process";
 import { X509Certificate } from "node:crypto";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
-import { CoreCaError, describeCoreCa, loadCoreCa } from "./core-ca.js";
+import { CoreCaError, defaultCoreCaCertificates, describeCoreCa, loadCoreCa } from "./core-ca.js";
 import {
   type ChainTlsFixture,
   createChainTlsFixture,
@@ -283,6 +283,62 @@ test("describeCoreCa names the file, the root count and the fingerprint", async 
     assert.match(line, /^\[agent\] core CA: 1 root\(s\) from /);
     assert.ok(line.includes(file));
     assert.ok(line.includes(bundle.roots[0]!.fingerprint256));
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("defaultCoreCaCertificates returns a non-empty list in this process (the bundled roots at minimum)", () => {
+  const list = defaultCoreCaCertificates();
+  assert.ok(list.length > 0);
+  assert.ok(list.every((pem) => pem.includes("BEGIN CERTIFICATE")));
+});
+
+/**
+ * Independent finding, 15.09.2026: `tls.rootCertificates` (this file's old
+ * base for the `ca` union, before this change) is ONLY the roots bundled
+ * with the running Node build — it does not see `NODE_EXTRA_CA_CERTS` or a
+ * `--use-system-ca` Node build's system store. `NODE_EXTRA_CA_CERTS` is read
+ * once, at process startup, so this can only be measured in a SEPARATE
+ * process started with the variable already set — the same pattern
+ * `apps/cli/src/ca.test.ts`'s equivalent measurement uses in the product
+ * monorepo (`resolveCaList` there, `defaultCoreCaCertificates` here).
+ */
+test("defaultCoreCaCertificates includes the operator's NODE_EXTRA_CA_CERTS root, not only the bundled set", async () => {
+  assert.ok(
+    await opensslAvailable(),
+    "NOT MEASURED: openssl is not on PATH, so this finding was not checked on this machine. Install openssl and run the gate again.",
+  );
+
+  const directory = await mkdtemp(join(tmpdir(), "yeke-agent-extra-ca-"));
+  try {
+    const extraRoot = await createRootCert(directory, { commonName: "extra-default-root" });
+    const extraRootFile = join(directory, "extra-default-root.crt");
+    await writeFile(extraRootFile, extraRoot);
+
+    const script =
+      'import { defaultCoreCaCertificates } from "./src/core-ca.ts";' +
+      'const norm = (pem) => pem.replace(/\\s+/g, "");' +
+      "const list = defaultCoreCaCertificates();" +
+      'process.stdout.write(String(list.some((pem) => norm(pem) === norm(process.env.EXTRA_PEM))));';
+
+    const projectRoot = join(import.meta.dirname, "..");
+    const out = execFileSync(process.execPath, ["--import", "tsx", "--input-type=module", "-e", script], {
+      cwd: projectRoot,
+      env: {
+        ...process.env,
+        // Read only at startup: must already be set before this child's own
+        // Node begins, which is exactly why this cannot be measured in-process.
+        NODE_EXTRA_CA_CERTS: extraRootFile,
+        EXTRA_PEM: extraRoot.toString("utf8"),
+      },
+      encoding: "utf8",
+    });
+    assert.equal(
+      out.trim(),
+      "true",
+      "defaultCoreCaCertificates() must include the NODE_EXTRA_CA_CERTS root, not only the Node-bundled set",
+    );
   } finally {
     await rm(directory, { recursive: true, force: true });
   }

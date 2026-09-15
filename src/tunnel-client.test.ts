@@ -19,7 +19,7 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { execFile } from "node:child_process";
+import { execFile, execFileSync } from "node:child_process";
 import { X509Certificate } from "node:crypto";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { createServer as createHttpsServer, type Server as HttpsServer } from "node:https";
@@ -606,8 +606,8 @@ test("shutdown stops the collector", async () => {
  * Everything above connects to `fakeCore` over plain `ws://`; the tests below
  * are the one place in this repository that measures the combination the
  * architecture decision's corporate-CA design rests on —
- * `ca: [...tls.rootCertificates, ...bundle]` handed to `ws`, against a REAL
- * TLS handshake, on a control plane whose certificate chains through an
+ * `ca: [...defaultCoreCaCertificates(), ...bundle]` handed to `ws`, against a
+ * REAL TLS handshake, on a control plane whose certificate chains through an
  * intermediate to a root Node does not carry by default. The baseline
  * measurement behind that decision (docs/architecture/2026-09-15-yeke-kurum-ca-guveni.md,
  * §8.3) only exercised `NODE_EXTRA_CA_CERTS`; this is the first measurement of
@@ -977,3 +977,142 @@ test("K16: an expired root alongside a valid one does not stop the agent from st
   }
 });
 
+/**
+ * ─── Independent finding, 15.09.2026: `NODE_EXTRA_CA_CERTS` / the system CA
+ * store must not be dropped by `YEKE_CORE_CA_FILE` ────────────────────────
+ *
+ * `NODE_EXTRA_CA_CERTS` is read once, at process startup — this repository's
+ * other tests all run inside ONE `tsx --test` process, so none of them could
+ * ever set it and see an effect. The only honest way to measure it is a
+ * SEPARATE process started with the variable already in its environment,
+ * which is what this test does (`execFileSync`, the same pattern
+ * `apps/cli/src/ca.test.ts`'s equivalent measurement uses in the product
+ * monorepo).
+ */
+test("the agent's own CA addition does not drop the operator's NODE_EXTRA_CA_CERTS root: a server signed ONLY by it, with YEKE_CORE_CA_FILE naming an unrelated root, still connects", async () => {
+  assert.ok(
+    await opensslAvailable(),
+    "NOT MEASURED: openssl is not on PATH, so this finding was not checked on this machine. Install openssl and run the gate again.",
+  );
+
+  const directory = await mkdtemp(join(tmpdir(), "yeke-agent-extra-ca-"));
+  try {
+    // Two UNRELATED chains: `extra` is what the server is actually signed by
+    // (reachable only through `NODE_EXTRA_CA_CERTS`) and `given` is what
+    // `YEKE_CORE_CA_FILE` names — a root that cannot verify this server at
+    // all. If the connection succeeds, it can only be because
+    // `defaultCoreCaCertificates()` picked up `extra` from the process's own
+    // default trust store; `given`'s root plays no part in it.
+    const extra = await createChainTlsFixture(directory, { commonName: "extra-root" });
+    const given = await createChainTlsFixture(directory, { commonName: "given-root" });
+
+    const extraRootFile = join(directory, "extra-root.crt");
+    await writeFile(extraRootFile, extra.rootCert);
+    const givenCaFile = join(directory, "given-ca.crt");
+    await writeFile(givenCaFile, given.rootCert);
+    const kubeconfigFile = join(directory, "kubeconfig");
+    await writeFile(
+      kubeconfigFile,
+      [
+        "apiVersion: v1",
+        "kind: Config",
+        "clusters:",
+        "  - name: unreachable",
+        "    cluster:",
+        "      server: https://127.0.0.1:1",
+        "contexts:",
+        "  - name: unreachable",
+        "    context:",
+        "      cluster: unreachable",
+        "      user: unreachable",
+        "current-context: unreachable",
+        "users:",
+        "  - name: unreachable",
+        "    user:",
+        "      token: not-used",
+        "",
+      ].join("\n"),
+    );
+
+    // A minimal control plane and a `TunnelClient`, both built from THIS
+    // repository's real source (`./src/tunnel-client.ts`, resolved relative
+    // to `cwd` below — the same reason `ca.test.ts`'s equivalent measurement
+    // uses a relative specifier rather than a package name): the server
+    // presents `extra`'s chain and never even sees `given`.
+    const script = `
+      import { createServer as createHttpsServer } from "node:https";
+      import { WebSocketServer } from "ws";
+      import { serializeControlMessage } from "@nairotech/yeke-tunnel";
+      import { TunnelClient } from "./src/tunnel-client.ts";
+
+      const cert = Buffer.from(process.env.SERVER_CERT_PEM, "utf8");
+      const key = Buffer.from(process.env.SERVER_KEY_PEM, "utf8");
+
+      const httpsServer = createHttpsServer({ cert, key });
+      const wss = new WebSocketServer({ server: httpsServer });
+      let sessions = 0;
+      wss.on("connection", (connection) => {
+        sessions += 1;
+        connection.send(
+          serializeControlMessage({ t: "welcome", clusterId: "cluster-1", sessionId: "session-1", protocol: 5 }),
+        );
+      });
+      await new Promise((resolve) => httpsServer.listen(0, "127.0.0.1", resolve));
+      const { port } = httpsServer.address();
+
+      process.env.KUBECONFIG = process.env.PROBE_KUBECONFIG;
+
+      const client = new TunnelClient({
+        coreUrl: \`wss://127.0.0.1:\${port}/tunnel\`,
+        clusterId: "cluster-1",
+        token: "agent-token",
+        kubeMode: "kubeconfig",
+        reconnectMinMs: 30,
+        reconnectMaxMs: 60,
+        kubeletInsecureTls: false,
+        metricsEnabled: false,
+        coreCaFile: process.env.GIVEN_CA_FILE,
+      });
+
+      await client.start();
+      const deadline = Date.now() + 5000;
+      while (client.protocolVersion !== 5 && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+      const ok = client.protocolVersion === 5 && sessions === 1;
+      await client.stop();
+      httpsServer.close();
+      process.stdout.write(ok ? "true" : "false");
+    `;
+
+    const projectRoot = join(import.meta.dirname, "..");
+    const out = execFileSync(process.execPath, ["--import", "tsx", "--input-type=module", "-e", script], {
+      cwd: projectRoot,
+      env: {
+        ...process.env,
+        // The one thing that makes this a SEPARATE-process test: read only at
+        // startup, so it must already be set before this child's Node begins.
+        NODE_EXTRA_CA_CERTS: extraRootFile,
+        GIVEN_CA_FILE: givenCaFile,
+        PROBE_KUBECONFIG: kubeconfigFile,
+        SERVER_CERT_PEM: extra.serverChainPem.toString("utf8"),
+        SERVER_KEY_PEM: extra.leafKey.toString("utf8"),
+      },
+      encoding: "utf8",
+      timeout: 15_000,
+    });
+    // The child is a real `TunnelClient`, so its own `[agent] ...` log lines
+    // (kubeconfig identity, the CA startup line, `core connection opened`,
+    // `registered`) share stdout with the one line this probe cares about —
+    // only the LAST line is the verdict.
+    const verdict = out.trim().split("\n").at(-1);
+    assert.equal(
+      verdict,
+      "true",
+      "the child process must connect using the NODE_EXTRA_CA_CERTS root, which YEKE_CORE_CA_FILE's own bundle cannot verify:\n" +
+        out,
+    );
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
