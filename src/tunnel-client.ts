@@ -9,7 +9,13 @@
 import { readFile } from "node:fs/promises";
 import { WebSocket, type RawData } from "ws";
 import { request } from "undici";
-import { type CoreCaBundle, defaultCoreCaCertificates, describeCoreCa, loadCoreCa } from "./core-ca.js";
+import {
+  type CoreCaBundle,
+  defaultCoreCaCertificates,
+  describeCoreCa,
+  describeSkippedCoreCa,
+  loadCoreCa,
+} from "./core-ca.js";
 import {
   AGENT_CLUSTER_HEADER,
   AGENT_TOKEN_HEADER,
@@ -555,6 +561,20 @@ export class TunnelClient {
    * that constant's own comment.
    */
   #loggedOversizedRootFingerprints: readonly string[] | undefined;
+  /**
+   * The fingerprint SET the "skipping expired certificate(s)" warning was
+   * last printed for — `undefined` when nothing is currently being skipped,
+   * for the same reason as `#loggedOversizedRootFingerprints` above.
+   * Independent finding, 15.09.2026: `loadCoreCa` used to print this warning
+   * itself, once per skipped certificate, on EVERY call — and `#connect`
+   * calls it on every reconnect (§3.10), so an unchanged file produced the
+   * same line again and again (measured: 10 reconnects, 10 identical
+   * lines). `loadCoreCa` now only reports what it skipped
+   * (`CoreCaBundle.skippedExpired`); this field is what lets the actual
+   * printing follow the same "once per SET, not once per read" rule as
+   * `#loggedCoreCaRootFingerprints` above.
+   */
+  #loggedSkippedExpiredFingerprints: readonly string[] | undefined;
 
   constructor(config: AgentConfig, hooks: { readonly createCollector?: CollectorFactory } = {}) {
     this.#config = config;
@@ -649,11 +669,11 @@ export class TunnelClient {
    * is auditable" claim exists for. An ordinary reconnect that re-reads the
    * SAME file still prints nothing, same as before.
    *
-   * A second warning follows the exact same "once per changed SET" shape —
-   * too many roots for `hello.coreCaRoots` to carry
-   * (`CORE_CA_HELLO_ROOTS_LIMIT`), an independent finding from 15.09.2026 —
-   * see that constant's own comment for why a per-attempt warning would be
-   * the wrong rate for it too.
+   * Two more warnings follow the exact same "once per changed SET" shape,
+   * both independent findings from 15.09.2026: too many roots for
+   * `hello.coreCaRoots` to carry (`CORE_CA_HELLO_ROOTS_LIMIT`), and
+   * `loadCoreCa`'s own `skippedExpired` (K16) — see each field's own
+   * comment for why a per-attempt warning was the wrong rate for either.
    */
   #loadCoreCaForConnect(): void {
     const file = this.#config.coreCaFile;
@@ -684,6 +704,19 @@ export class TunnelClient {
         }
       } else {
         this.#loggedOversizedRootFingerprints = undefined;
+      }
+
+      if (bundle.skippedExpired.length > 0) {
+        const skippedFingerprints = bundle.skippedExpired.map((cert) => cert.fingerprint256);
+        const skippedChanged =
+          !this.#loggedSkippedExpiredFingerprints ||
+          !sameRootFingerprintSet(this.#loggedSkippedExpiredFingerprints, skippedFingerprints);
+        if (skippedChanged) {
+          console.warn(describeSkippedCoreCa(file, bundle.skippedExpired));
+          this.#loggedSkippedExpiredFingerprints = skippedFingerprints;
+        }
+      } else {
+        this.#loggedSkippedExpiredFingerprints = undefined;
       }
     } catch (err) {
       if (!this.#coreCa) throw err;

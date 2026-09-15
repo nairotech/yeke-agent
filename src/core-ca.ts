@@ -48,14 +48,27 @@
  * it restarted for any unrelated reason (a node drain, an OOM kill, a
  * kubectl rollout) the agent refused to start at all, over a certificate
  * nothing downstream was still relying on. So here, an expired certificate
- * (root or intermediate) is skipped with a warning instead — `ca` only ever
- * carries certificates that are still valid, and `roots` only ever reports
- * roots that are still valid, so a caller cannot end up trusting or
- * publishing (`hello.coreCaRoots`, K15) a fingerprint that cannot verify
- * anything. `CORE_CA_NO_ROOT` still fires if, after expired certificates are
- * removed, no valid root is left — the message says which of the two ways
- * that happened (never had one, or all of them expired) since the operator's
- * fix differs: add a root vs. add a NEW root before the old one disappears.
+ * (root or intermediate) is skipped instead — `ca` only ever carries
+ * certificates that are still valid, and `roots` only ever reports roots
+ * that are still valid, so a caller cannot end up trusting or publishing
+ * (`hello.coreCaRoots`, K15) a fingerprint that cannot verify anything.
+ * `CORE_CA_NO_ROOT` still fires if, after expired certificates are removed,
+ * no valid root is left — the message says which of the two ways that
+ * happened (never had one, or all of them expired) since the operator's fix
+ * differs: add a root vs. add a NEW root before the old one disappears.
+ *
+ * What gets skipped is reported back as `CoreCaBundle.skippedExpired`
+ * rather than logged from inside this function. Independent finding,
+ * 15.09.2026: `loadCoreCa` used to `console.warn` here directly, and
+ * `TunnelClient` calls this function fresh on EVERY connection attempt
+ * (§3.10 again — a ConfigMap update must be picked up without a restart),
+ * so a routine reconnect against an UNCHANGED file printed the same line
+ * again every time — 10 reconnects, 10 identical lines. This function has
+ * no memory between calls to know "did I already say this"; only its
+ * caller does (the same reason the K15 root-set startup line moved to a
+ * `TunnelClient` field rather than living here). So `loadCoreCa` reports
+ * the DATA and `TunnelClient.#loadCoreCaForConnect` decides whether the
+ * skipped set actually changed before printing anything.
  */
 import { readFileSync } from "node:fs";
 import { X509Certificate } from "node:crypto";
@@ -63,6 +76,18 @@ import * as tls from "node:tls";
 
 /** The self-signed certificates found in the file — what the startup log names. */
 export interface CoreCaRoot {
+  readonly subject: string;
+  readonly fingerprint256: string;
+  readonly validTo: string;
+}
+
+/**
+ * A certificate `loadCoreCa` dropped for being expired — root or
+ * intermediate, so it is not a `CoreCaRoot` (which implies self-signed).
+ * What `TunnelClient` names in its (rate-limited) skip warning — see the
+ * "K16" section of this file's header.
+ */
+export interface CoreCaSkippedCertificate {
   readonly subject: string;
   readonly fingerprint256: string;
   readonly validTo: string;
@@ -90,6 +115,15 @@ export interface CoreCaBundle {
   readonly ca: readonly string[];
   /** The self-signed (root) certificates among `ca`, for the startup log and for `hello.coreCaRoots` (K15). Only valid, deduplicated (unexpired, distinct-by-fingerprint) roots — see "K16" and the `ca` doc above. */
   readonly roots: readonly CoreCaRoot[];
+  /**
+   * Certificates dropped for being expired, in file order — the DATA behind
+   * the "skipping expired certificate" warning; see "K16" in the file
+   * header for why this function itself does not log it. Not deduplicated
+   * (an operator's duplicate-and-both-expired file is rare enough that the
+   * extra complexity was not worth it; the caller's own set-comparison
+   * still ensures the warning itself does not repeat).
+   */
+  readonly skippedExpired: readonly CoreCaSkippedCertificate[];
 }
 
 export type CoreCaErrorCode = "CORE_CA_FILE_UNREADABLE" | "CORE_CA_PEM_INVALID" | "CORE_CA_NO_ROOT";
@@ -200,21 +234,17 @@ export function loadCoreCa(file: string, now: () => number = Date.now): CoreCaBu
   // operator's mistake for it to report and refuse to start over. Filtering
   // first, then checking for a surviving root, is what makes "an expired
   // root, alone in the file" and "an expired root next to a valid one"
-  // resolve differently without duplicating the self-signed check.
+  // resolve differently without duplicating the self-signed check. What is
+  // dropped is collected into `skippedExpired`, not logged here directly —
+  // see "K16" in the file header for why that is the caller's job.
   const nowMs = now();
   const validBlocks: string[] = [];
   const validCertificates: X509Certificate[] = [];
+  const skippedExpired: CoreCaSkippedCertificate[] = [];
   for (const [index, cert] of certificates.entries()) {
     const validTo = Date.parse(cert.validTo);
     if (Number.isFinite(validTo) && validTo < nowMs) {
-      // English/ASCII, like every line this repository logs (see the header):
-      // its reader is the operator running `kubectl logs yeke-agent`, and this
-      // is the one piece of the rotation procedure (architecture decision
-      // §3.10) that is otherwise invisible — the old root is still in the
-      // ConfigMap, still being read every reconnect, and now silently inert.
-      console.warn(
-        `[agent] core CA: skipping expired certificate ${cert.subject.replace(/\n/g, ", ")} valid until ${cert.validTo}`,
-      );
+      skippedExpired.push({ subject: cert.subject, fingerprint256: cert.fingerprint256, validTo: cert.validTo });
       continue;
     }
     validBlocks.push(blocks[index]!);
@@ -269,6 +299,7 @@ export function loadCoreCa(file: string, now: () => number = Date.now): CoreCaBu
       fingerprint256: cert.fingerprint256,
       validTo: cert.validTo,
     })),
+    skippedExpired,
   };
 }
 
@@ -286,4 +317,25 @@ export function describeCoreCa(file: string, bundle: CoreCaBundle): string {
     .map((root) => `${root.subject.replace(/\n/g, ", ")} sha256:${root.fingerprint256} valid until ${root.validTo}`)
     .join("; ");
   return `[agent] core CA: ${bundle.roots.length} root(s) from ${file}; ${roots}`;
+}
+
+/**
+ * The "certificates skipped for being expired" log line: `[agent] core CA:
+ * skipping expired certificate(s) from /etc/yeke/core-ca/ca.crt (1): CN=… valid
+ * until …`.
+ *
+ * Consolidated into ONE line for however many certificates were skipped
+ * (rather than one `console.warn` per certificate, which is what
+ * `loadCoreCa` itself used to do — see "K16" in this file's header) so that
+ * `TunnelClient.#loadCoreCaForConnect`'s "once per changed SET" rule prints
+ * exactly one line per change, matching `describeCoreCa` above. The text
+ * `"skipping expired certificate"` is a substring on purpose — kept
+ * word-for-word from the original per-certificate line so a reader (or a
+ * test) grepping for that phrase still finds it.
+ */
+export function describeSkippedCoreCa(file: string, skipped: readonly CoreCaSkippedCertificate[]): string {
+  const parts = skipped
+    .map((cert) => `${cert.subject.replace(/\n/g, ", ")} valid until ${cert.validTo}`)
+    .join("; ");
+  return `[agent] core CA: skipping expired certificate(s) from ${file} (${skipped.length}): ${parts}`;
 }
