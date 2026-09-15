@@ -42,6 +42,7 @@ import {
   type ChainTlsFixture,
   createChainTlsFixture,
   createExpiredRootCert,
+  createRootCert,
   opensslAvailable,
 } from "./core-ca-fixture.js";
 
@@ -1196,3 +1197,113 @@ test("the startup CA line is re-printed once when the loaded root SET changes (r
   }
 });
 
+/**
+ * ─── Independent finding, 15.09.2026: more than 16 roots leaves the tunnel
+ * half-open ───────────────────────────────────────────────────────────────
+ *
+ * `HelloMessage.coreCaRoots` (K15) is capped at 16 items on the wire
+ * (`packages/tunnel/src/tunnel.ts`, architecture decision §3.15). Measured:
+ * with 17 roots loaded, the agent sent an over-the-cap array, core rejected
+ * the `hello`, and the tunnel never finished negotiating — the agent's own
+ * log showed nothing past `[agent] core connection opened`; no `welcome`
+ * ever arrived, so the metrics collector never started either. Core's own
+ * fix (rejecting an oversized `hello` explicitly, with a line naming why)
+ * is a separate change; this is the agent's half — leave the field out
+ * entirely once the loaded set will not fit, the same "absent means
+ * unknown or unreportable" shape an agent that predates the field already
+ * produces.
+ */
+test("with more than 16 valid roots, hello.coreCaRoots is left OUT entirely and a limit warning is logged once (not on every reconnect)", async () => {
+  const fixture = await chainA();
+  process.env.KUBECONFIG = await kubeconfig();
+  const directory = await mkdtemp(join(tmpdir(), "yeke-agent-tunnel-ca-oversized-"));
+  const caFile = join(directory, "ca.crt");
+  try {
+    // fixture.rootCert (the one that actually verifies the server) plus 16
+    // more distinct, unrelated roots: 17 in total, one over the wire's cap.
+    const extraRoots = await Promise.all(
+      Array.from({ length: 16 }, (_, index) => createRootCert(directory, { commonName: `oversized-root-${index}` })),
+    );
+    await writeFile(caFile, Buffer.concat([fixture.rootCert, ...extraRoots]));
+
+    const core = await secureFakeCore({ cert: fixture.serverChainPem, key: fixture.leafKey, protocol: 5 });
+    const originalWarn = console.warn;
+    const lines: string[] = [];
+    console.warn = (...args: unknown[]) => void lines.push(args.join(" "));
+    const client = new TunnelClient(caTestConfig(core.url, caFile));
+    const limitLines = () => lines.filter((line) => line.includes("more than hello.coreCaRoots can report"));
+    try {
+      await client.start();
+      // The handshake itself does not depend on hello at all (core replies
+      // with `welcome` unconditionally in this fake); what matters is what
+      // hello CARRIED, which is why the assertion below reads the raw wire
+      // bytes rather than trusting the connection succeeding.
+      await until("the handshake completes despite 17 loaded roots", () => client.protocolVersion === 5);
+      await until("the hello control message arrived", () => core.received.some((r) => r.control?.t === "hello"));
+
+      const entry = core.received.find((r) => r.control?.t === "hello")!;
+      const raw = JSON.parse(entry.raw!) as Record<string, unknown>;
+      assert.equal(
+        "coreCaRoots" in raw,
+        false,
+        `hello must not carry coreCaRoots at all past the wire limit:\n${JSON.stringify(raw, null, 2)}`,
+      );
+      assert.equal(
+        limitLines().length,
+        1,
+        `expected exactly one over-limit warning:\n${JSON.stringify(lines, null, 2)}`,
+      );
+
+      // A routine reconnect against the SAME (still 17-root) file must not
+      // repeat the warning.
+      core.drop();
+      await until("the agent reconnected", () => core.sessions === 2 && client.protocolVersion === 5);
+      assert.equal(
+        limitLines().length,
+        1,
+        `a reconnect against an UNCHANGED file must not repeat the over-limit warning:\n${JSON.stringify(lines, null, 2)}`,
+      );
+    } finally {
+      console.warn = originalWarn;
+      await client.stop();
+      await core.close();
+    }
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("a duplicated root does not count twice toward the 16-root wire limit: 16 distinct roots plus one repeat still reports hello.coreCaRoots", async () => {
+  const fixture = await chainA();
+  process.env.KUBECONFIG = await kubeconfig();
+  const directory = await mkdtemp(join(tmpdir(), "yeke-agent-tunnel-ca-dedup-"));
+  const caFile = join(directory, "ca.crt");
+  try {
+    // fixture.rootCert once more (so the count would read 17 if a duplicate
+    // PEM block were naively counted) plus 15 other distinct roots: 16
+    // DISTINCT roots in total, at the limit rather than over it.
+    const extraRoots = await Promise.all(
+      Array.from({ length: 15 }, (_, index) => createRootCert(directory, { commonName: `dedup-root-${index}` })),
+    );
+    await writeFile(caFile, Buffer.concat([fixture.rootCert, fixture.rootCert, ...extraRoots]));
+
+    const core = await secureFakeCore({ cert: fixture.serverChainPem, key: fixture.leafKey, protocol: 5 });
+    const client = new TunnelClient(caTestConfig(core.url, caFile));
+    try {
+      await client.start();
+      await until("the handshake completes", () => client.protocolVersion === 5);
+      await until("the hello control message arrived", () => core.received.some((r) => r.control?.t === "hello"));
+
+      const entry = core.received.find((r) => r.control?.t === "hello")!;
+      const raw = JSON.parse(entry.raw!) as { coreCaRoots?: readonly string[] };
+      assert.ok(raw.coreCaRoots, "hello must carry coreCaRoots: the duplicate must not have pushed the count over 16");
+      assert.equal(raw.coreCaRoots.length, 16);
+      assert.equal(new Set(raw.coreCaRoots).size, 16, "every reported fingerprint must be distinct");
+    } finally {
+      await client.stop();
+      await core.close();
+    }
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});

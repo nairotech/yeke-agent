@@ -126,6 +126,32 @@ function sameRootFingerprintSet(a: readonly string[], b: readonly string[]): boo
 }
 
 /**
+ * The ceiling `hello.coreCaRoots` (K15) can carry on the wire — a LOCAL
+ * mirror of `HelloMessage.coreCaRoots`'s `z.array(...).max(16)` in
+ * `packages/tunnel/src/tunnel.ts` (architecture decision §3.15: "en çok 16
+ * öğe"). Not read from the installed package: this repository is pinned to
+ * `@nairotech/yeke-tunnel` 5.0.0 (`boundary.test.ts`'s exact-version gate),
+ * and 5.0.0's `HelloMessage` schema does not have `coreCaRoots` at all — the
+ * 5.1.0 release that adds it had not reached the registry when this
+ * constant was written (see the architecture decision's release order,
+ * §5). Once the pin moves to 5.1.0 this MAY be readable from the package's
+ * own schema instead of duplicated here; until then, drifting silently from
+ * the wire's real limit is the failure mode a duplicated constant risks, so
+ * this comment is the cross-reference that catches it.
+ *
+ * Independent finding, 15.09.2026: with more roots loaded than this, the
+ * agent sent a `coreCaRoots` array over the cap and core rejected the whole
+ * `hello` for it — the tunnel never finished negotiating, with no log line
+ * on the agent's side to say why (core's own fix, capping and reporting
+ * that rejection, is a separate change). The agent's half of the fix is
+ * simpler than accepting a broken tunnel: past this many roots, leave the
+ * field out of `hello` entirely (absent, the same as an agent that
+ * predates the field — see the `open` handler) rather than send something
+ * the wire will not accept.
+ */
+const CORE_CA_HELLO_ROOTS_LIMIT = 16;
+
+/**
  * Node's TLS error codes for "the certificate does not chain to anything I
  * trust" — the ONLY family a corporate CA can fix. A closed list on purpose:
  * an expired certificate or a hostname mismatch is a different problem that
@@ -520,6 +546,15 @@ export class TunnelClient {
    * silent, exactly as before.
    */
   #loggedCoreCaRootFingerprints: readonly string[] | undefined;
+  /**
+   * The root fingerprint SET the "too many roots for hello" warning was last
+   * printed for — `undefined` when the loaded set is at or under
+   * `CORE_CA_HELLO_ROOTS_LIMIT`, so a later climb back over the limit (even
+   * with the SAME set that triggered it before) warns again rather than
+   * staying silent from stale memory. Independent finding, 15.09.2026 — see
+   * that constant's own comment.
+   */
+  #loggedOversizedRootFingerprints: readonly string[] | undefined;
 
   constructor(config: AgentConfig, hooks: { readonly createCollector?: CollectorFactory } = {}) {
     this.#config = config;
@@ -613,6 +648,12 @@ export class TunnelClient {
    * certificate, which is exactly the case §3.14's "which CA is distributed
    * is auditable" claim exists for. An ordinary reconnect that re-reads the
    * SAME file still prints nothing, same as before.
+   *
+   * A second warning follows the exact same "once per changed SET" shape —
+   * too many roots for `hello.coreCaRoots` to carry
+   * (`CORE_CA_HELLO_ROOTS_LIMIT`), an independent finding from 15.09.2026 —
+   * see that constant's own comment for why a per-attempt warning would be
+   * the wrong rate for it too.
    */
   #loadCoreCaForConnect(): void {
     const file = this.#config.coreCaFile;
@@ -620,12 +661,29 @@ export class TunnelClient {
     try {
       const bundle = loadCoreCa(file);
       this.#coreCa = bundle;
+
       const fingerprints = bundle.roots.map((root) => root.fingerprint256);
       const changed =
         !this.#loggedCoreCaRootFingerprints || !sameRootFingerprintSet(this.#loggedCoreCaRootFingerprints, fingerprints);
       if (changed) {
         console.log(describeCoreCa(file, bundle));
         this.#loggedCoreCaRootFingerprints = fingerprints;
+      }
+
+      if (fingerprints.length > CORE_CA_HELLO_ROOTS_LIMIT) {
+        const oversizedChanged =
+          !this.#loggedOversizedRootFingerprints ||
+          !sameRootFingerprintSet(this.#loggedOversizedRootFingerprints, fingerprints);
+        if (oversizedChanged) {
+          console.warn(
+            `[agent] core CA: ${fingerprints.length} valid root(s) loaded from ${file}, more than hello.coreCaRoots ` +
+              `can report (${CORE_CA_HELLO_ROOTS_LIMIT}); the field is left out of hello until the file has ` +
+              `${CORE_CA_HELLO_ROOTS_LIMIT} or fewer distinct roots`,
+          );
+          this.#loggedOversizedRootFingerprints = fingerprints;
+        }
+      } else {
+        this.#loggedOversizedRootFingerprints = undefined;
       }
     } catch (err) {
       if (!this.#coreCa) throw err;
@@ -673,7 +731,13 @@ export class TunnelClient {
       // not relabel an earlier session's `hello`). `[]`, never omitted, when
       // no corporate CA is configured, so core can tell "an agent that knows
       // this field and has nothing to report" apart from "an agent that
-      // predates the field" (which sends no `coreCaRoots` at all).
+      // predates the field" (which sends no `coreCaRoots` at all) — that
+      // second case is also why the field is left OUT (not sent as an
+      // over-long array) past `CORE_CA_HELLO_ROOTS_LIMIT`: an agent that
+      // cannot fit what it loaded into the wire's limit is, from core's
+      // side, indistinguishable from one that does not know the field yet,
+      // and that is the correct fallback — sending the array anyway is the
+      // independent finding this comment's neighbour constant fixes.
       //
       // `@nairotech/yeke-tunnel` stays pinned to 5.0.0 in this repository's
       // package.json for this change: the 5.1.0 release that adds
@@ -687,8 +751,11 @@ export class TunnelClient {
       // `serializeControlMessage` is a plain `JSON.stringify` with no
       // validation on the way out (only `parseControlMessage`, on the
       // RECEIVING side, strips unknown keys — irrelevant here, core is the
-      // receiver and core's copy of the schema does know the field). The one
-      // real obstacle is TypeScript: 5.0.0's `HelloMessage` type has no
+      // receiver and core's copy of the schema does know the field), and
+      // `JSON.stringify` itself drops a property whose value is `undefined`
+      // — exactly the mechanism `kubernetesVersion` below already relies on,
+      // and now `coreCaRoots` does too when it is left out. The one real
+      // obstacle is TypeScript: 5.0.0's `HelloMessage` type has no
       // `coreCaRoots` property, so an object literal passed straight to
       // `#send(message: ControlMessage)` would fail an excess-property check.
       // Resolved in the narrowest way available — an explicit intersection
@@ -696,12 +763,18 @@ export class TunnelClient {
       // so TypeScript still checks every OTHER field of this object against
       // the real 5.0.0 shape; only the one additive field is exempted, and by
       // name.
-      const hello: HelloMessage & { readonly coreCaRoots: readonly string[] } = {
+      const coreCaRootFingerprints = coreCa?.roots.map((root) => root.fingerprint256);
+      const hello: HelloMessage & { readonly coreCaRoots?: readonly string[] } = {
         t: "hello",
         protocol: TUNNEL_PROTOCOL_VERSION,
         agentVersion: AGENT_VERSION,
         kubernetesVersion: this.#target ? await readKubernetesVersion(this.#target) : undefined,
-        coreCaRoots: coreCa ? coreCa.roots.map((root) => root.fingerprint256) : [],
+        coreCaRoots:
+          coreCaRootFingerprints === undefined
+            ? []
+            : coreCaRootFingerprints.length > CORE_CA_HELLO_ROOTS_LIMIT
+              ? undefined
+              : coreCaRootFingerprints,
       };
       this.#send(hello);
     });

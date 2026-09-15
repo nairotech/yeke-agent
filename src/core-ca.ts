@@ -70,8 +70,8 @@ export interface CoreCaRoot {
 
 export interface CoreCaBundle {
   /**
-   * Every still-VALID `CERTIFICATE` block in the file, in file order, each
-   * ending in `\n`. Handed to `ws` as-is: `new WebSocket(url, { ca: [...defaultCoreCaCertificates(), ...bundle.ca] })`
+   * Every still-VALID, DISTINCT `CERTIFICATE` block in the file, in file
+   * order, each ending in `\n`. Handed to `ws` as-is: `new WebSocket(url, { ca: [...defaultCoreCaCertificates(), ...bundle.ca] })`
    * (K2 in the architecture decision — an ADDITION to the default trust
    * store, never a replacement — see `defaultCoreCaCertificates` below for
    * why that base set is not simply `tls.rootCertificates`). Intermediates
@@ -80,9 +80,15 @@ export interface CoreCaBundle {
    * to self-signed entries.
    * An EXPIRED block (root or intermediate) never reaches this array — see
    * "K16" in the file header — so a caller never has to filter it out again.
+   * A block that is byte-identical to an EARLIER one (same fingerprint) is
+   * also dropped here, keeping only the first occurrence — independent
+   * finding, 15.09.2026: a ConfigMap edit or a rotation that concatenates
+   * two files can easily produce the same certificate twice, and a caller
+   * counting `roots.length` against a wire limit (K15's `hello.coreCaRoots`,
+   * capped at 16) must count DISTINCT roots, not PEM blocks.
    */
   readonly ca: readonly string[];
-  /** The self-signed (root) certificates among `ca`, for the startup log and for `hello.coreCaRoots` (K15). Only valid (unexpired) roots — see "K16" above. */
+  /** The self-signed (root) certificates among `ca`, for the startup log and for `hello.coreCaRoots` (K15). Only valid, deduplicated (unexpired, distinct-by-fingerprint) roots — see "K16" and the `ca` doc above. */
   readonly roots: readonly CoreCaRoot[];
 }
 
@@ -215,7 +221,20 @@ export function loadCoreCa(file: string, now: () => number = Date.now): CoreCaBu
     validCertificates.push(cert);
   }
 
-  const roots = validCertificates.filter(isSelfSigned);
+  // Independent finding, 15.09.2026: dedupe the still-valid certificates by
+  // fingerprint, keeping the FIRST occurrence — see `CoreCaBundle.ca`'s own
+  // doc for why a repeated PEM block must count once, not once per copy.
+  const seenFingerprints = new Set<string>();
+  const dedupedBlocks: string[] = [];
+  const dedupedCertificates: X509Certificate[] = [];
+  for (const [index, cert] of validCertificates.entries()) {
+    if (seenFingerprints.has(cert.fingerprint256)) continue;
+    seenFingerprints.add(cert.fingerprint256);
+    dedupedBlocks.push(validBlocks[index]!);
+    dedupedCertificates.push(cert);
+  }
+
+  const roots = dedupedCertificates.filter(isSelfSigned);
   if (roots.length === 0) {
     // Which of the two ways there is no usable root matters to the operator's
     // fix: a file that never had one needs a root added; a file whose only
@@ -244,7 +263,7 @@ export function loadCoreCa(file: string, now: () => number = Date.now): CoreCaBu
     // trailing newline of the last block, and `ws`/`tls` tolerate both, but
     // normalizing here means a test comparing `ca` against the source text
     // does not have to special-case the last element.
-    ca: validBlocks.map((block) => `${block.trim()}\n`),
+    ca: dedupedBlocks.map((block) => `${block.trim()}\n`),
     roots: roots.map((cert) => ({
       subject: cert.subject,
       fingerprint256: cert.fingerprint256,
@@ -256,9 +275,11 @@ export function loadCoreCa(file: string, now: () => number = Date.now): CoreCaBu
 /**
  * The startup log line: `[agent] core CA: 1 root(s) from /etc/yeke/core-ca/ca.crt; CN=… sha256:… valid until …`.
  *
- * Written once, when the CA is first loaded successfully (see
- * `TunnelClient.#connect`) — not on every reconnect's re-read, which would
- * turn a routine keepalive cycle into a log line every `reconnectMinMs`.
+ * Printed by `TunnelClient.#loadCoreCaForConnect` whenever the loaded root
+ * SET changes — the first successful load, and again only if a later
+ * reconnect's re-read turns up a different set (rotation, §3.10) — not on
+ * every reconnect's re-read, which would turn a routine keepalive cycle
+ * into a log line every `reconnectMinMs`.
  */
 export function describeCoreCa(file: string, bundle: CoreCaBundle): string {
   const roots = bundle.roots

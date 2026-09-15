@@ -260,6 +260,25 @@ test("K16: an expired intermediate is skipped while a valid root is kept", async
   }
 });
 
+test("loadCoreCa dedupes a repeated root certificate by fingerprint (independent finding, 15.09.2026): the SAME block twice counts once in both `ca` and `roots`", async () => {
+  const fixture = await chain();
+  const directory = await mkdtemp(join(tmpdir(), "yeke-agent-core-ca-"));
+  try {
+    // The exact same PEM block, twice — the shape an operator's ConfigMap
+    // edit or a rotation that concatenates two files can easily produce.
+    // `hello.coreCaRoots` (K15) counts `roots.length` against a 16-item wire
+    // limit, so a duplicate must count once, not once per copy.
+    const file = await withFile(directory, "duplicated-root.crt", Buffer.concat([fixture.rootCert, fixture.rootCert]));
+    const bundle = loadCoreCa(file);
+    assert.equal(bundle.roots.length, 1, "a repeated root must count once, not twice");
+    assert.equal(bundle.ca.length, 1, "its PEM block must appear once in `ca` too");
+    const rootCert = new X509Certificate(fixture.rootCert);
+    assert.equal(bundle.roots[0]?.fingerprint256, rootCert.fingerprint256);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test("root alone is accepted (K1b: only the root is required, an intermediate helps but is optional)", async () => {
   const fixture = await chain();
   const directory = await mkdtemp(join(tmpdir(), "yeke-agent-core-ca-"));
