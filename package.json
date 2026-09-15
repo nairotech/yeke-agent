@@ -22,7 +22,7 @@
   },
   "dependencies": {
     "@kubernetes/client-node": "^1.4.0",
-    "@nairotech/yeke-tunnel": "5.0.0",
+    "@nairotech/yeke-tunnel": "5.1.0",
     "undici": "^7.17.0",
     "ws": "^8.21.1"
   },
