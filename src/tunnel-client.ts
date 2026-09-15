@@ -112,6 +112,20 @@ function isAllowedPath(path: string): boolean {
 }
 
 /**
+ * Whether two root fingerprint SETS are the same — order-independent, since
+ * a re-read of the same file must not be treated as a change just because
+ * `loadCoreCa` happened to hand the certificates back in a different order
+ * (it does not today, but nothing about `#loadCoreCaForConnect`'s "print
+ * only on a real change" rule should depend on that staying true).
+ */
+function sameRootFingerprintSet(a: readonly string[], b: readonly string[]): boolean {
+  if (a.length !== b.length) return false;
+  const sortedA = [...a].sort();
+  const sortedB = [...b].sort();
+  return sortedA.every((fingerprint, index) => fingerprint === sortedB[index]);
+}
+
+/**
  * Node's TLS error codes for "the certificate does not chain to anything I
  * trust" — the ONLY family a corporate CA can fix. A closed list on purpose:
  * an expired certificate or a hostname mismatch is a different problem that
@@ -488,6 +502,24 @@ export class TunnelClient {
    * to a file this agent is not free to silently distrust.
    */
   #coreCa: CoreCaBundle | undefined;
+  /**
+   * The root fingerprint SET the startup CA line was last printed for —
+   * `undefined` before the first successful load.
+   *
+   * Independent finding, 15.09.2026: the original "print once, on the FIRST
+   * successful load" rule (`#loadCoreCaForConnect` below) meant the line
+   * never printed again, even across a full rotation (§3.10: the file's
+   * roots change TWICE — old+new, then new alone — while the pod is never
+   * restarted). §3.14 claims "which CA is distributed is auditable" from
+   * this very line; measured against an actual rotation, that claim went
+   * stale after the first certificate, which defeats the point of an
+   * auditable line existing at all. Comparing against this field (not
+   * against `#coreCa` itself, which is already the freshly loaded bundle by
+   * the time the comparison would run) is what lets "the file was re-read
+   * but nothing in it actually changed" — every ordinary reconnect — stay
+   * silent, exactly as before.
+   */
+  #loggedCoreCaRootFingerprints: readonly string[] | undefined;
 
   constructor(config: AgentConfig, hooks: { readonly createCollector?: CollectorFactory } = {}) {
     this.#config = config;
@@ -572,15 +604,29 @@ export class TunnelClient {
    * briefly missing during a ConfigMap swap, a truncated write) is caught here
    * and logged instead: the socket still connects with whatever CA is already
    * trusted, rather than the agent going down over a transient read.
+   *
+   * The startup CA line is printed whenever the loaded root SET changed since
+   * the last time it was printed (`#loggedCoreCaRootFingerprints`) — not only
+   * on the very first load. Independent finding, 15.09.2026: printing once
+   * ever meant a full rotation (§3.10 — the file's roots change TWICE while
+   * the pod is never restarted) produced no line at all past the first
+   * certificate, which is exactly the case §3.14's "which CA is distributed
+   * is auditable" claim exists for. An ordinary reconnect that re-reads the
+   * SAME file still prints nothing, same as before.
    */
   #loadCoreCaForConnect(): void {
     const file = this.#config.coreCaFile;
     if (!file) return;
     try {
       const bundle = loadCoreCa(file);
-      const first = !this.#coreCa;
       this.#coreCa = bundle;
-      if (first) console.log(describeCoreCa(file, bundle));
+      const fingerprints = bundle.roots.map((root) => root.fingerprint256);
+      const changed =
+        !this.#loggedCoreCaRootFingerprints || !sameRootFingerprintSet(this.#loggedCoreCaRootFingerprints, fingerprints);
+      if (changed) {
+        console.log(describeCoreCa(file, bundle));
+        this.#loggedCoreCaRootFingerprints = fingerprints;
+      }
     } catch (err) {
       if (!this.#coreCa) throw err;
       console.warn(
