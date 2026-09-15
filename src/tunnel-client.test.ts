@@ -1388,3 +1388,113 @@ test("K16 finding: the 'skipping expired certificate(s)' warning is printed once
   }
 });
 
+/**
+ * ─── Independent finding, 15.09.2026: `hello` rejected with 1008 reconnects
+ * once a second forever ─────────────────────────────────────────────────
+ *
+ * Measured against a real `TunnelClient`: a control plane that closes every
+ * `hello` with 1008 (`PROTOCOL_UNSUPPORTED` — core's real code for a `hello`
+ * it will not accept) never let the backoff climb past its floor — 11
+ * connection attempts in 10 seconds against `reconnectMinMs: 1000`. The
+ * cause was `#backoff`'s reset living in the socket's `open` handler:
+ * `open` only proves the TCP+TLS handshake succeeded, and `hello` goes out
+ * from that same handler — core can still refuse it and close with no
+ * `welcome` ever sent. Every such attempt's `open` re-armed the SAME floor
+ * the immediately-following rejection should have been backing off from. A
+ * full TLS handshake, a token check on core's side, and a log line on each
+ * end, on a one-second clock, indefinitely — roughly 86,000 times a day for
+ * one misbehaving or out-of-date agent.
+ *
+ * The two tests below share the shape of `#backoff`'s own file-header
+ * comment: one server that never sends `welcome` (this one) must show the
+ * delay CLIMBING; one that does send it (the next test) must show the delay
+ * staying at the floor every time, proving the fix did not turn every
+ * reconnect slow. Real elapsed time is measured (`Date.now()` between
+ * connections) — there is no injectable clock for `setTimeout` here — so
+ * the assertions compare the LAST gap against the FIRST by a wide margin
+ * rather than checking exact doubling, to stay robust against scheduler
+ * jitter on a loaded machine.
+ */
+test("a control plane that closes every hello with 1008 (never sending welcome) makes the reconnect delay CLIMB, not sit at the floor", async () => {
+  process.env.KUBECONFIG = await kubeconfig();
+  const server = new WebSocketServer({ host: "127.0.0.1", port: 0 });
+  const connectTimes: number[] = [];
+  server.on("connection", (connection) => {
+    connectTimes.push(Date.now());
+    // No `welcome`, ever — this is core's real rejection path (measured
+    // finding): the agent's `hello` is read and refused, not ignored.
+    connection.on("message", () => {
+      connection.close(1008, "protocol unsupported");
+    });
+  });
+  await new Promise<void>((resolve) => server.once("listening", resolve));
+  const { port } = server.address() as AddressInfo;
+
+  const client = new TunnelClient({
+    coreUrl: `ws://127.0.0.1:${port}/tunnel`,
+    clusterId: "cluster-1",
+    token: "agent-token",
+    kubeMode: "kubeconfig",
+    reconnectMinMs: 15,
+    reconnectMaxMs: 2_000,
+    kubeletInsecureTls: false,
+    metricsEnabled: false,
+  });
+  try {
+    await client.start();
+    await until("at least six rejected connection attempts", () => connectTimes.length >= 6);
+
+    const gaps = connectTimes.slice(1).map((t, i) => t - connectTimes[i]!);
+    assert.ok(
+      gaps.at(-1)! >= gaps[0]! * 4,
+      `expected the delay to climb well past the floor (gaps: ${JSON.stringify(gaps)})`,
+    );
+  } finally {
+    await client.stop();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  }
+});
+
+test("a session that DID register (received welcome) and later drops keeps reconnecting from reconnectMinMs, every time — not an accumulated backoff", async () => {
+  const core = await fakeCore(5);
+  process.env.KUBECONFIG = await kubeconfig();
+  const client = new TunnelClient({
+    coreUrl: core.url,
+    clusterId: "cluster-1",
+    token: "agent-token",
+    kubeMode: "kubeconfig",
+    reconnectMinMs: 15,
+    reconnectMaxMs: 2_000,
+    kubeletInsecureTls: false,
+    metricsEnabled: false,
+  });
+  const gaps: number[] = [];
+  try {
+    await client.start();
+    await until("the first session registers", () => client.protocolVersion === 5);
+
+    let last = Date.now();
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      core.drop();
+      await until(
+        `reconnect ${attempt + 2} registers`,
+        () => core.sessions === attempt + 2 && client.protocolVersion === 5,
+      );
+      const now = Date.now();
+      gaps.push(now - last);
+      last = now;
+    }
+
+    // Every gap stays near the floor: if the reset had NOT happened on each
+    // `welcome`, later gaps would climb the same way the previous test's
+    // do. A generous ceiling — well under one doubling of the 15ms floor —
+    // is enough to tell the two shapes apart without being timing-brittle.
+    for (const [index, gap] of gaps.entries()) {
+      assert.ok(gap < 60, `reconnect ${index + 2} took ${gap}ms, expected near the 15ms floor: ${JSON.stringify(gaps)}`);
+    }
+  } finally {
+    await client.stop();
+    await core.close();
+  }
+});
+
