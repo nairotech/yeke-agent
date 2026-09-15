@@ -20,6 +20,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { createServer as createHttpsServer, type Server as HttpsServer } from "node:https";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AddressInfo } from "node:net";
@@ -34,6 +35,11 @@ import {
   type SampleMessage,
 } from "@nairotech/yeke-tunnel";
 import type { AgentConfig } from "./config.js";
+import {
+  type ChainTlsFixture,
+  createChainTlsFixture,
+  opensslAvailable,
+} from "./core-ca-fixture.js";
 import {
   TunnelClient,
   type CollectorFactory,
@@ -567,4 +573,297 @@ test("shutdown stops the collector", async () => {
  * shutdown path rather than to the sample path, so it is written down here
  * instead of being silently absorbed into this round.
  */
+
+/**
+ * ─── `YEKE_CORE_CA_FILE`: core signed by an organization's own CA ───────────
+ *
+ * Everything above connects to `fakeCore` over plain `ws://`; the tests below
+ * are the one place in this repository that measures the combination the
+ * architecture decision's corporate-CA design rests on —
+ * `ca: [...tls.rootCertificates, ...bundle]` handed to `ws`, against a REAL
+ * TLS handshake, on a control plane whose certificate chains through an
+ * intermediate to a root Node does not carry by default. The baseline
+ * measurement behind that decision (docs/architecture/2026-09-15-yeke-kurum-ca-guveni.md,
+ * §8.3) only exercised `NODE_EXTRA_CA_CERTS`; this is the first measurement of
+ * the `ws`-`ca`-option path itself.
+ *
+ * `secureFakeCore` is `fakeCore` with one difference: an `https.Server`
+ * underneath the `WebSocketServer`, built with whatever certificate chain a
+ * test hands it. `createChainTlsFixture` (`core-ca-fixture.ts`) is what
+ * supplies a root → intermediate → leaf chain rather than the CA+leaf pair
+ * `metrics/fixture.ts` builds for the collector — the point being measured
+ * here is specifically that Node refuses to anchor trust on the intermediate
+ * alone, and a leaf-only server could never exercise that.
+ */
+
+let cachedChainA: { fixture: ChainTlsFixture; directory: string } | undefined;
+let cachedChainB: { fixture: ChainTlsFixture; directory: string } | undefined;
+
+/** One root → intermediate → leaf chain, generated once and reused. */
+async function chainA(): Promise<ChainTlsFixture> {
+  if (cachedChainA) return cachedChainA.fixture;
+  assert.ok(
+    await opensslAvailable(),
+    "NOT MEASURED: openssl is not on PATH, so the corporate-CA claims of the tunnel client were not " +
+      "checked on this machine. Install openssl and run the gate again.",
+  );
+  const directory = await mkdtemp(join(tmpdir(), "yeke-agent-tunnel-ca-a-"));
+  cachedChainA = { fixture: await createChainTlsFixture(directory, { commonName: "core-a" }), directory };
+  return cachedChainA.fixture;
+}
+
+/** A SECOND, unrelated chain — for the "wrong root, then the right one" test. */
+async function chainB(): Promise<ChainTlsFixture> {
+  if (cachedChainB) return cachedChainB.fixture;
+  const directory = await mkdtemp(join(tmpdir(), "yeke-agent-tunnel-ca-b-"));
+  cachedChainB = { fixture: await createChainTlsFixture(directory, { commonName: "core-b" }), directory };
+  return cachedChainB.fixture;
+}
+
+test.after(async () => {
+  if (cachedChainA) await rm(cachedChainA.directory, { recursive: true, force: true });
+  if (cachedChainB) await rm(cachedChainB.directory, { recursive: true, force: true });
+});
+
+/**
+ * `fakeCore`, TLS-wrapped: identical wire behaviour (same `welcome`, same
+ * message recording in arrival order), but the transport is a real
+ * `https.Server` presenting whatever chain the test supplies, so a client
+ * with the wrong (or no) trust anchor genuinely fails the handshake rather
+ * than a mock pretending it would have.
+ */
+async function secureFakeCore(options: {
+  readonly cert: Buffer;
+  readonly key: Buffer;
+  readonly protocol: number | undefined;
+}): Promise<FakeCore> {
+  const received: Received[] = [];
+  let socket: CoreSocket | undefined;
+  let sessions = 0;
+
+  const httpsServer: HttpsServer = createHttpsServer({ cert: options.cert, key: options.key });
+  const wss = new WebSocketServer({ server: httpsServer });
+  wss.on("connection", (connection) => {
+    sessions += 1;
+    socket = connection;
+    connection.on("message", (data, isBinary) => {
+      if (isBinary) {
+        received.push({ binary: Buffer.from(data as Buffer) });
+        return;
+      }
+      received.push({ control: parseControlMessage(data.toString()) });
+    });
+    connection.send(
+      serializeControlMessage({
+        t: "welcome",
+        clusterId: "cluster-1",
+        sessionId: `session-${sessions}`,
+        ...(options.protocol === undefined ? {} : { protocol: options.protocol }),
+      }),
+    );
+  });
+  await new Promise<void>((resolve) => httpsServer.listen(0, "127.0.0.1", resolve));
+  const { port } = httpsServer.address() as AddressInfo;
+
+  return {
+    url: `wss://127.0.0.1:${port}/tunnel`,
+    received,
+    get sessions() {
+      return sessions;
+    },
+    samples() {
+      const found: { message: SampleMessage; payload: Buffer }[] = [];
+      for (let index = 0; index < received.length; index += 1) {
+        const message = received[index]?.control;
+        if (message?.t !== "sample") continue;
+        const next = received[index + 1]?.binary;
+        assert.ok(next, `the sample message at ${index} was not followed by a binary frame`);
+        const decoded = decodeBodyFrame(next);
+        assert.equal(decoded?.requestId, SAMPLE_FRAME_REQUEST_ID);
+        found.push({ message, payload: Buffer.from(decoded!.payload) });
+      }
+      return found;
+    },
+    send(message) {
+      socket?.send(serializeControlMessage(message));
+    },
+    drop() {
+      socket?.terminate();
+    },
+    close: () =>
+      new Promise<void>((resolve) => {
+        for (const client of wss.clients) client.terminate();
+        wss.close();
+        httpsServer.close(() => resolve());
+      }),
+  };
+}
+
+/** The parts of `AgentConfig` every CA test shares; only `coreUrl` and `coreCaFile` vary. */
+function caTestConfig(coreUrl: string, coreCaFile?: string): AgentConfig {
+  return {
+    coreUrl,
+    clusterId: "cluster-1",
+    token: "agent-token",
+    kubeMode: "kubeconfig",
+    // Short and bounded, so a negative probe's "it never connects" assertion
+    // does not have to wait out a realistic production backoff.
+    reconnectMinMs: 30,
+    reconnectMaxMs: 60,
+    kubeletInsecureTls: false,
+    // The collector is irrelevant to what these tests measure and would only
+    // add an unreachable-apiserver's worth of noise to the log assertions.
+    metricsEnabled: false,
+    ...(coreCaFile ? { coreCaFile } : {}),
+  };
+}
+
+test("YEKE_CORE_CA_FILE naming the root trusts a server presenting leaf+intermediate (Node cannot anchor on the intermediate alone)", async () => {
+  const fixture = await chainA();
+  process.env.KUBECONFIG = await kubeconfig();
+  const directory = await mkdtemp(join(tmpdir(), "yeke-agent-tunnel-ca-"));
+  const caFile = join(directory, "ca.crt");
+  await writeFile(caFile, fixture.rootCert);
+
+  const core = await secureFakeCore({ cert: fixture.serverChainPem, key: fixture.leafKey, protocol: 5 });
+  const client = new TunnelClient(caTestConfig(core.url, caFile));
+  try {
+    await client.start();
+    await until("the agent trusts core's certificate and completes the handshake", () => client.protocolVersion === 5);
+    assert.equal(core.sessions, 1);
+  } finally {
+    await client.stop();
+    await core.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("without YEKE_CORE_CA_FILE the same server is untrusted, and the error line names the remedy", async () => {
+  const fixture = await chainA();
+  process.env.KUBECONFIG = await kubeconfig();
+  const core = await secureFakeCore({ cert: fixture.serverChainPem, key: fixture.leafKey, protocol: 5 });
+  const originalError = console.error;
+  const lines: string[] = [];
+  console.error = (...args: unknown[]) => void lines.push(args.join(" "));
+  const client = new TunnelClient(caTestConfig(core.url));
+  try {
+    await client.start();
+    await settle();
+    assert.equal(client.protocolVersion, 0, "the handshake must never complete against an untrusted certificate");
+    assert.equal(core.sessions, 0, "the TLS handshake itself must fail, before any WebSocket upgrade");
+    assert.ok(
+      lines.some((line) => line.includes("YEKE_CORE_CA_FILE") && line.includes("not trusted")),
+      `no connection-error line named the remedy:\n${JSON.stringify(lines, null, 2)}`,
+    );
+  } finally {
+    console.error = originalError;
+    await client.stop();
+    await core.close();
+  }
+});
+
+test("the file is re-read on every connection attempt: a wrong root fails, and fixing the file makes the very next reconnect succeed (rotation)", async () => {
+  const fixtureA = await chainA();
+  const fixtureB = await chainB();
+  process.env.KUBECONFIG = await kubeconfig();
+  const directory = await mkdtemp(join(tmpdir(), "yeke-agent-tunnel-ca-"));
+  const caFile = join(directory, "ca.crt");
+  // The server speaks chain B; the file starts out with chain A's (unrelated)
+  // root, so the very first attempt must fail — proving the second success
+  // below comes from a fresh read, not a cached one from `start()`.
+  await writeFile(caFile, fixtureA.rootCert);
+
+  const core = await secureFakeCore({ cert: fixtureB.serverChainPem, key: fixtureB.leafKey, protocol: 5 });
+  const client = new TunnelClient(caTestConfig(core.url, caFile));
+  try {
+    await client.start();
+    await settle();
+    assert.equal(client.protocolVersion, 0, "chain A's root must not verify chain B's certificate");
+    assert.equal(core.sessions, 0);
+
+    await writeFile(caFile, fixtureB.rootCert);
+
+    await until("the reconnect re-read the file and picked up the corrected root", () => client.protocolVersion === 5);
+    assert.equal(core.sessions, 1, "exactly the reconnect that followed the fix reached the server");
+  } finally {
+    await client.stop();
+    await core.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("when the CA file becomes unreadable, the last known good set is kept and the tunnel survives", async () => {
+  const fixture = await chainA();
+  process.env.KUBECONFIG = await kubeconfig();
+  const directory = await mkdtemp(join(tmpdir(), "yeke-agent-tunnel-ca-"));
+  const caFile = join(directory, "ca.crt");
+  await writeFile(caFile, fixture.rootCert);
+
+  const core = await secureFakeCore({ cert: fixture.serverChainPem, key: fixture.leafKey, protocol: 5 });
+  const originalWarn = console.warn;
+  const lines: string[] = [];
+  console.warn = (...args: unknown[]) => void lines.push(args.join(" "));
+  const client = new TunnelClient(caTestConfig(core.url, caFile));
+  try {
+    await client.start();
+    await until("the first connection succeeds with the correct root", () => client.protocolVersion === 5);
+    assert.equal(core.sessions, 1);
+
+    // Corrupt the file in place: the next `#connect` must fail to re-read it.
+    await writeFile(caFile, "not a certificate\n");
+    core.drop();
+
+    await until(
+      "the agent reconnected using the LAST KNOWN GOOD set, not a broken fresh read",
+      () => core.sessions === 2 && client.protocolVersion === 5,
+    );
+    assert.ok(
+      lines.some((line) => line.includes("core CA file could not be re-read") && line.includes("last known set")),
+      `no warning line reported the unreadable file:\n${JSON.stringify(lines, null, 2)}`,
+    );
+  } finally {
+    console.warn = originalWarn;
+    await client.stop();
+    await core.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("the startup CA log line is written once, on the first successful load, naming the file and the root's fingerprint", async () => {
+  const fixture = await chainA();
+  process.env.KUBECONFIG = await kubeconfig();
+  const directory = await mkdtemp(join(tmpdir(), "yeke-agent-tunnel-ca-"));
+  const caFile = join(directory, "ca.crt");
+  await writeFile(caFile, fixture.rootCert);
+
+  const core = await secureFakeCore({ cert: fixture.serverChainPem, key: fixture.leafKey, protocol: 5 });
+  const originalLog = console.log;
+  const lines: string[] = [];
+  console.log = (...args: unknown[]) => void lines.push(args.join(" "));
+  const client = new TunnelClient(caTestConfig(core.url, caFile));
+  try {
+    await client.start();
+    await until("the first connection succeeds", () => client.protocolVersion === 5);
+
+    const caLines = lines.filter((line) => line.startsWith("[agent] core CA:"));
+    assert.equal(caLines.length, 1, `expected exactly one startup CA line:\n${JSON.stringify(lines, null, 2)}`);
+    assert.ok(caLines[0]?.includes(caFile));
+    assert.ok(caLines[0]?.includes("1 root(s)"));
+
+    // A reconnect (the file unchanged) must NOT repeat the line — it is a
+    // startup announcement, not a per-attempt one.
+    core.drop();
+    await until("the agent reconnected", () => core.sessions === 2);
+    assert.equal(
+      lines.filter((line) => line.startsWith("[agent] core CA:")).length,
+      1,
+      "a routine reconnect must not repeat the startup CA line",
+    );
+  } finally {
+    console.log = originalLog;
+    await client.stop();
+    await core.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
 
