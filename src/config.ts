@@ -12,6 +12,19 @@ export interface AgentConfig {
   reconnectMinMs: number;
   reconnectMaxMs: number;
   /**
+   * Path to a PEM file with the certificate authority that signed core's TLS
+   * certificate, when it was signed by an organization's own CA rather than a
+   * publicly trusted one (`YEKE_CORE_CA_FILE`).
+   *
+   * Only the PATH lives here; the content is read by `core-ca.ts`, and read
+   * again before every connection attempt in `tunnel-client.ts` — see that
+   * file for why. `undefined` (the default: no corporate CA) must leave the
+   * WebSocket's `ca` option unset entirely, not set to an empty list — the two
+   * are different to Node (an empty `ca` array still REPLACES the bundled
+   * trust store, per K2 in the architecture decision this field belongs to).
+   */
+  coreCaFile?: string;
+  /**
    * Accept kubelet server certificates that the cluster CA cannot verify.
    *
    * Off by default, and the default is the decision. The metrics collector
@@ -80,6 +93,7 @@ export function loadConfig(): AgentConfig {
     kubeContext: process.env.YEKE_KUBE_CONTEXT,
     reconnectMinMs: Number(process.env.YEKE_RECONNECT_MIN_MS ?? 1_000),
     reconnectMaxMs: Number(process.env.YEKE_RECONNECT_MAX_MS ?? 30_000),
+    coreCaFile: process.env.YEKE_CORE_CA_FILE,
     // Exactly the string `true`. A weakness is accepted deliberately or not at
     // all, and treating `1`, `yes` or `TRUE` as consent would mean a typo in a
     // manifest could disable certificate verification across a fleet.

@@ -225,6 +225,7 @@ a default are required; the agent refuses to start without them.
 | `YEKE_AGENT_TOKEN` | — | Proof of identity to the control plane; sent in a header, never in the URL |
 | `YEKE_KUBE_MODE` | `in-cluster` | `in-cluster` for production, `kubeconfig` for local development |
 | `YEKE_KUBE_CONTEXT` | current context | Only used in `kubeconfig` mode |
+| `YEKE_CORE_CA_FILE` | — | Path to a PEM file with the CA that signed core's TLS certificate, when it is your organization's own CA rather than a publicly trusted one; see "Corporate CA" below |
 | `YEKE_RECONNECT_MIN_MS` | `1000` | Initial reconnect backoff |
 | `YEKE_RECONNECT_MAX_MS` | `30000` | Backoff ceiling |
 | `YEKE_KUBELET_INSECURE_TLS` | `false` | Accept kubelet serving certificates the cluster CA cannot verify. Off by default; see below |
@@ -276,6 +277,55 @@ than tunnel protocol v5 (it cannot receive the frames) or when the agent runs in
 `kubeconfig` mode (kubelet reads need the pod's own ServiceAccount); in both
 cases the agent says so in one line and carries on.
 
+### Corporate CA
+
+If core is served behind a certificate signed by your organization's own CA —
+a reverse proxy, or core's own native TLS — rather than a publicly trusted
+one, point `YEKE_CORE_CA_FILE` at a PEM file containing that CA (`src/core-ca.ts`).
+The install manifest sets this up for you automatically whenever core itself
+is configured with `YEKE_PUBLIC_CA_FILE`: a `ConfigMap` carrying the CA, a
+read-only mount at `/etc/yeke/core-ca`, and the environment variable pointing
+at it. If your agent predates that CA (an existing cluster whose core is only
+now moving to a corporate CA), the cluster's update-agent action in the
+control plane's web interface adds the `ConfigMap` and the mount for you once
+core has the CA configured, without touching anything else.
+
+The trust this file grants is an ADDITION to the public roots bundled with
+Node.js, never a replacement: the agent still verifies core against the same
+public trust store it always has, plus whatever is in this file. There is no
+pinning — the agent trusts anything issued by the CA you provide, the same as
+any other root in the trust store.
+
+**The file must contain a root — a self-signed certificate — not only an
+intermediate.** Node.js clients (this agent, and the CLI) cannot anchor trust
+on an intermediate certificate alone, even though Go and `curl` can; a file
+with no self-signed certificate in it is refused at startup rather than left
+to fail later at the TLS handshake with no indication of why. If the chain
+your reverse proxy serves is only leaf+intermediate, add the root the
+intermediate was issued by.
+
+The file is re-read before every connection attempt, not only once at
+startup: a `ConfigMap` update lands on the pod's mount without a restart, and
+a certificate rotation (old root removed, new one added, core's certificate
+re-issued) completes without the agent's pod ever being touched — the
+reconnect that follows the certificate change is the moment the new root is
+picked up. The one exception is the very first read: if the file is missing,
+unreadable, malformed, or contains no root when the agent starts, it refuses
+to start (`[agent] failed to start: …`), the same rule `YEKE_CORE_URL` and the
+other required settings follow. A read that fails LATER — the file briefly
+absent during a `ConfigMap` swap, a truncated write — does not bring the
+tunnel down: the last successfully loaded CA is kept, and one line is logged
+saying so, until the next attempt reads a valid file again.
+
+When core's certificate cannot be verified, the connection error names the
+reason and, for the family of TLS errors a corporate CA can actually fix
+(an unrecognized issuer, a self-signed certificate in the chain), points at
+this variable directly rather than leaving you to guess.
+
+When `YEKE_CORE_CA_FILE` is not set, none of this changes anything: the `ca`
+option is never passed to the WebSocket at all, and TLS verification behaves
+exactly as it always has.
+
 ---
 
 ## Build and run
@@ -299,12 +349,16 @@ docker build -t yeke-agent:dev .
 ```
 
 `pnpm test` runs the boundary and pin gates (`src/boundary.test.ts`), the
-identity-classification tests (`src/kube.test.ts`) and the metrics collector's
-own suite (`src/metrics/*.test.ts`). The TLS tests in that suite need `openssl`
-on PATH: they generate a throwaway CA and two serving certificates rather than
-carrying a private key in a public repository, and when `openssl` is missing
-they FAIL with a message saying the claim was not measured, instead of passing
-quietly.
+identity-classification tests (`src/kube.test.ts`), the metrics collector's
+own suite (`src/metrics/*.test.ts`) and the corporate-CA tests
+(`src/core-ca.test.ts`, and the CA cases inside `src/tunnel-client.test.ts`).
+The TLS-facing tests in the last two need `openssl` on PATH: the metrics suite
+generates a throwaway CA and two serving certificates, the CA suite a full
+root → intermediate → leaf chain (so a test can measure that this agent, like
+every Node.js client, refuses to anchor trust on the intermediate alone) —
+rather than carrying a private key in a public repository — and when `openssl`
+is missing they FAIL with a message saying the claim was not measured, instead
+of passing quietly.
 
 There is also a measurement harness for the collector, which is not a gate:
 

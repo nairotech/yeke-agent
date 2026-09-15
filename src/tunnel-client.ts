@@ -7,8 +7,10 @@
  * is enough.
  */
 import { readFile } from "node:fs/promises";
+import { rootCertificates } from "node:tls";
 import { WebSocket, type RawData } from "ws";
 import { request } from "undici";
+import { type CoreCaBundle, describeCoreCa, loadCoreCa } from "./core-ca.js";
 import {
   AGENT_CLUSTER_HEADER,
   AGENT_TOKEN_HEADER,
@@ -108,6 +110,26 @@ function isAllowedPath(path: string): boolean {
   if (path.includes("..")) return false;
   return ALLOWED_PATH_PREFIXES.some((p) => path === p || path.startsWith(`${p}/`) || path.startsWith(`${p}?`));
 }
+
+/**
+ * Node's TLS error codes for "the certificate does not chain to anything I
+ * trust" — the ONLY family a corporate CA can fix. A closed list on purpose:
+ * an expired certificate or a hostname mismatch is a different problem that
+ * `YEKE_CORE_CA_FILE` does nothing for, and telling an operator to mount a CA
+ * for either would send them down a dead end.
+ */
+const TLS_TRUST_ERROR_CODES = new Set([
+  "UNABLE_TO_VERIFY_LEAF_SIGNATURE",
+  "SELF_SIGNED_CERT_IN_CHAIN",
+  "DEPTH_ZERO_SELF_SIGNED_CERT",
+  "UNABLE_TO_GET_ISSUER_CERT_LOCALLY",
+  "UNABLE_TO_GET_ISSUER_CERT",
+]);
+
+/** The remedy appended to a connection error whose code is in `TLS_TRUST_ERROR_CODES`. */
+const TLS_TRUST_HINT =
+  "core's certificate is not trusted; if it is signed by your organization's CA, mount the CA and set " +
+  "YEKE_CORE_CA_FILE (the install manifest does this when core has YEKE_PUBLIC_CA_FILE)";
 
 /** Hop-by-hop and identity headers that must not be forwarded to the apiserver. */
 const STRIPPED_REQUEST_HEADERS = new Set([
@@ -452,6 +474,20 @@ export class TunnelClient {
    */
   #collector: MetricsCollector | undefined;
   #collectorStarting = false;
+  /**
+   * The organization's CA, once loaded — `undefined` when `YEKE_CORE_CA_FILE`
+   * is not set, in which case `ca` is never passed to `WebSocket` at all (see
+   * `#connect`).
+   *
+   * Once this is set it never goes back to `undefined`: a re-read that fails
+   * on a later connection attempt (file deleted, briefly unreadable during a
+   * ConfigMap update) keeps the LAST successfully loaded bundle rather than
+   * dropping trust entirely. The one read that is allowed to bring the agent
+   * down is the very first one — the same "an obstacle is reported, never
+   * routed around" rule `kubeletInsecureTls` documents in `config.ts`, applied
+   * to a file this agent is not free to silently distrust.
+   */
+  #coreCa: CoreCaBundle | undefined;
 
   constructor(config: AgentConfig, hooks: { readonly createCollector?: CollectorFactory } = {}) {
     this.#config = config;
@@ -517,14 +553,60 @@ export class TunnelClient {
     await this.#target?.close();
   }
 
+  /**
+   * Loads `YEKE_CORE_CA_FILE` before a connection attempt, keeping `#coreCa`
+   * current.
+   *
+   * Called from `#connect` on EVERY attempt, not once at startup: a ConfigMap
+   * update lands on the pod's mount without a restart (kubelet, ~1 minute) and
+   * the rotation procedure this file supports (architecture decision §3.10)
+   * completes without the pod ever being touched — the reconnect that follows
+   * a certificate change is itself the moment the new root must be picked up.
+   *
+   * The first successful load is the one exception to "never bring the tunnel
+   * down over this": before it, `#coreCa` is `undefined` and there is no last
+   * known good set to fall back to, so a rule violation propagates out of
+   * `start()` and `main()` (`index.ts`) reports it as `[agent] failed to
+   * start: …` — the same reader-facing convention as `config.ts`'s
+   * `required()`. After that first success, a read or parse failure (file
+   * briefly missing during a ConfigMap swap, a truncated write) is caught here
+   * and logged instead: the socket still connects with whatever CA is already
+   * trusted, rather than the agent going down over a transient read.
+   */
+  #loadCoreCaForConnect(): void {
+    const file = this.#config.coreCaFile;
+    if (!file) return;
+    try {
+      const bundle = loadCoreCa(file);
+      const first = !this.#coreCa;
+      this.#coreCa = bundle;
+      if (first) console.log(describeCoreCa(file, bundle));
+    } catch (err) {
+      if (!this.#coreCa) throw err;
+      console.warn(
+        `[agent] core CA file could not be re-read, using the last known set: ${(err as Error).message}`,
+      );
+    }
+  }
+
   #connect(): void {
     if (this.#stopped) return;
 
+    this.#loadCoreCaForConnect();
+
+    const coreCa = this.#coreCa;
     const socket = new WebSocket(this.#config.coreUrl, {
       headers: {
         [AGENT_TOKEN_HEADER]: this.#config.token,
         [AGENT_CLUSTER_HEADER]: this.#config.clusterId,
       },
+      // An ADDITION to Node's bundled public roots, never a replacement (K2):
+      // the option is omitted entirely when no corporate CA is configured, so
+      // a CA-less agent's TLS behaviour is byte-for-byte what it was before
+      // this field existed — `ca: []` would not be equivalent, since Node
+      // treats a `ca` option (even empty) as replacing the default trust
+      // store rather than leaving it alone.
+      ...(coreCa ? { ca: [...rootCertificates, ...coreCa.ca] } : {}),
     });
     this.#socket = socket;
 
@@ -557,7 +639,14 @@ export class TunnelClient {
     });
 
     socket.on("error", (err) => {
-      console.error(`[agent] connection error: ${err.message}`);
+      // The remedy is appended, not substituted: Node's own text stays intact
+      // and the hint rides alongside it, the same "foreign text is never
+      // rewritten, only labelled" rule as `failure.ts`. Logged on every
+      // attempt (not once per state change) — backoff already spaces retries
+      // out, and that is today's behaviour for this line.
+      const code = (err as NodeJS.ErrnoException).code;
+      const hint = code && TLS_TRUST_ERROR_CODES.has(code) ? ` — ${TLS_TRUST_HINT}` : "";
+      console.error(`[agent] connection error: ${err.message}${hint}`);
     });
   }
 
