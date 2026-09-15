@@ -493,6 +493,31 @@ export class TunnelClient {
    * frames to a v3 peer.
    */
   #protocol = 0;
+  /**
+   * Delay before the next reconnect attempt — exponential, reset only on a
+   * CONFIRMED registration.
+   *
+   * Independent finding, 15.09.2026: this used to reset the moment the
+   * SOCKET opened (`#connect`'s `open` handler), not when the control plane
+   * actually accepted the agent. `open` only proves the TCP+TLS handshake
+   * succeeded — `hello` is sent from that same handler, and core can still
+   * close the connection over it (an unsupported protocol, an oversized
+   * `hello`, a bad token) with no `welcome` ever arriving. Measured: a
+   * control plane that closes every `hello` with 1008 made the agent
+   * reconnect about once a second indefinitely, because each attempt's
+   * `open` re-armed the very floor a `close`-without-`welcome` should have
+   * been backing off from — a full TLS handshake, a token check on core's
+   * side and a log line on both ends, roughly 86,000 times a day. The reset
+   * now lives where `welcome` is handled (`#onControl`'s `"welcome"` case,
+   * next to the `registered` log line) — the one point that proves the peer
+   * actually accepted this agent — so a connection that opens and is then
+   * rejected keeps climbing the exponential curve on its next attempt
+   * instead of restarting from the floor every time. A session that DID
+   * register and later drops (the ordinary case: a restart, a network blip)
+   * still reconnects from `reconnectMinMs`, unchanged:
+   * `#cleanupAfterDisconnect` does not touch this field, only the `welcome`
+   * case does.
+   */
   #backoff: number;
   #stopped = false;
   /** When the last message was received from the control plane; the sole criterion for the keepalive decision. */
@@ -753,7 +778,8 @@ export class TunnelClient {
     this.#socket = socket;
 
     socket.on("open", async () => {
-      this.#backoff = this.#config.reconnectMinMs;
+      // `#backoff` is NOT reset here — see its own comment. `open` proves
+      // only the TCP+TLS handshake; the reset waits for `welcome`.
       console.log("[agent] core connection opened");
       this.#lastSeenAt = Date.now();
       this.#startLiveness(socket);
@@ -1018,6 +1044,13 @@ export class TunnelClient {
 
     switch (message.t) {
       case "welcome":
+        // Independent finding, 15.09.2026: the backoff reset lives HERE, not
+        // in `#connect`'s `open` handler — see `#backoff`'s own comment for
+        // why. `welcome` is the one message that proves core accepted this
+        // agent's `hello`; resetting any earlier (on the socket merely
+        // opening) meant a control plane that rejects every `hello` never
+        // saw the exponential curve engage at all.
+        this.#backoff = this.#config.reconnectMinMs;
         // No `protocol` means the peer is a v3 control plane (it never sends the field).
         this.#protocol = message.protocol ?? 3;
         console.log(
