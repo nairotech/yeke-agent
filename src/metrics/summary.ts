@@ -27,9 +27,11 @@
  *
  * ─── What is NOT read, on purpose ───────────────────────────────────────────
  *
- *  · `containers[]`. K3: the container list is not summed; the pod-level field
- *    is used. Summing containers would double-count against the pod cgroup's
- *    own accounting and would silently include the pause container.
+ *  · `containers[]`'s STATISTICS. K3: the container list is not summed; the
+ *    pod-level field is used. Summing containers would double-count against
+ *    the pod cgroup's own accounting and would silently include the pause
+ *    container. Only the container NAMES are read, as the roster `cpu.limit`
+ *    needs (`containersByPod` below).
  *  · `systemContainers[]` (kubelet, runtime, pods). Node totals already contain
  *    them, and they are not entities the product has a screen for.
  *  · `swap`. Not in the Phase 1 metric set.
@@ -150,8 +152,13 @@ interface VolumeStats extends FsStats {
   name?: string;
   pvcRef?: PvcReference;
 }
+/** `ContainerStats` upstream; only the name is read (the roster for `cpu.limit`). */
+interface ContainerStats {
+  name?: string;
+}
 interface PodStats {
   podRef?: PodReference;
+  containers?: ContainerStats[];
   startTime?: string;
   cpu?: CpuStats;
   memory?: MemoryStats;
@@ -190,6 +197,17 @@ export interface SummaryReading {
   readonly psiIo: number;
   /** Rate keys this document produced; the caller uses them to expire the rest. */
   readonly rateKeys: ReadonlySet<string>;
+  /**
+   * Pod entity id -> the names in its `containers[]`, the pause container
+   * excluded. The roster `podCpuLimit` (`cadvisor.ts`) checks the cgroup quotas
+   * against: it lists a container whether or not it has a CPU limit, which a
+   * list built from cAdvisor's quota lines never can.
+   *
+   * A pod whose document carries no `containers` array has NO entry — not an
+   * empty one. "The kubelet did not say" must not become "the pod has no
+   * containers", and `podCpuLimit` refuses both anyway.
+   */
+  readonly containersByPod: ReadonlyMap<string, readonly string[]>;
 }
 
 /**
@@ -312,6 +330,7 @@ export function readSummary(
   const rateKeys = new Set<string>();
   let psiPresent = false;
   let psiIo = NO_READING;
+  const containersByPod = new Map<string, readonly string[]>();
 
   const node = document.node;
   if (nodeName && node) {
@@ -361,6 +380,17 @@ export function readSummary(
       node: nodeName || undefined,
       attributes: {},
     });
+    if (Array.isArray(pod.containers)) {
+      const names: string[] = [];
+      for (const container of pod.containers) {
+        const name = container?.name;
+        // The kubelet leaves the pause container out of this list; the filter
+        // is the same one `cadvisor.ts` applies, so the two sides agree on
+        // what a "real" container is even on a kubelet that does not.
+        if (typeof name === "string" && name !== "" && name !== "POD") names.push(name);
+      }
+      containersByPod.set(id, names);
+    }
 
     const cores = numberOf(pod.cpu?.usageNanoCores);
     writer.gauge(id, "cpu.cores", has(cores) ? cores / 1e9 : NO_READING);
@@ -393,6 +423,7 @@ export function readSummary(
     psiPresent,
     psiIo,
     rateKeys,
+    containersByPod,
   };
 }
 

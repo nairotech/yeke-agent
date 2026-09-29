@@ -372,6 +372,64 @@ test("an entity whose owner or denominator changed is re-declared under the SAME
   assert.deepEqual(second.entityIds, [nodeAlias, podAlias]);
 });
 
+test("a pod whose CPU limit changed is re-declared under the SAME alias; an unchanged one is not", () => {
+  const encoder = new SampleEncoder();
+  const limited = podEntity("uid-1", "web-1", { attributes: { "cpu.limit": Math.fround(0.5) } });
+  const first = decodeAll(
+    encoder.encode([
+      internalFrame({
+        capturedAt: START_MS,
+        entities: [limited],
+        values: [[limited, "cpu.throttledWall", 0.1]],
+      }),
+    ]),
+  )[0]!;
+  const declared = first.entities.added.find((entry) => entry.uid === "uid-1")!;
+  assert.deepEqual(declared.attrs, { "cpu.limit": Math.fround(0.5) });
+
+  const unchanged = decodeAll(
+    encoder.encode([
+      internalFrame({
+        capturedAt: START_MS + PERIOD_MS,
+        entities: [limited],
+        values: [[limited, "cpu.throttledWall", 0.1]],
+      }),
+    ]),
+  )[0]!;
+  assert.deepEqual(unchanged.entities.added, []);
+
+  // In-place resize to one core.
+  const resized = podEntity("uid-1", "web-1", { attributes: { "cpu.limit": 1 } });
+  const second = decodeAll(
+    encoder.encode([
+      internalFrame({
+        capturedAt: START_MS + 2 * PERIOD_MS,
+        entities: [resized],
+        values: [[resized, "cpu.throttledWall", 0.1]],
+      }),
+    ]),
+  )[0]!;
+  assert.equal(second.entities.added.length, 1);
+  assert.equal(second.entities.added[0]!.id, declared.id);
+  assert.deepEqual(second.entities.added[0]!.attrs, { "cpu.limit": 1 });
+
+  // A container without a limit joins: the attribute disappears, and that is
+  // a change too — the receiver must not keep the old ceiling.
+  const unlimited = podEntity("uid-1", "web-1");
+  const third = decodeAll(
+    encoder.encode([
+      internalFrame({
+        capturedAt: START_MS + 3 * PERIOD_MS,
+        entities: [unlimited],
+        values: [[unlimited, "cpu.cores", 0.2]],
+      }),
+    ]),
+  )[0]!;
+  assert.equal(third.entities.added.length, 1);
+  assert.equal(third.entities.added[0]!.id, declared.id);
+  assert.equal(third.entities.added[0]!.attrs, undefined);
+});
+
 test("a frame over the ceiling is split at entity boundaries, each part with its own seq", () => {
   const node = nodeEntity("node-a");
   const pods = Array.from({ length: 7 }, (_, index) => podEntity(`uid-${index}`, `web-${index}`));

@@ -80,7 +80,9 @@ export type EntityKind = "node" | "pod" | "pvc";
  *  · `procs`            count, gauge
  *  · `io.readBps`       bytes per second, DERIVED from a counter
  *  · `io.writeBps`      bytes per second, DERIVED from a counter
- *  · `cpu.throttled`    ratio in [0,1], DERIVED from two counters
+ *  · `cpu.throttled`    ratio in [0,1] — DECLARED, NO LONGER PRODUCED, see below
+ *  · `cpu.throttledWall` share of wall time in [0,1], DERIVED from a counter
+ *                       and the CFS period; the pod's worst container
  *  · `restarts`         count — DECLARED, NOT PRODUCED IN PHASE 1, see below
  *
  * `fs.used` is the PVC's used bytes and it is deliberately NOT `fs.rootUsed`,
@@ -95,6 +97,17 @@ export type EntityKind = "node" | "pod" | "pvc";
  * BYTE counter, because "rx" alone reads as a packet count to half the people
  * who see it; "errors" has no such ambiguity and `net.errorsPerSecond` would be
  * the longest name in the table for the least confusion removed.
+ *
+ * `cpu.throttled` is the retired throttling ratio (Δthrottled / Δperiods,
+ * containers summed). Its denominator only advances in periods where the
+ * container had work, so it answered "how often was it throttled while awake"
+ * and read 77% for a container held back 1.3% of the time (`counters.ts` →
+ * `wallShare` has the measurement). This agent produces `cpu.throttledWall`
+ * instead and never `cpu.throttled`; the name stays because older agents still
+ * send it and the control plane still stores it under that meaning — reusing
+ * it for the new number would put two meanings in one series across a mixed
+ * fleet. That it is not produced is asserted in `collector.test.ts`, the same
+ * way as `restarts` below.
  *
  * `restarts` IS in the K3 table and IS NOT produced by this collector. The
  * count lives in a pod's `status`, `status` is part of the object body, and the
@@ -125,6 +138,7 @@ export const METRIC_NAMES = [
   "io.readBps",
   "io.writeBps",
   "cpu.throttled",
+  "cpu.throttledWall",
   "restarts",
 ] as const;
 
@@ -138,15 +152,22 @@ export type MetricName = (typeof METRIC_NAMES)[number];
  * a node joining a cluster; sending them 2880 times a day as a flat line would
  * cost more than every rate put together and would still be the same number.
  *
- * What is NOT here, and why: a pod's `resources.requests` / `resources.limits`.
- * K3 names them as attributes, and the source it names is "the object itself".
- * The collector cannot read that object — a pod's spec is a body, and the
- * closed list of jobs the agent does under its own identity forbids bodies
+ * What is NOT here, and why: a pod's `resources.requests`. K3 names it as an
+ * attribute, and the source it names is "the object itself". The collector
+ * cannot read that object — a pod's spec is a body, and the closed list of
+ * jobs the agent does under its own identity forbids bodies
  * (`2026-09-09-yeke-izleme-kimlik-degismezi.md` K1). The control plane already
  * has that number from a read made under the USER's identity (the existing
  * `PodMetrics` path), which is also the only identity allowed to decide whether
- * that user may see it. So the denominator is joined on the control plane, and
- * the collector's silence here is the invariant working, not a gap.
+ * that user may see it. So the request is joined on the control plane, and the
+ * collector's silence here is the invariant working, not a gap.
+ *
+ * The CPU LIMIT is the exception, because it does not need the body: the
+ * kubelet already publishes each container's CFS quota and period on
+ * `/metrics/cadvisor`, the endpoint the collector reads anyway, and the limit
+ * is their quotient (`cpu.limit`, `cadvisor.ts` → `podCpuLimit`). It is an
+ * attribute and not a denominator of any series here; seeing it needs `list
+ * pods` on the control plane, which already reveals the spec that holds it.
  */
 export const ATTRIBUTE_NAMES = [
   /** node: cores schedulable by the scheduler (`status.allocatable.cpu`). */
@@ -177,6 +198,18 @@ export const ATTRIBUTE_NAMES = [
   "fs.capacity",
   /** count — a PVC's total inodes (`inodes`); the denominator of `fs.inodesUsed`. */
   "fs.inodes",
+  /**
+   * pod: cores — the sum of its containers' CPU limits, read from the cgroup
+   * (`container_spec_cpu_quota` / `container_spec_cpu_period`), not from the
+   * pod spec.
+   *
+   * ABSENT whenever any container of the pod has no limit (the pod then has no
+   * CPU ceiling at all) and whenever the reading cannot establish the full
+   * container list; see `podCpuLimit`. A changed limit (an in-place resize)
+   * changes the entity's record and is re-declared on the wire (`wire.ts`,
+   * `#alias`).
+   */
+  "cpu.limit",
 ] as const;
 
 export type AttributeName = (typeof ATTRIBUTE_NAMES)[number];

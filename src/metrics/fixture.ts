@@ -89,6 +89,12 @@ export interface SummaryFixtureOptions {
     readonly capacityBytes?: number;
     readonly inodesUsed?: number;
   };
+  /**
+   * Adds a second container, `sidecar`, to every pod's `containers[]` — the
+   * roster `cpu.limit` is checked against. Pair it with the same option of
+   * `cadvisorFixture`, which decides whether that sidecar has a CPU limit.
+   */
+  readonly sidecar?: boolean;
 }
 
 function stamp(ms: number): string {
@@ -219,6 +225,16 @@ export function summaryFixture(options: SummaryFixtureOptions): unknown {
         rootfs: { time, availableBytes: 10_737_418_240, capacityBytes: 21_474_836_480, usedBytes: 24_576 },
         logs: { time, availableBytes: 10_737_418_240, capacityBytes: 21_474_836_480, usedBytes: 8_192 },
       },
+      ...(options.sidecar
+        ? [
+            {
+              name: "sidecar",
+              startTime: stamp(startMs - 3_600_000),
+              cpu: { time, usageNanoCores: 1_000_000, usageCoreNanoSeconds: 1_000_000 * options.tick },
+              memory: { time, workingSetBytes: 16_777_216, rssBytes: 12_582_912 },
+            },
+          ]
+        : []),
     ],
   }));
 
@@ -313,6 +329,19 @@ export interface CadvisorFixtureOptions {
   readonly periodMs?: number;
   /** Lines from other families, to prove the filter actually filters. */
   readonly noise?: number;
+  /**
+   * `app`'s CFS quota in µs (period 100 000 µs), default 50 000 = 0.5 core.
+   * Zero makes `app` limitless: no quota line and no throttling counters,
+   * which is the shape a real kubelet emits for a container without a limit.
+   */
+  readonly appQuotaUs?: number;
+  /**
+   * A second container per pod. `limited`: quota 20 000 µs (0.2 core) and a
+   * throttled counter growing 150 per tick (wall share 0.5 at the default
+   * 30-second tick — five times `app`'s 0.1). `limitless`: a period line and
+   * IO only, the real shape of an unlimited container.
+   */
+  readonly sidecar?: "limited" | "limitless";
 }
 
 /**
@@ -323,13 +352,20 @@ export interface CadvisorFixtureOptions {
  *  · a pod-level cgroup line with an EMPTY container label;
  *  · a pause container line (`container="POD"`);
  *  · two devices per container, so the summing is exercised;
- *  · `# HELP` / `# TYPE` comments and unrelated families as noise.
+ *  · `# HELP` / `# TYPE` comments and unrelated families as noise;
+ *  · the CPU lines in the shape read from a production kubelet (29.09.2026):
+ *    counters stamped, spec lines unstamped, `container_spec_cpu_period` on
+ *    EVERY container (the pause container and the pod slice included, both
+ *    with an empty `container` label), quota and throttling counters only on
+ *    a container that has a limit — and the pod slice's own quota line, which
+ *    a reader must not add to the containers'.
  */
 export function cadvisorFixture(options: CadvisorFixtureOptions): string {
   const periodMs = options.periodMs ?? 30_000;
   const startMs = options.startMs ?? Date.parse("2026-09-09T00:00:00.000Z");
   const at = startMs + options.tick * periodMs;
   const zero = options.io === "zero";
+  const appQuotaUs = options.appQuotaUs ?? 50_000;
   const out: string[] = [];
 
   out.push("# HELP container_fs_reads_bytes_total Cumulative count of bytes read");
@@ -363,17 +399,41 @@ export function cadvisorFixture(options: CadvisorFixtureOptions): string {
         `container_fs_writes_bytes_total{container="app",device="${device}",id="${cgroup}/app",image="ornek/app:1",name="k8s_app_${pod.name}",${labels}} ${reads(50_000 + options.tick * (500 + index))} ${at}`,
       );
     }
-    out.push(
-      `container_cpu_cfs_periods_total{container="app",id="${cgroup}/app",image="ornek/app:1",name="k8s_app_${pod.name}",${labels}} ${1_000 + options.tick * 300} ${at}`,
-    );
-    // The base (700) is deliberately far from the per-tick increment (30): the
-    // ratio of the TOTALS and the ratio of the DELTAS then differ by a factor
-    // of five, so a test can tell which one the reader computed. With a base
-    // proportional to the increment both would agree and the assertion would
-    // measure nothing.
-    out.push(
-      `container_cpu_cfs_throttled_periods_total{container="app",id="${cgroup}/app",image="ornek/app:1",name="k8s_app_${pod.name}",${labels}} ${700 + options.tick * 30} ${at}`,
-    );
+    const app = `container="app",id="${cgroup}/app",image="ornek/app:1",name="k8s_app_${pod.name}",${labels}`;
+    if (appQuotaUs > 0) {
+      // Still emitted by a real kubelet and no longer read: the filter must
+      // drop it (it was the denominator of the retired ratio).
+      out.push(`container_cpu_cfs_periods_total{${app}} ${1_000 + options.tick * 300} ${at}`);
+      // 30 throttled periods of 100 ms per 30-second tick: a wall share of
+      // 0.1. The base (700) is far from the per-tick increment so that a
+      // reader dividing TOTALS instead of deltas gets a visibly different
+      // number.
+      out.push(`container_cpu_cfs_throttled_periods_total{${app}} ${700 + options.tick * 30} ${at}`);
+    }
+    const sidecar = `container="sidecar",id="${cgroup}/sidecar",image="ornek/sidecar:1",name="k8s_sidecar_${pod.name}",${labels}`;
+    if (options.sidecar === "limited") {
+      out.push(`container_cpu_cfs_periods_total{${sidecar}} ${2_000 + options.tick * 280} ${at}`);
+      out.push(`container_cpu_cfs_throttled_periods_total{${sidecar}} ${100 + options.tick * 150} ${at}`);
+    }
+    if (options.sidecar) {
+      out.push(`container_fs_reads_bytes_total{${sidecar},device="/dev/sda"} ${reads(10_000)} ${at}`);
+    }
+
+    // Spec lines: unstamped, as the kubelet writes them.
+    const slice = `container="",id="${cgroup}",image="",name="",${labels}`;
+    const pause = `container="",id="${cgroup}/pause",image="registry.k8s.io/pause:3.10",name="pause",${labels}`;
+    out.push(`container_spec_cpu_period{${slice}} 100000`);
+    out.push(`container_spec_cpu_period{${pause}} 100000`);
+    out.push(`container_spec_cpu_period{${app}} 100000`);
+    if (options.sidecar) out.push(`container_spec_cpu_period{${sidecar}} 100000`);
+    // The slice's own quota is the sum of its containers' when all are
+    // limited; a reader that counted it would double the pod's limit.
+    const sidecarQuota = options.sidecar === "limited" ? 20_000 : 0;
+    if (appQuotaUs > 0 && (options.sidecar !== "limitless")) {
+      out.push(`container_spec_cpu_quota{${slice}} ${appQuotaUs + sidecarQuota}`);
+    }
+    if (appQuotaUs > 0) out.push(`container_spec_cpu_quota{${app}} ${appQuotaUs}`);
+    if (sidecarQuota > 0) out.push(`container_spec_cpu_quota{${sidecar}} ${sidecarQuota}`);
   });
 
   // Families the filter must drop. A real endpoint carries hundreds of these.

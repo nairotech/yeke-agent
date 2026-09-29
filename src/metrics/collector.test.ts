@@ -117,8 +117,13 @@ interface FakeNode {
   tick: number;
   io: "normal" | "zero";
   psiIo: number;
+  /** `app`'s CFS quota in µs; see `cadvisorFixture`. */
+  appQuotaUs: number;
   close(): Promise<void>;
 }
+
+/** A second container in every pod, limited or not; see the fixtures. */
+type SidecarOption = { readonly sidecar?: "limited" | "limitless" };
 
 /** The PVC knobs the fixture takes, threaded through a fake node unchanged. */
 type PvcOptions = Pick<SummaryFixtureOptions, "pvcEvery" | "sharedPvc">;
@@ -131,10 +136,11 @@ async function fakeKubeletNode(
     pods: number;
     rogue?: boolean;
     status?: number;
-  } & PvcOptions,
+  } & PvcOptions &
+    SidecarOption,
 ): Promise<FakeNode> {
   const pods = fixturePods(name, options.pods);
-  const state = { tick: 0, io: "normal" as "normal" | "zero", psiIo: 0.1 };
+  const state = { tick: 0, io: "normal" as "normal" | "zero", psiIo: 0.1, appQuotaUs: 50_000 };
 
   const server: Server = createServer({ cert: options.cert, key: options.key }, (req, res) => {
     if (options.status && options.status >= 300) {
@@ -155,6 +161,7 @@ async function fakeKubeletNode(
             psiIo: state.psiIo,
             ...(options.pvcEvery === undefined ? {} : { pvcEvery: options.pvcEvery }),
             ...(options.sharedPvc === undefined ? {} : { sharedPvc: options.sharedPvc }),
+            ...(options.sidecar === undefined ? {} : { sidecar: true }),
           }),
         ),
       );
@@ -170,6 +177,8 @@ async function fakeKubeletNode(
           periodMs: PERIOD_MS,
           startMs: START_MS,
           io: state.io,
+          appQuotaUs: state.appQuotaUs,
+          ...(options.sidecar === undefined ? {} : { sidecar: options.sidecar }),
         }),
       );
       return;
@@ -201,6 +210,12 @@ async function fakeKubeletNode(
     set psiIo(value: number) {
       state.psiIo = value;
     },
+    get appQuotaUs() {
+      return state.appQuotaUs;
+    },
+    set appQuotaUs(value: number) {
+      state.appQuotaUs = value;
+    },
     close: () =>
       new Promise<void>((resolve) => {
         server.closeAllConnections?.();
@@ -225,7 +240,7 @@ function valueOf(frame: InternalFrame, entity: string, metric: MetricName): numb
 }
 
 async function harness(
-  options: { pods?: number; rogue?: boolean; status?: number } & PvcOptions = {},
+  options: { pods?: number; rogue?: boolean; status?: number } & PvcOptions & SidecarOption = {},
 ) {
   const fixture = await tls();
   const node = await fakeKubeletNode("node-a", {
@@ -235,6 +250,7 @@ async function harness(
     ...(options.status === undefined ? {} : { status: options.status }),
     ...(options.pvcEvery === undefined ? {} : { pvcEvery: options.pvcEvery }),
     ...(options.sharedPvc === undefined ? {} : { sharedPvc: options.sharedPvc }),
+    ...(options.sidecar === undefined ? {} : { sidecar: options.sidecar }),
   });
   const kubelet = new KubeletClient({
     token: { read: async () => "tok", invalidate: () => undefined },
@@ -306,7 +322,12 @@ test("one tick produces node and pod entities with both readings merged", async 
     // ...and from the cAdvisor text, in the same frame.
     assert.equal(valueOf(frame, "node/node-a", "io.readBps"), Math.fround(200_000 / 30));
     const pod = `pod/${h.node.pods[0]?.uid}`;
-    assert.equal(valueOf(frame, pod, "cpu.throttled"), Math.fround(0.1));
+    assert.equal(valueOf(frame, pod, "cpu.throttledWall"), Math.fround(0.1));
+    // The pod's CPU limit, from the cgroup quota: an attribute, not a series.
+    assert.equal(
+      entitiesOf(frame).find((entity) => entity.id === pod)?.attributes["cpu.limit"],
+      Math.fround(0.5),
+    );
 
     assert.deepEqual(frame.nodes, [
       { node: "node-a", state: "ok", psi: true, ioUnmeasurable: false },
@@ -361,6 +382,68 @@ test("PHASE 1 GAP, ASSERTED: no sample is ever produced for `restarts`", async (
       samplesOf(frame!).filter((sample) => sample.metric === "restarts"),
       [],
     );
+  } finally {
+    await h.close();
+  }
+});
+
+test("RETIRED, ASSERTED: no sample is ever produced for `cpu.throttled`", async () => {
+  const h = await harness({ pods: 3, sidecar: "limited" });
+  try {
+    // The name stays in `METRIC_NAMES` for the older agents that still send
+    // it (`types.ts`); this agent sends the wall share instead. Several frames,
+    // because the first one has no rates at all and would pass vacuously.
+    for (let index = 0; index < 4; index += 1) {
+      const frame = await h.advance();
+      assert.deepEqual(
+        samplesOf(frame!).filter((sample) => sample.metric === "cpu.throttled"),
+        [],
+        `frame ${index}`,
+      );
+    }
+    const last = await h.advance();
+    // ...and the replacement IS there, from the worst container (the sidecar's 0.5).
+    assert.equal(valueOf(last!, `pod/${h.node.pods[0]?.uid}`, "cpu.throttledWall"), Math.fround(0.5));
+  } finally {
+    await h.close();
+  }
+});
+
+test("cpu.limit end to end: the sum when every container is limited, ABSENT when one is not", async () => {
+  const limited = await harness({ pods: 2, sidecar: "limited" });
+  try {
+    const frame = await limited.advance();
+    for (const entity of entitiesOf(frame!).filter((item) => item.kind === "pod")) {
+      // 0.5 (app) + 0.2 (sidecar), with the Summary listing both.
+      assert.equal(entity.attributes["cpu.limit"], Math.fround(0.7), entity.id);
+    }
+  } finally {
+    await limited.close();
+  }
+
+  const limitless = await harness({ pods: 2, sidecar: "limitless" });
+  try {
+    const frame = await limitless.advance();
+    for (const entity of entitiesOf(frame!).filter((item) => item.kind === "pod")) {
+      assert.equal("cpu.limit" in entity.attributes, false, entity.id);
+    }
+  } finally {
+    await limitless.close();
+  }
+});
+
+test("a resized CPU limit changes the pod's record, so the layout is not reused", async () => {
+  const h = await harness({ pods: 2 });
+  try {
+    const first = await h.advance();
+    const same = await h.advance();
+    assert.equal(same?.layout, first?.layout, "nothing changed yet");
+
+    h.node.appQuotaUs = 100_000; // in-place resize: 0.5 -> 1 core
+    const resized = await h.advance();
+    assert.notEqual(resized?.layout, same?.layout);
+    const pod = entitiesOf(resized!).find((entity) => entity.id === `pod/${h.node.pods[0]?.uid}`);
+    assert.equal(pod?.attributes["cpu.limit"], 1);
   } finally {
     await h.close();
   }
