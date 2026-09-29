@@ -30,6 +30,9 @@
  *     what maps one to the other for the pods running on this node right now.
  *  3. Counters become rates, gauges are copied, PSI decides whether the IO zero
  *     probe fires, and the whole node either produces data or produces a state.
+ *     A pod's `cpu.limit` is joined here: cAdvisor has the quotas, the Summary
+ *     has the container roster, and only the two together can say that EVERY
+ *     container is limited (`podCpuLimit`).
  *  4. One frame goes into the ring. Then the ring drains, oldest first, for as
  *     long as the sink accepts.
  *
@@ -70,7 +73,7 @@
  *     wrong. The failure above cost a morning because both of those lines were
  *     missing.
  */
-import { IoZeroProbe, readCadvisor } from "./cadvisor.js";
+import { IoZeroProbe, podCpuLimit, readCadvisor } from "./cadvisor.js";
 import { CounterRates } from "./counters.js";
 import type { KubeletReader, KubeletTarget } from "./kubelet-client.js";
 import {
@@ -775,6 +778,18 @@ export class Collector {
     let ioUnmeasurable = probe.suppressing;
 
     if (cadvisorResult.state === "ok") {
+      const { containerLimits, containersSeen } = cadvisorResult.value;
+      for (let index = 0; index < entities.length; index += 1) {
+        const entity = entities[index]!;
+        if (entity.kind !== "pod") continue;
+        const cores = podCpuLimit(
+          reading.containersByPod.get(entity.id),
+          containerLimits.get(entity.id),
+          containersSeen.get(entity.id),
+        );
+        if (cores === undefined) continue;
+        entities[index] = { ...entity, attributes: { ...entity.attributes, "cpu.limit": cores } };
+      }
       samples.push(...cadvisorResult.value.samples);
       for (const key of cadvisorResult.value.rateKeys) rateKeys.add(key);
       if (cadvisorResult.value.ioCountersSeen) {
@@ -787,7 +802,9 @@ export class Collector {
     // A cAdvisor read that failed while the Summary succeeded is NOT a node
     // failure: the node's CPU, memory, filesystem, network and pressure are all
     // in hand. Only IO and throttling are missing, and their series are simply
-    // absent for this frame. Reporting the node as unreachable here would erase
+    // absent for this frame — as is every pod's `cpu.limit`, which is not
+    // carried over from an earlier reading: an attribute nobody read this tick
+    // is not re-asserted. Reporting the node as unreachable here would erase
     // data that was successfully collected.
 
     const state: NodeState = {

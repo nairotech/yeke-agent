@@ -1,7 +1,7 @@
 /**
  * Line filter for the kubelet's `/metrics/cadvisor`.
  *
- * ─── Why this endpoint is read at all, and why only four lines of it ────────
+ * ─── Why this endpoint is read at all, and why only five families of it ─────
  *
  * K3: the Summary API has no disk IO throughput and no CPU throttling. Both
  * exist only here. Throttling in particular is the most frequent answer to "why
@@ -9,18 +9,39 @@
  *
  * What is NOT built: a Prometheus parser. This endpoint emits thousands of
  * lines per node; a full parse would allocate an object for every one of them
- * so that four families survive. The filter below decides on the first
+ * so that five families survive. The filter below decides on the first
  * characters of a line and never allocates for the rest — K3's rule is "a line
  * whose prefix does not match is discarded" and the reason is the agent's CPU
  * budget (50m at 50 nodes, roof document section 8).
  *
- * The four families, and why exactly these:
+ * The five families, and why exactly these:
  *
  *  · `container_fs_reads_bytes_total`  / `container_fs_writes_bytes_total`
  *      Disk IO throughput. Counters, per device; the agent divides.
- *  · `container_cpu_cfs_throttled_periods_total` / `container_cpu_cfs_periods_total`
- *      A pair. Their DELTA ratio is the throttling share; the ratio of the
- *      totals would answer a question about the container's whole lifetime.
+ *  · `container_cpu_cfs_throttled_periods_total`
+ *      Counter, per container. Times the period length and divided by the
+ *      elapsed time, it is the share of WALL time the container sat at its
+ *      quota (`cpu.throttledWall`; `counters.ts` → `wallShare` has the
+ *      arithmetic and the measurement that retired the old ratio).
+ *  · `container_spec_cpu_period` / `container_spec_cpu_quota`
+ *      Gauges, per container, unstamped. The period is the length of one CFS
+ *      slice (100 000 µs unless the kubelet runs with `--cpu-cfs-quota-period`)
+ *      and is what turns a count of throttled periods into time. The quota over
+ *      the period is the container's CPU limit in cores, which becomes the
+ *      pod's `cpu.limit` attribute (see `podCpuLimit`).
+ *
+ * `container_cpu_cfs_periods_total` is NOT read any more. It was the
+ * denominator of the retired ratio (`cpu.throttled`), and the kernel advances
+ * it only in periods where the cgroup had runnable work — which is exactly why
+ * that ratio answered "how often was it throttled while awake" instead of "how
+ * much of the time was it held back". Nothing reads it, so it is not parsed.
+ *
+ * Shape, as read from a production kubelet (29.09.2026, k8s 1.31, systemd
+ * cgroup driver): the throttling counters and `container_spec_cpu_quota` exist
+ * ONLY for containers that have a CPU limit; `container_spec_cpu_period` exists
+ * for every container, limited or not. The counters carry an exposition
+ * timestamp and it DIFFERS between containers of one pod (cAdvisor stamps a
+ * container with its own last housekeeping); the spec lines carry none.
  *
  * ─── The pause container, and a discrepancy that is written down rather ─────
  * ─── than smoothed over                                                 ─────
@@ -34,11 +55,15 @@
  *
  * Both are excluded here, which satisfies the mechanism (`container != ""`) and
  * the stated purpose (no pause container) at the same time, and costs only the
- * pause container's own negligible IO. Which of the two shapes a given kubelet
- * emits is UNMEASURED — no live kubelet was read in the round that wrote this
- * file. Naming the discrepancy is the point: silently implementing one reading
- * of the rule would leave the next reader unable to tell a decision from an
- * oversight.
+ * pause container's own negligible IO. Naming the discrepancy is the point:
+ * silently implementing one reading of the rule would leave the next reader
+ * unable to tell a decision from an oversight.
+ *
+ * One shape has since been SEEN (29.09.2026, a production kubelet, k8s 1.31,
+ * containerd, systemd cgroup driver): the pause container carries an EMPTY
+ * `container` label there, told apart from the pod slice only by its `id` and
+ * `image`. The `POD` shape was not seen and stays excluded for the kubelets
+ * that emit it.
  *
  * ─── `id="/"` is the node ───────────────────────────────────────────────────
  *
@@ -53,10 +78,18 @@ import { NO_READING, type Sample, float32 } from "./types.js";
 const FS_READS = "container_fs_reads_bytes_total";
 const FS_WRITES = "container_fs_writes_bytes_total";
 const CFS_THROTTLED = "container_cpu_cfs_throttled_periods_total";
-const CFS_PERIODS = "container_cpu_cfs_periods_total";
+const SPEC_PERIOD = "container_spec_cpu_period";
+const SPEC_QUOTA = "container_spec_cpu_quota";
 
 /** The only prefixes that survive; everything else is dropped without parsing. */
-const WANTED = new Set<string>([FS_READS, FS_WRITES, CFS_THROTTLED, CFS_PERIODS]);
+const WANTED = new Set<string>([FS_READS, FS_WRITES, CFS_THROTTLED, SPEC_PERIOD, SPEC_QUOTA]);
+
+/**
+ * The CFS period when a container's `container_spec_cpu_period` line is absent:
+ * the kernel's and Kubernetes' default, 100 ms. When the line is there it wins,
+ * because `--cpu-cfs-quota-period` can change it per kubelet.
+ */
+export const DEFAULT_CFS_PERIOD_US = 100_000;
 
 /**
  * Every family here starts with this. The check is a cheap first gate: on a
@@ -153,17 +186,44 @@ export interface CadvisorReading {
   readonly ioCountersSeen: boolean;
   /** True when every IO counter seen in this reading was exactly zero. */
   readonly ioCountersAllZero: boolean;
+  /**
+   * Per pod entity: container name -> CPU limit in cores, for every container
+   * of that pod that carried a POSITIVE `container_spec_cpu_quota` and a
+   * positive `container_spec_cpu_period` in this reading.
+   */
+  readonly containerLimits: ReadonlyMap<string, ReadonlyMap<string, number>>;
+  /**
+   * Per pod entity: every real container name any wanted line mentioned —
+   * limited or not (`container_spec_cpu_period` is emitted for all of them).
+   * `podCpuLimit` uses it to catch a roster that is behind this reading.
+   */
+  readonly containersSeen: ReadonlyMap<string, ReadonlySet<string>>;
 }
 
-interface Totals {
+interface IoTotals {
   reads: number;
   writes: number;
-  throttled: number;
-  periods: number;
 }
 
-function emptyTotals(): Totals {
-  return { reads: NO_READING, writes: NO_READING, throttled: NO_READING, periods: NO_READING };
+/**
+ * One container's CPU lines out of one reading. Every field starts as
+ * `NO_READING`; the spec lines arrive AFTER the counters in the exposition
+ * (families are sorted), so nothing is computed until the whole text is read.
+ */
+interface ContainerCpu {
+  throttled: number;
+  /** The counter line's own exposition timestamp, or `NO_READING`. */
+  throttledAt: number;
+  periodUs: number;
+  quotaUs: number;
+}
+
+interface PodTotals extends IoTotals {
+  readonly containers: Map<string, ContainerCpu>;
+}
+
+function emptyIo(): IoTotals {
+  return { reads: NO_READING, writes: NO_READING };
 }
 
 function add(current: number, value: number): number {
@@ -209,8 +269,8 @@ export async function readCadvisor(
   context: CadvisorContext,
 ): Promise<CadvisorReading> {
   const { readAt, rates, nodeName, podIdByName, suppressIo } = context;
-  const nodeTotals = emptyTotals();
-  const podTotals = new Map<string, Totals>();
+  const nodeTotals = emptyIo();
+  const podTotals = new Map<string, PodTotals>();
   let latestStamp = NO_READING;
   let ioCountersSeen = false;
   let ioCountersAllZero = true;
@@ -229,7 +289,7 @@ export async function readCadvisor(
     const id = parsed.labels.get("id");
     if (id === "/") {
       // The machine root. Throttling is not collected at node level (K3's table
-      // marks it pod-only): a node-wide throttling ratio would average a
+      // marks it pod-only): a node-wide throttling figure would average a
       // throttled container together with every idle one and read as "fine".
       if (parsed.name === FS_READS) nodeTotals.reads = add(nodeTotals.reads, parsed.value);
       else if (parsed.name === FS_WRITES) nodeTotals.writes = add(nodeTotals.writes, parsed.value);
@@ -237,8 +297,10 @@ export async function readCadvisor(
     }
 
     const container = parsed.labels.get("container");
-    // Empty label = the pod-level cgroup slice; `POD` = the pause container.
-    // See this file's header for why both go.
+    // Empty label = the pod-level cgroup slice (and, on some kubelets, the
+    // pause container); `POD` = the pause container. See this file's header
+    // for why both go. For the CPU lines this is also what keeps the pod
+    // slice's OWN quota (the sum of its containers') out of the limit sum.
     if (!container || container === "POD") continue;
 
     const namespace = parsed.labels.get("namespace");
@@ -253,12 +315,18 @@ export async function readCadvisor(
 
     let totals = podTotals.get(entity);
     if (!totals) {
-      totals = emptyTotals();
+      totals = { ...emptyIo(), containers: new Map() };
       podTotals.set(entity, totals);
     }
-    // Containers are summed into their pod, and every device of a container is
-    // summed too: an operator asks "how much is this pod writing", not "how
-    // much is it writing to /dev/sdb".
+    let cpu = totals.containers.get(container);
+    if (!cpu) {
+      cpu = { throttled: NO_READING, throttledAt: NO_READING, periodUs: NO_READING, quotaUs: NO_READING };
+      totals.containers.set(container, cpu);
+    }
+    // IO: containers are summed into their pod, and every device of a
+    // container is summed too: an operator asks "how much is this pod
+    // writing", not "how much is it writing to /dev/sdb". CPU is NOT summed —
+    // it is kept per container and folded with MAX below.
     switch (parsed.name) {
       case FS_READS:
         totals.reads = add(totals.reads, parsed.value);
@@ -267,10 +335,14 @@ export async function readCadvisor(
         totals.writes = add(totals.writes, parsed.value);
         break;
       case CFS_THROTTLED:
-        totals.throttled = add(totals.throttled, parsed.value);
+        cpu.throttled = parsed.value;
+        cpu.throttledAt = parsed.timestamp ?? NO_READING;
         break;
-      case CFS_PERIODS:
-        totals.periods = add(totals.periods, parsed.value);
+      case SPEC_PERIOD:
+        cpu.periodUs = parsed.value;
+        break;
+      case SPEC_QUOTA:
+        cpu.quotaUs = parsed.value;
         break;
       default:
         break;
@@ -280,8 +352,10 @@ export async function readCadvisor(
   const at = Number.isNaN(latestStamp) ? readAt : latestStamp;
   const samples: Sample[] = [];
   const rateKeys = new Set<string>();
+  const containerLimits = new Map<string, Map<string, number>>();
+  const containersSeen = new Map<string, Set<string>>();
 
-  const writeIo = (entity: string, totals: Totals): void => {
+  const writeIo = (entity: string, totals: IoTotals): void => {
     for (const [metric, value] of [
       ["io.readBps", totals.reads],
       ["io.writeBps", totals.writes],
@@ -299,18 +373,107 @@ export async function readCadvisor(
   if (nodeName) writeIo(`node/${nodeName}`, nodeTotals);
   for (const [entity, totals] of podTotals) {
     writeIo(entity, totals);
-    if (Number.isNaN(totals.throttled) || Number.isNaN(totals.periods)) continue;
-    const key = `${entity}|cpu.throttled`;
-    rateKeys.add(key);
-    const ratio = rates.ratio(key, totals.throttled, totals.periods, at);
+    containersSeen.set(entity, new Set(totals.containers.keys()));
+
+    // ─── cpu.throttledWall: the pod's WORST container ───────────────────────
+    //
+    // Each container has its own cgroup and counts its own periods, so the
+    // shares are not additive: a SUM over containers can exceed 1 and answers
+    // no question at all. An AVERAGE dilutes a throttled sidecar with an idle
+    // main container and reads "fine" for a pod whose requests are stuck
+    // behind that sidecar. The maximum is the same rule the screen already
+    // applies one level up (a workload is as bad as its worst pod), taken one
+    // level down.
+    //
+    // A container without the counter has no CPU limit and cannot be
+    // throttled; it does not take part. A pod where NO container has the
+    // counter gets no series at all — "unlimited" is not "zero throttling",
+    // and a column of zeros would say the latter. A container whose own
+    // interval produced no number (first reading, restart) is skipped; the
+    // pod's value is the worst of the containers that DID produce one, and a
+    // hole only when none did.
+    let counted = false;
+    let worst = NO_READING;
+    const limits = new Map<string, number>();
+    for (const [name, cpu] of totals.containers) {
+      if (cpu.quotaUs > 0 && cpu.periodUs > 0) limits.set(name, cpu.quotaUs / cpu.periodUs);
+      if (Number.isNaN(cpu.throttled)) continue;
+      counted = true;
+      const key = `${entity}|cpu.throttledWall|${name}`;
+      rateKeys.add(key);
+      const periodUs = cpu.periodUs > 0 ? cpu.periodUs : DEFAULT_CFS_PERIOD_US;
+      // The counter's OWN stamp: cAdvisor stamps each container with its own
+      // housekeeping instant, and in this ratio the elapsed time IS the
+      // denominator — a node-wide stamp would be off by up to the housekeeping
+      // spread (seen on a production node: 17 s between a container's stamp
+      // and its own pod slice's in one reading).
+      const stampedAt = Number.isNaN(cpu.throttledAt) ? readAt : cpu.throttledAt;
+      const share = rates.wallShare(key, cpu.throttled, periodUs, stampedAt);
+      if (Number.isNaN(share)) continue;
+      if (Number.isNaN(worst) || share > worst) worst = share;
+    }
+    if (limits.size > 0) containerLimits.set(entity, limits);
+    if (!counted) continue;
     samples.push({
       entity,
-      metric: "cpu.throttled",
-      value: Number.isNaN(ratio) ? NO_READING : float32(ratio),
+      metric: "cpu.throttledWall",
+      value: Number.isNaN(worst) ? NO_READING : float32(worst),
     });
   }
 
-  return { samples, rateKeys, ioCountersSeen, ioCountersAllZero };
+  return { samples, rateKeys, ioCountersSeen, ioCountersAllZero, containerLimits, containersSeen };
+}
+
+/**
+ * The pod's CPU limit in cores — `cpu.limit` (K2) — or `undefined` when the pod
+ * has no finite limit or when this reading cannot tell.
+ *
+ * A pod's CPU ceiling is the SUM of its containers' limits, and it exists only
+ * if EVERY container has one: a single container without a limit can use the
+ * whole node, so the pod has no ceiling. That makes the answer depend on
+ * knowing the full list of containers, including the ones cAdvisor has no
+ * quota line for — and a list built from the quota lines alone would, by
+ * construction, never contain a container without a limit. So the roster comes
+ * from somewhere else:
+ *
+ *  · `roster` is the Summary's `pods[].containers[].name` for this pod — the
+ *    kubelet's own list of the pod's running containers, which lists a
+ *    container whether or not it has a limit (and never the pause container).
+ *    It comes from the SAME tick, one request earlier.
+ *  · `seen` is every real container any cAdvisor line named for this pod
+ *    (`container_spec_cpu_period` is emitted for limited and unlimited
+ *    containers alike). A name here that the roster lacks means the two reads
+ *    straddled a container start: the roster is behind, and a sum over it
+ *    could be missing a term.
+ *
+ * Every name in the union of the two (and of `limits`) must have a positive
+ * limit, and the roster must be non-empty. Anything else — no roster, a
+ * container without a quota, a container one side has not seen — returns
+ * `undefined` and the attribute is not written. An absent limit reads as "not
+ * known"; a wrong one would read as a ceiling the pod does not have.
+ *
+ * Rejected: counting the pod-level slice's own quota line (its `container`
+ * label is empty). Its quota IS the sum of the containers' quotas when all are
+ * limited, but whether the kubelet leaves the slice unlimited when one
+ * container is unlimited was not measured, and the whole question here is that
+ * case.
+ */
+export function podCpuLimit(
+  roster: readonly string[] | undefined,
+  limits: ReadonlyMap<string, number> | undefined,
+  seen: ReadonlySet<string> | undefined,
+): number | undefined {
+  if (!roster || roster.length === 0 || !limits) return undefined;
+  const names = new Set<string>(roster);
+  for (const name of seen ?? []) names.add(name);
+  for (const name of limits.keys()) names.add(name);
+  let cores = 0;
+  for (const name of names) {
+    const limit = limits.get(name);
+    if (limit === undefined || !(limit > 0)) return undefined;
+    cores += limit;
+  }
+  return float32(cores);
 }
 
 /**

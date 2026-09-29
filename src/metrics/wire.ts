@@ -342,10 +342,12 @@ export class SampleEncoder {
  * carries a uid the wire schema does not declare, which zod would strip on
  * arrival — sending it would be bytes nobody reads.
  *
- * `attrs` is the denominators, and what is NOT in it is documented where it is
- * decided (`ATTRIBUTE_NAMES` in `types.ts`): a pod's requests and limits live in
- * an object body, the agent reads no bodies under its own identity, and the
- * control plane joins them from a read made under the user's identity.
+ * `attrs` is the denominators, and what is and is NOT in it is documented
+ * where it is decided (`ATTRIBUTE_NAMES` in `types.ts`): a pod's requests live
+ * in an object body, the agent reads no bodies under its own identity, and the
+ * control plane joins them from a read made under the user's identity. A pod's
+ * CPU limit IS here (`cpu.limit`), read from the cgroup rather than the body;
+ * because it is part of the record, a resize re-declares the pod.
  */
 function recordOf(entity: Entity): Omit<SampleEntityRecord, "id"> {
   const attrs: Record<string, number> = {};
