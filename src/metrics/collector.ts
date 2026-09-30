@@ -161,7 +161,7 @@ const SILENCE_TICKS = 3;
 const TICK_STALL_TICKS = 4;
 
 export interface CollectorOptions {
-  /** The apiserver connection, from `resolveKubeTarget` — nodes, pods, ReplicaSets. */
+  /** The apiserver connection, from `resolveKubeTarget` — nodes, pods, ReplicaSets, Jobs. */
   readonly target: KubeTarget;
   readonly kubelet: KubeletReader;
   readonly sink: SampleSink;
@@ -191,13 +191,15 @@ export interface CollectorStats {
   readonly nodesKnown: number;
   readonly entitiesLastFrame: number;
   readonly samplesLastFrame: number;
-  /** Failed LIST/WATCH attempts against the apiserver, across the three watches. */
+  /** Failed LIST/WATCH attempts against the apiserver, across all four watches. */
   readonly watchFailures: number;
   /**
    * Which of `nodes`/`pods`/`replicasets` the apiserver most recently denied
    * with 403, right now. Empty in the common case. This is what turns into
    * `apiserverForbidden` on the frame and, from there, `state: "forbidden"`
-   * on the wire (`collectorStatusOf`, `wire.ts`).
+   * on the wire (`collectorStatusOf`, `wire.ts`). `jobs` is deliberately
+   * never listed here, even when it is denied: see
+   * `#apiserverForbiddenResources`.
    */
   readonly apiserverForbidden: readonly string[];
   /** Bytes of sample data the ring is holding right now (exact). */
@@ -233,12 +235,18 @@ export class Collector {
 
   readonly #nodes = new Map<string, NodeRecord>();
   readonly #pods = new Map<string, MetaRecord>();
-  /** Pods and ReplicaSets in one index: the owner walk crosses between them. */
+  /**
+   * Pods, ReplicaSets and Jobs in one index: the owner walk crosses between
+   * them. (Was pods and ReplicaSets only; Jobs joined on 30.09.2026 so that a
+   * CronJob's pods resolve to the CronJob rather than to a new Job per run —
+   * `resolveOwner` has the measurement.)
+   */
   readonly #owners = new Map<string, MetaRecord>();
 
   #nodeWatch: ResourceWatch<NodeRecord> | undefined;
   #podWatch: ResourceWatch<MetaRecord> | undefined;
   #replicaSetWatch: ResourceWatch<MetaRecord> | undefined;
+  #jobWatch: ResourceWatch<MetaRecord> | undefined;
 
   /**
    * The previous frame's layout, offered to `packFrame` for reuse.
@@ -350,10 +358,15 @@ export class Collector {
       "replicasets",
       undefined,
     );
+    // The ReplicaSet watch's exact twin, one API group over: metadata only,
+    // into the same owner index, never into `#pods`. It is what lets
+    // `resolveOwner` take a CronJob's pod past its Job to the CronJob.
+    this.#jobWatch = this.#metadataWatch("/apis/batch/v1/jobs", "Job", "jobs", undefined);
 
     this.#nodeWatch.start();
     this.#podWatch.start();
     this.#replicaSetWatch.start();
+    this.#jobWatch.start();
     this.#schedule();
     this.#startHealthTimer();
   }
@@ -368,6 +381,7 @@ export class Collector {
       this.#nodeWatch?.stop(),
       this.#podWatch?.stop(),
       this.#replicaSetWatch?.stop(),
+      this.#jobWatch?.stop(),
     ]);
   }
 
@@ -385,7 +399,8 @@ export class Collector {
       watchFailures:
         (this.#nodeWatch?.failures ?? 0) +
         (this.#podWatch?.failures ?? 0) +
-        (this.#replicaSetWatch?.failures ?? 0),
+        (this.#replicaSetWatch?.failures ?? 0) +
+        (this.#jobWatch?.failures ?? 0),
       apiserverForbidden: this.#apiserverForbiddenResources(),
       ringValueBytes: retained.valueBytes,
       ringLayouts: retained.layouts,
@@ -417,9 +432,27 @@ export class Collector {
   }
 
   /**
-   * Which of the three closed-list watches the apiserver most recently
-   * refused with 403, right now. Empty when none is (the common case, and
-   * every case before the manifest goes stale).
+   * Which of the closed-list watches the apiserver most recently refused with
+   * 403, right now, COUNTING ONLY those without which the collector cannot do
+   * its job. Empty when none is (the common case, and every case before the
+   * manifest goes stale).
+   *
+   * Was "which of the three closed-list watches"; with `jobs` there are four
+   * watches, and this set deliberately stays at three (decision K3,
+   * 30.09.2026). `nodes` and `pods` are what the collector enumerates and
+   * attributes; `replicasets` has been here since the signal was introduced.
+   * `jobs` is an ENRICHMENT: without it, a CronJob's pod resolves to its Job —
+   * one hop short, exactly as every agent did before the Job watch existed —
+   * and every number still arrives, whole. Putting `jobs` here would turn that
+   * into `apiserverForbidden: true`, which paints the ENTIRE cluster with the
+   * "not authorized — re-apply the manifest" state on the screen, on every
+   * cluster whose manifest predates the Job grant, for a loss of one link of
+   * attribution. That alternative was considered and rejected on that
+   * disproportion. A denied `jobs` is still reported: `ResourceWatch` logs
+   * "apiserver denied jobs (403) — re-apply the agent manifest …" once, on the
+   * change, and its failures count in `watchFailures`. `collector.test.ts`
+   * asserts both halves: a 403 on `jobs` leaves this empty, a 403 on `pods`
+   * does not.
    */
   #apiserverForbiddenResources(): readonly string[] {
     const resources: string[] = [];

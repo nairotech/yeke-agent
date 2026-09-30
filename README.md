@@ -119,10 +119,23 @@ this is the complete list:
    knows when a cluster's API surface changed. It observes that objects changed;
    it does not read what is in them. Also originated by the control plane.
 3. **Kubelet statistics collection**, together with the node list and the
-   pod/ReplicaSet metadata watches it needs to attribute a number to a workload.
-   This one lives in the agent itself (`src/metrics/`): it reads
+   pod/ReplicaSet/Job metadata watches it needs to attribute a number to a
+   workload. This one lives in the agent itself (`src/metrics/`): it reads
    `/stats/summary` and `/metrics/cadvisor` from each kubelet and watches
-   `nodes`, `pods` and `replicasets`.
+   `nodes`, `pods`, `replicasets` (`apps`) and `jobs` (`batch`).
+
+   The `jobs` watch is one more link of this same job, not a fourth one. It
+   exists so that a pod started by a CronJob is attributed to the CronJob
+   rather than to that run's Job: until it was added, the owner chain stopped
+   at the Job, and every CronJob run showed up as a brand-new workload. The
+   ClusterRole in the installation manifest therefore carries `list, watch` on
+   `batch` `jobs` next to `nodes`, `pods` and `replicasets`. An agent running
+   against an OLDER ClusterRole, one without that grant, keeps working: every
+   number is still collected, CronJob pods are attributed to their Job as
+   before, the collector is not reported as unauthorized, and the agent writes
+   one log line (`apiserver denied jobs (403) — re-apply the agent manifest …`)
+   so the operator knows which grant is missing. Re-applying the manifest
+   restores the CronJob attribution.
 
    PersistentVolumeClaim fullness comes from this same read and adds nothing to
    the list: a kubelet's Summary reports the volumes of the pods on its node,
@@ -133,9 +146,10 @@ this is the complete list:
 
 Properties that hold for all three, and that you can check in the source:
 
-- **No object bodies.** Pods and ReplicaSets are requested as
+- **No object bodies.** Pods, ReplicaSets and Jobs are requested as
   `PartialObjectMetadata` (`src/metrics/owners.ts`), so the apiserver serves
-  `metadata` and never sends `spec`, `status` or `data`. Node objects ARE read in
+  `metadata` and never sends `spec`, `status` or `data` — a Job's pod template,
+  including its `env`, never reaches the agent. Node objects ARE read in
   full, because the collector needs each node's address and `allocatable`; a node
   object carries no Secret. This is also why the collector does not report a
   container restart count: that number lives in a pod's `status`, and `status` is

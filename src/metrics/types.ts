@@ -359,6 +359,9 @@ export interface InternalFrame {
   /**
    * True when the apiserver denied one of the three closed-list watches
    * (`nodes`, `pods`, `apps/replicasets`) with 403 on the most recent attempt.
+   * The fourth watch, `batch/jobs` (added 30.09.2026), is excluded on purpose:
+   * it only lengthens the owner chain, so its 403 is a log line, not this flag
+   * (`Collector#apiserverForbiddenResources`).
    *
    * This is NOT the same signal as a per-node `forbidden` in `nodes` above:
    * that one is the KUBELET refusing `nodes/stats`/`nodes/metrics` for one

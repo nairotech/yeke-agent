@@ -59,11 +59,14 @@ test("Pod -> ReplicaSet -> Deployment", () => {
 });
 
 test("Pod -> Job -> CronJob, once a Job record is in the index", () => {
-  // Phase 1 does not WATCH jobs (the ClusterRole in the identity decision grants
-  // pods and replicasets only), so this shape is exercised with the record fed
-  // in by hand. The walker is written against the index rather than against a
-  // list of kinds, which is what makes adding `batch/jobs` later a registration
-  // and not a rewrite.
+  // The walker in isolation, with the Job record fed in by hand. This comment
+  // used to say the collector did not WATCH jobs (the ClusterRole granted pods
+  // and replicasets only) and that adding `batch/jobs` later would be "a
+  // registration and not a rewrite". Since 30.09.2026 it is exactly that: the
+  // collector watches `batch/v1` jobs (metadata only) into the same index and
+  // `resolveOwner` did not change. The end-to-end proof, through a real Job
+  // watch, is in `collector.test.ts` ("a CronJob's pod resolves to the
+  // CRONJOB ...").
   const cronJob = { kind: "CronJob", name: "yedek", uid: "cj-1" };
   const job = record("j-1", "Job", "yedek-28001", cronJob);
   const pod = record("p-2", "Pod", "yedek-28001-xyz", {
