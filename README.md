@@ -134,8 +134,14 @@ this is the complete list:
    number is still collected, CronJob pods are attributed to their Job as
    before, the collector is not reported as unauthorized, and the agent writes
    one log line (`apiserver denied jobs (403) — re-apply the agent manifest …`)
-   so the operator knows which grant is missing. Re-applying the manifest
-   restores the CronJob attribution.
+   so the operator knows which grant is missing — one line for as long as the
+   denial lasts, not one per retry. While denied, the agent asks again once a
+   minute, so a stale ClusterRole costs your apiserver one refused request per
+   minute. Re-applying the manifest restores the CronJob attribution within
+   that minute, and the agent logs `apiserver access to jobs restored`. (The
+   same one-line rule applies to a denied `nodes`, `pods` or `replicasets`;
+   those three keep retrying every few seconds, because their denial is shown
+   to you as an unauthorized collector and should clear quickly.)
 
    PersistentVolumeClaim fullness comes from this same read and adds nothing to
    the list: a kubelet's Summary reports the volumes of the pods on its node,

@@ -18,7 +18,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AddressInfo } from "node:net";
 import { Agent } from "undici";
-import { Collector, MIN_CORE_PROTOCOL_FOR_METRICS, shouldCollect } from "./collector.js";
+import { Collector, JOB_FORBIDDEN_RETRY_MS, MIN_CORE_PROTOCOL_FOR_METRICS, shouldCollect } from "./collector.js";
 import {
   type FixturePod,
   type SummaryFixtureOptions,
@@ -1421,7 +1421,7 @@ async function waitFor(what: string, condition: () => boolean, timeoutMs = 2000)
   }
 }
 
-function collectorOn(target: KubeTarget) {
+function collectorOn(target: KubeTarget, options: { watchRetryMs?: number } = {}) {
   let clock = START_MS;
   const collector = new Collector({
     target,
@@ -1429,6 +1429,7 @@ function collectorOn(target: KubeTarget) {
     sink: new RecordingSink(),
     periodMs: PERIOD_MS,
     now: () => clock,
+    ...options,
   });
   return {
     collector,
@@ -1593,6 +1594,11 @@ test("a 403 on jobs does NOT make the collector forbidden; a 403 on pods still d
       // The operator is still told, once, which grant is missing.
       const denied = captures.warn.filter((line) => line.includes("apiserver denied jobs (403)"));
       assert.equal(denied.length, 1, JSON.stringify(captures.warn));
+      // ...and only once: the repeats of the same 403 write nothing.
+      assert.deepEqual(
+        captures.warn.filter((line) => line.includes("/apis/batch/v1/jobs failed, retrying")),
+        [],
+      );
     } finally {
       await h.collector.stop();
       await api.close();
@@ -1632,5 +1638,34 @@ test("a 403 on jobs does NOT make the collector forbidden; a 403 on pods still d
       await h.collector.stop();
       await api.close();
     }
+  }
+});
+
+test("the jobs watch retries a 403 once a minute; pods keeps the short retry", async () => {
+  const api = await routedApiserver(
+    {
+      [PATHS.nodes]: [NODE_OBJECT],
+      [PATHS.pods]: [POD_META],
+      [PATHS.replicasets]: [],
+      [PATHS.jobs]: [JOB_META],
+    },
+    { [PATHS.pods]: 403, [PATHS.jobs]: 403 },
+  );
+  // A 5 ms ordinary retry: `pods` must follow it, `jobs` must not.
+  const h = collectorOn(api.target, { watchRetryMs: 5 });
+  const lists = (path: string) => api.requests.filter((item) => item.path === path && !item.watch).length;
+  try {
+    assert.equal(JOB_FORBIDDEN_RETRY_MS, 60_000);
+    await captured(async () => {
+      h.collector.start();
+      await waitFor("jobs to be denied once and pods six times", () => lists(PATHS.jobs) >= 1 && lists(PATHS.pods) >= 6);
+    });
+    // Against each other, not against a clock: six refused `pods` LISTs, one
+    // refused `jobs` LIST. `pods` stays fast because its 403 is on the screen
+    // and must clear right after a re-apply; `jobs` waits `JOB_FORBIDDEN_RETRY_MS`.
+    assert.equal(lists(PATHS.jobs), 1);
+  } finally {
+    await h.collector.stop();
+    await api.close();
   }
 });
