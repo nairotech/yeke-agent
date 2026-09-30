@@ -236,12 +236,15 @@ test("a node with no InternalIP decodes without an address", () => {
 interface FakeApiserver {
   port: number;
   status: number;
+  /** Requests answered so far, of any kind. */
+  readonly requests: number;
   close(): Promise<void>;
 }
 
 async function fakeApiserver(status: number): Promise<FakeApiserver> {
-  const state = { status };
+  const state = { status, requests: 0 };
   const server: Server = createServer((_req, res) => {
+    state.requests += 1;
     if (state.status === 200) {
       res.writeHead(200, { "content-type": "application/json" });
       res.end(JSON.stringify({ metadata: { resourceVersion: "1" }, items: [] }));
@@ -258,6 +261,9 @@ async function fakeApiserver(status: number): Promise<FakeApiserver> {
     },
     set status(value: number) {
       state.status = value;
+    },
+    get requests() {
+      return state.requests;
     },
     close: () =>
       new Promise<void>((resolve) => {
@@ -392,5 +398,127 @@ test("forbidden clears once the watch's LIST succeeds again", async () => {
   } finally {
     await watch.stop();
     await api.close();
+  }
+});
+
+/** Captures `console.warn` for one act, and always puts it back. */
+async function warnings(act: () => Promise<void>): Promise<string[]> {
+  const lines: string[] = [];
+  const original = console.warn;
+  console.warn = (...args: unknown[]) => void lines.push(args.join(" "));
+  try {
+    await act();
+  } finally {
+    console.warn = original;
+  }
+  return lines;
+}
+
+const count = (lines: readonly string[], needle: string): number =>
+  lines.filter((line) => line.includes(needle)).length;
+
+test("a watch that stays denied writes ONE line however often it retries, and one when it recovers", async () => {
+  // TESTER finding, 30.09.2026: `#run` wrote "failed, retrying: HTTP 403" on
+  // every attempt next to the one "denied" line -- measured on `jobs`, one
+  // "denied" and three retry lines in 11 seconds, ~17 280 a day on a cluster
+  // whose ClusterRole never gets the grant.
+  const api = await fakeApiserver(403);
+  const watch = new ResourceWatch<MetaRecord>({
+    target: targetFor(api.port),
+    path: "/apis/batch/v1/jobs",
+    resource: "jobs",
+    metadataOnly: true,
+    decode: (raw) => decodeMeta(raw, "Job"),
+    handlers: NOOP_HANDLERS,
+    retryMs: 5,
+  });
+  try {
+    const denied = await warnings(async () => {
+      watch.start();
+      await waitUntil(() => watch.failures >= 6);
+    });
+    assert.equal(count(denied, "apiserver denied jobs (403)"), 1, JSON.stringify(denied));
+    assert.equal(count(denied, "failed, retrying"), 0, JSON.stringify(denied));
+
+    const recovered = await warnings(async () => {
+      api.status = 200;
+      await waitUntil(() => watch.forbidden === false);
+    });
+    assert.equal(count(recovered, "apiserver access to jobs restored"), 1, JSON.stringify(recovered));
+    assert.equal(count(recovered, "failed, retrying"), 0, JSON.stringify(recovered));
+  } finally {
+    await watch.stop();
+    await api.close();
+  }
+});
+
+test("a 5xx is still written on every attempt, and does not take the 403 backoff", async () => {
+  const api = await fakeApiserver(500);
+  const watch = new ResourceWatch<MetaRecord>({
+    target: targetFor(api.port),
+    path: "/apis/batch/v1/jobs",
+    resource: "jobs",
+    metadataOnly: true,
+    decode: (raw) => decodeMeta(raw, "Job"),
+    handlers: NOOP_HANDLERS,
+    retryMs: 5,
+    // Would stall this test for a minute if a 500 were mistaken for a 403.
+    forbiddenRetryMs: 60_000,
+  });
+  try {
+    const lines = await warnings(async () => {
+      watch.start();
+      await waitUntil(() => watch.failures >= 4);
+    });
+    assert.ok(count(lines, "failed, retrying: HTTP 500") >= 3, JSON.stringify(lines));
+    assert.equal(count(lines, "apiserver denied"), 0, JSON.stringify(lines));
+  } finally {
+    await watch.stop();
+    await api.close();
+  }
+});
+
+test("a 403 backs off by forbiddenRetryMs; without it, by retryMs; and stop() does not wait it out", async () => {
+  const fastApi = await fakeApiserver(403);
+  const slowApi = await fakeApiserver(403);
+  const options = {
+    path: "/apis/batch/v1/jobs",
+    resource: "jobs",
+    metadataOnly: true,
+    decode: (raw: unknown) => decodeMeta(raw, "Job"),
+    handlers: NOOP_HANDLERS,
+    retryMs: 5,
+  };
+  // The `pods` shape: no `forbiddenRetryMs`, so a 403 retries at `retryMs`.
+  const fast = new ResourceWatch<MetaRecord>({ ...options, target: targetFor(fastApi.port) });
+  // The `jobs` shape.
+  const slow = new ResourceWatch<MetaRecord>({
+    ...options,
+    target: targetFor(slowApi.port),
+    forbiddenRetryMs: 60_000,
+  });
+  try {
+    await warnings(async () => {
+      fast.start();
+      slow.start();
+      await waitUntil(() => slow.failures >= 1 && fast.failures >= 6);
+    });
+    // Measured against each other, not against a clock: while the fast one
+    // retried six times, the slow one did not retry once.
+    assert.equal(slow.failures, 1);
+    assert.equal(slowApi.requests, 1);
+    assert.ok(fastApi.requests >= 6, String(fastApi.requests));
+
+    // A one-minute backoff must not become a one-minute shutdown.
+    const stopped = await Promise.race([
+      slow.stop().then(() => true),
+      new Promise<boolean>((resolve) => setTimeout(() => resolve(false), 2000).unref()),
+    ]);
+    assert.equal(stopped, true, "stop() waited out the 403 backoff");
+  } finally {
+    await fast.stop();
+    await slow.stop();
+    await fastApi.close();
+    await slowApi.close();
   }
 });

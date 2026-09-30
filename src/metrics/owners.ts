@@ -366,6 +366,23 @@ export interface ResourceWatchOptions<T> {
   readonly handlers: WatchHandlers<T>;
   /** Backoff after a failed watch. Injected so the tests do not sleep. */
   readonly retryMs?: number;
+  /**
+   * Backoff after a 403, when it should differ from `retryMs`. Defaults to
+   * `retryMs`, which is what `nodes`/`pods`/`replicasets` use: their 403 is
+   * carried to the screen as `forbidden`, and once the manifest is re-applied
+   * they must come back within one short retry.
+   *
+   * `jobs` passes 60 seconds (`Collector`). Its 403 is not shown anywhere —
+   * it only means the CronJob hop is missing — so there is nobody waiting on
+   * a fast recovery, and on a cluster whose ClusterRole predates the Job
+   * grant the short retry would be a refused LIST every five seconds (17 280
+   * a day) for as long as nobody re-applies the manifest. With 60 seconds it
+   * is one a minute. The cost is on the other side of an upgrade: in the
+   * "update the agent" flow the ClusterRole patch can land after the new
+   * image starts, and then the CronJob attribution appears at most 60
+   * seconds after the grant, not 5.
+   */
+  readonly forbiddenRetryMs?: number;
 }
 
 /**
@@ -394,16 +411,20 @@ class ApiserverHttpError extends Error {
 export class ResourceWatch<T> {
   readonly #options: ResourceWatchOptions<T>;
   readonly #retryMs: number;
+  readonly #forbiddenRetryMs: number;
   #abort: AbortController | undefined;
   #running = false;
   #loop: Promise<void> | undefined;
   /**
    * Rising while the apiserver is unreachable.
    *
-   * Surfaced through `Collector.stats()` rather than logged on every retry: a
-   * watch that cannot connect retries every five seconds, and a log line per
-   * attempt would bury the reason it failed under the fact that it keeps
-   * failing.
+   * Surfaced through `Collector.stats()` as a count. The per-attempt log line
+   * in `#run` is written for failures that are NOT a 403 (a 5xx, a network
+   * error, a 401), one per attempt, as before. A 403 is logged once, on the
+   * change, and its repeats are silent (see `#run`). This comment used to say
+   * failures were "not logged on every retry"; that was never true for any
+   * of them, and an independent TESTER measured it on `jobs` (30.09.2026):
+   * one "denied" line plus a "failed, retrying" line every five seconds.
    */
   failures = 0;
   /**
@@ -416,7 +437,10 @@ export class ResourceWatch<T> {
    * rather than merely `degraded` (`collectorStatusOf` in `wire.ts`).
    */
   #forbidden = false;
-  /** So the log line below fires on a CHANGE, not on every five-second retry. */
+  /**
+   * So the log line below fires on a CHANGE, not on every retry. `#run`
+   * relies on it: a repeated 403 writes nothing at all.
+   */
   #loggedForbidden = false;
 
   get forbidden(): boolean {
@@ -426,6 +450,7 @@ export class ResourceWatch<T> {
   constructor(options: ResourceWatchOptions<T>) {
     this.#options = options;
     this.#retryMs = options.retryMs ?? 5_000;
+    this.#forbiddenRetryMs = options.forbiddenRetryMs ?? this.#retryMs;
   }
 
   start(): void {
@@ -458,16 +483,30 @@ export class ResourceWatch<T> {
         // is not evidence of that. Whether a 403 here makes the whole
         // COLLECTOR `forbidden` is the collector's decision, not this watch's:
         // `jobs` reports it only through the log line in `#setForbidden`.
-        this.#setForbidden(err instanceof ApiserverHttpError && err.statusCode === 403);
-        // Foreign text, verbatim. The operator reading `kubectl logs` is the
-        // audience; the control plane is told through the collector's state,
-        // not through this line.
-        console.warn(
-          `[metrics] watch ${this.#options.path} failed, retrying: ${
-            err instanceof Error ? err.message : String(err)
-          }`,
-        );
-        await delay(this.#retryMs);
+        const denied = err instanceof ApiserverHttpError && err.statusCode === 403;
+        this.#setForbidden(denied);
+        // A 403 writes NO per-attempt line: `#setForbidden` has just written
+        // (or, on a repeat, already wrote) "apiserver denied <resource>
+        // (403) — re-apply …", which is the whole story, and repeating
+        // "failed, retrying: HTTP 403" every retry is what turned one stale
+        // ClusterRole into ~17 280 lines a day (measured by TESTER on `jobs`,
+        // 30.09.2026: in 11 s, one "denied" line and three retry lines). The
+        // rule is the watch's, so it holds for all four resources: a denied
+        // `nodes`/`pods`/`replicasets` now also leaves exactly one line.
+        // Everything else — 5xx, network, 401 — is still written on every
+        // attempt: those carry a different message each time and are the
+        // ones worth reading in order.
+        if (!denied) {
+          // Foreign text, verbatim. The operator reading `kubectl logs` is the
+          // audience; the control plane is told through the collector's
+          // state, not through this line.
+          console.warn(
+            `[metrics] watch ${this.#options.path} failed, retrying: ${
+              err instanceof Error ? err.message : String(err)
+            }`,
+          );
+        }
+        await delay(denied ? this.#forbiddenRetryMs : this.#retryMs, this.#abort?.signal);
       }
     }
   }
@@ -604,8 +643,29 @@ async function* ndjson(body: AsyncIterable<Buffer | string>): AsyncIterable<stri
   }
 }
 
-function delay(ms: number): Promise<void> {
+/**
+ * A backoff that `stop()` can cut short.
+ *
+ * It used to be a plain timer, which made `stop()` wait out whatever backoff
+ * the loop was in — five seconds, harmless enough. With `forbiddenRetryMs`
+ * at 60 seconds, the agent's shutdown would wait a minute on a cluster whose
+ * ClusterRole lacks `jobs`, so the abort signal now ends the wait too.
+ */
+function delay(ms: number, signal?: AbortSignal): Promise<void> {
   return new Promise((resolve) => {
-    setTimeout(resolve, ms).unref?.();
+    if (signal?.aborted) {
+      resolve();
+      return;
+    }
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    timer.unref?.();
+    const onAbort = (): void => {
+      clearTimeout(timer);
+      resolve();
+    };
+    signal?.addEventListener("abort", onAbort, { once: true });
   });
 }

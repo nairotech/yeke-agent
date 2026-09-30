@@ -180,7 +180,26 @@ export interface CollectorOptions {
   readonly ioZeroProbeRounds?: number;
   /** How often the liveness line is written. Injected so a test need not wait ten minutes. */
   readonly livenessMs?: number;
+  /**
+   * The apiserver watches' backoff after a failure (`ResourceWatch.retryMs`).
+   * Injected so the tests do not sleep; production takes the default.
+   */
+  readonly watchRetryMs?: number;
 }
+
+/**
+ * The `jobs` watch's backoff after a 403 (`ResourceWatch.forbiddenRetryMs`).
+ *
+ * The other three watches retry a 403 at the ordinary pace because their 403
+ * is shown to the operator and must clear quickly after a re-apply. A denied
+ * `jobs` is shown nowhere (K3: it only loses the CronJob hop), so it retries
+ * once a minute: at most 60 seconds' delay for the CronJob attribution when
+ * the ClusterRole patch lands after the new image, and one refused request a
+ * minute instead of one every five seconds on a cluster that never gets the
+ * grant. Deliberately not scaled by `watchRetryMs`, so a test can see the
+ * two paces apart.
+ */
+export const JOB_FORBIDDEN_RETRY_MS = 60_000;
 
 export interface CollectorStats {
   readonly ticks: number;
@@ -331,6 +350,7 @@ export class Collector {
 
     this.#nodeWatch = new ResourceWatch<NodeRecord>({
       target: this.#options.target,
+      ...(this.#options.watchRetryMs === undefined ? {} : { retryMs: this.#options.watchRetryMs }),
       path: "/api/v1/nodes",
       resource: "nodes",
       // K4 permits the full node object: addresses, allocatable, conditions.
@@ -361,7 +381,9 @@ export class Collector {
     // The ReplicaSet watch's exact twin, one API group over: metadata only,
     // into the same owner index, never into `#pods`. It is what lets
     // `resolveOwner` take a CronJob's pod past its Job to the CronJob.
-    this.#jobWatch = this.#metadataWatch("/apis/batch/v1/jobs", "Job", "jobs", undefined);
+    this.#jobWatch = this.#metadataWatch("/apis/batch/v1/jobs", "Job", "jobs", undefined, {
+      forbiddenRetryMs: JOB_FORBIDDEN_RETRY_MS,
+    });
 
     this.#nodeWatch.start();
     this.#podWatch.start();
@@ -450,7 +472,8 @@ export class Collector {
    * attribution. That alternative was considered and rejected on that
    * disproportion. A denied `jobs` is still reported: `ResourceWatch` logs
    * "apiserver denied jobs (403) — re-apply the agent manifest …" once, on the
-   * change, and its failures count in `watchFailures`. `collector.test.ts`
+   * change (its repeats write nothing), its failures count in
+   * `watchFailures`, and it retries once every `JOB_FORBIDDEN_RETRY_MS`. `collector.test.ts`
    * asserts both halves: a 403 on `jobs` leaves this empty, a 403 on `pods`
    * does not.
    */
@@ -481,9 +504,12 @@ export class Collector {
     kind: string,
     resource: string,
     into: Map<string, MetaRecord> | undefined,
+    backoff: { readonly forbiddenRetryMs?: number } = {},
   ): ResourceWatch<MetaRecord> {
     return new ResourceWatch<MetaRecord>({
       target: this.#options.target,
+      ...(this.#options.watchRetryMs === undefined ? {} : { retryMs: this.#options.watchRetryMs }),
+      ...backoff,
       metadataOnly: true,
       path,
       resource,
