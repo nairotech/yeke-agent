@@ -9,7 +9,7 @@
  *
  * ─── Metadata only, and what that costs ─────────────────────────────────────
  *
- * Pods and ReplicaSets are watched with
+ * Pods, ReplicaSets and (since 30.09.2026) `batch/v1` Jobs are watched with
  * `Accept: application/json;as=PartialObjectMetadataList;g=meta.k8s.io;v=v1`.
  * The apiserver then serves the object's `metadata` and nothing else: no
  * `spec`, no `status`, no `data`. This is not a filter applied after receiving
@@ -19,6 +19,10 @@
  * That is what makes the agent's third self-identity job legal. The invariant
  * says these jobs read no object bodies; asking for `PartialObjectMetadata` is
  * how a program says that to the apiserver rather than to a code reviewer.
+ * The Job watch is the same request against a different path: it widens the
+ * third job's "pod/ReplicaSet metadata watch" to "pod/ReplicaSet/Job metadata
+ * watch" — one more link of the same job, not a fourth job — and it asks for
+ * exactly as little (see `resolveOwner` for why it was added).
  *
  * Nodes ARE read in full, and K4 permits it explicitly: addresses,
  * `allocatable`, conditions and the kubelet version are all in the node object,
@@ -129,13 +133,29 @@ export interface MetaRecord {
  * name was guessed from the ReplicaSet's (the `<deployment>-<hash>` convention
  * is a convention, and a hand-written ReplicaSet does not follow it).
  *
- * Phase 1 populates the index with pods and ReplicaSets only, because that is
- * what the ClusterRole in the identity decision grants. A pod owned by a Job
- * therefore resolves to the JOB, not to its CronJob — correct, and one hop
- * short. Making it two hops means watching `batch/jobs`, which means a fourth
- * entry in the closed list of self-identity jobs, which means revising that
- * document. The walker itself needs no change: it is written against the index,
- * not against a list of kinds.
+ * WAS (until 30.09.2026): the index held pods and ReplicaSets only, because
+ * that was what the ClusterRole in the identity decision granted. A pod owned
+ * by a Job therefore resolved to the JOB, not to its CronJob — correct, and one
+ * hop short. This comment then said that making it two hops "means a fourth
+ * entry in the closed list of self-identity jobs".
+ *
+ * NOW: the collector also watches `batch/v1` `jobs`, metadata only, into the
+ * same index, so Pod -> Job -> CronJob is walked to the CronJob. Two things
+ * changed the answer. First, a measurement: in production's `metric_entities`
+ * (30.09.2026, 12 clusters) 16 515 of 17 568 workload rows (94 %) were
+ * `owner_kind = 'Job'`, 16 501 of them `<cronjob>-<timestamp>` Jobs spawned by
+ * just 14 CronJobs — every run of a CronJob became a brand-new workload, and
+ * their blobs were 49.7 % of the metrics store. "One hop short" was not a
+ * cosmetic gap. Second, the classification: a Job watch is not a fourth
+ * self-identity job, it is one more link of the third one (the owner-chain
+ * metadata watch), under the same "no object bodies" rule — the identity
+ * decision's K1 item 3 now reads "pod/ReplicaSet/Job metadata watch".
+ *
+ * The walker itself did not change: it is written against the index, not
+ * against a list of kinds (`collector.test.ts` drives it through a real Job
+ * watch to prove that). A cluster whose ClusterRole does not yet grant `jobs`
+ * gets the old behaviour — the walk stops at the Job — and NOT a `forbidden`
+ * collector; see `Collector#apiserverForbiddenResources`.
  *
  * `maxDepth` is a cycle guard. Owner references can be made to point in a
  * circle by hand, and an unbounded walk in an agent running in someone else's
@@ -321,16 +341,26 @@ export interface WatchHandlers<T> {
 
 export interface ResourceWatchOptions<T> {
   readonly target: KubeTarget;
-  /** e.g. `/api/v1/pods`, `/apis/apps/v1/replicasets`, `/api/v1/nodes`. */
+  /**
+   * e.g. `/api/v1/pods`, `/apis/apps/v1/replicasets`, `/apis/batch/v1/jobs`,
+   * `/api/v1/nodes`.
+   */
   readonly path: string;
   /**
    * Short label for this watch's resource, e.g. `"nodes"`, `"pods"`,
-   * `"replicasets"`. Used only for the forbidden/restored log line — the
-   * operator reading `kubectl logs` needs to know WHICH of the closed list's
-   * three watches the ClusterRole is missing, not just that one of them is.
+   * `"replicasets"`, `"jobs"`. Used only for the forbidden/restored log line —
+   * the operator reading `kubectl logs` needs to know WHICH of the closed
+   * list's watches the ClusterRole is missing, not just that one of them is.
+   * (Was "three watches"; `jobs` made it four watches within the same
+   * self-identity job, 30.09.2026.) For `jobs` this line is the ONLY signal a
+   * 403 produces: it does not make the collector `forbidden` (see
+   * `Collector#apiserverForbiddenResources`).
    */
   readonly resource: string;
-  /** `true` for pods and ReplicaSets; `false` for nodes (K4 allows the body). */
+  /**
+   * `true` for pods, ReplicaSets and Jobs; `false` for nodes (K4 allows the
+   * body).
+   */
   readonly metadataOnly: boolean;
   readonly decode: (raw: unknown) => T | undefined;
   readonly handlers: WatchHandlers<T>;
@@ -421,11 +451,13 @@ export class ResourceWatch<T> {
       } catch (err) {
         if (!this.#running) return;
         this.failures += 1;
-        // A 403 on `nodes`/`pods`/`apps/replicasets` LIST or WATCH is the
-        // closed-list RBAC failure K1 names: the manifest was not re-applied
-        // after the ClusterRole gained these verbs. Anything else — 401
-        // (already handled below), a 5xx, a timeout, DNS — is not evidence of
-        // that, and stays `degraded` at the collector level.
+        // A 403 on a closed-list LIST or WATCH (`nodes`/`pods`/
+        // `apps/replicasets`/`batch/jobs`) is the RBAC failure K1 names: the
+        // manifest was not re-applied after the ClusterRole gained these verbs.
+        // Anything else — 401 (already handled below), a 5xx, a timeout, DNS —
+        // is not evidence of that. Whether a 403 here makes the whole
+        // COLLECTOR `forbidden` is the collector's decision, not this watch's:
+        // `jobs` reports it only through the log line in `#setForbidden`.
         this.#setForbidden(err instanceof ApiserverHttpError && err.statusCode === 403);
         // Foreign text, verbatim. The operator reading `kubectl logs` is the
         // audience; the control plane is told through the collector's state,

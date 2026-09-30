@@ -427,10 +427,17 @@ function wireNodeState(code: NodeStateCode): SampleCollectorNodeState {
  * the apiserver refuses to list `nodes` at all" — an empty list looks the same
  * either way, and before this fix both produced `degraded`, which sends the
  * operator to "wait, it will recover" rather than to "re-apply the manifest".
- * The second case is exactly K1's closed list (`nodes`, `pods`,
- * `apps/replicasets` list/watch): when the apiserver refuses one of those
- * three with 403, `ResourceWatch.forbidden` is true and the collector already
- * knows the specific, actionable reason — so `apiserverForbidden: true` forces
+ * The second case is K1's closed list. It was `nodes`, `pods`,
+ * `apps/replicasets` list/watch; since 30.09.2026 it also carries
+ * `batch/jobs` list/watch (metadata only, the owner chain's CronJob hop). The
+ * signal, however, still comes from the first three alone: when the apiserver
+ * refuses one of `nodes`/`pods`/`replicasets` with 403,
+ * `ResourceWatch.forbidden` is true and the collector already knows the
+ * specific, actionable reason. A 403 on `jobs` is deliberately NOT part of it
+ * — without `jobs` every number still arrives and only the CronJob hop is
+ * missing, so it is logged by the agent and never turns the whole cluster
+ * `forbidden` (`Collector#apiserverForbiddenResources`, decision K3). So
+ * `apiserverForbidden: true` forces
  * `state: "forbidden"` even where the per-node data alone would have said
  * `degraded` (empty `nodes`) or, in the rarer case of a mid-session RBAC
  * revocation, even `active` (stale, previously-discovered nodes whose kubelets

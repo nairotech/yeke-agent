@@ -30,6 +30,8 @@ import {
   summaryFixture,
 } from "./fixture.js";
 import { KubeletClient, type KubeletReader, type KubeletResult, type KubeletTarget } from "./kubelet-client.js";
+import { decodeSampleFrame } from "@nairotech/yeke-tunnel";
+import { SampleEncoder, collectorStatusOf } from "./wire.js";
 import {
   type InternalFrame,
   type MetricName,
@@ -497,7 +499,7 @@ test("apiserver 403 on the node watch marks the frame apiserverForbidden, with n
   });
   try {
     collector.start();
-    // Give the three watches' first LIST attempt time to land a 403.
+    // Give the watches' first LIST attempt time to land a 403.
     await waitUntil(() => collector.stats().apiserverForbidden.includes("nodes"));
 
     const frame = await collector.tick();
@@ -1256,5 +1258,379 @@ test("an unreachable kubelet is logged once on the change too, with the reason a
     assert.ok(nodeLines[0]?.includes("recovered from unreachable"), nodeLines[0]);
   } finally {
     await h.collector.stop();
+  }
+});
+
+/**
+ * ─── The CronJob hop: Pod -> Job -> CronJob through a real Job watch ────────
+ *
+ * Measured in production, 30.09.2026: 16 515 of 17 568 workload rows in the
+ * control plane's `metric_entities` were `owner_kind = 'Job'`, 16 501 of them
+ * spawned by 14 CronJobs, because the owner index held pods and ReplicaSets
+ * only and every CronJob run therefore became a new workload. The fix is one
+ * more metadata watch (`batch/v1` `jobs`) into the same index.
+ *
+ * These gates go through `Collector.start()` against a fake apiserver, not
+ * through `seedOwner`: seeding the index by hand is exactly what the old
+ * `owners.test.ts` case did, and it proved the walker could take the hop
+ * without proving that anything ever put a Job into the index. The kubelet is
+ * the `StubKubelet` seam above, answering a Summary built by the fixture for
+ * the one pod the apiserver describes.
+ */
+const CRON_POD = { namespace: "ornek", name: "yedek-29001-xk2p9", uid: "cron-pod-uid-1" };
+const CRON_JOB = { kind: "CronJob", name: "yedek", uid: "cj-1" };
+const RUN_JOB = { kind: "Job", name: "yedek-29001", uid: "j-1" };
+
+const NODE_OBJECT = {
+  metadata: { name: "node-a", uid: "node-uid-a" },
+  status: {
+    addresses: [{ type: "InternalIP", address: "10.0.0.1" }],
+    conditions: [{ type: "Ready", status: "True" }],
+    allocatable: { cpu: "4" },
+  },
+};
+const POD_META = {
+  kind: "PartialObjectMetadata",
+  metadata: {
+    uid: CRON_POD.uid,
+    name: CRON_POD.name,
+    namespace: CRON_POD.namespace,
+    ownerReferences: [{ ...RUN_JOB, controller: true }],
+  },
+};
+const JOB_META = {
+  kind: "PartialObjectMetadata",
+  metadata: {
+    uid: RUN_JOB.uid,
+    name: RUN_JOB.name,
+    namespace: CRON_POD.namespace,
+    ownerReferences: [{ ...CRON_JOB, controller: true }],
+  },
+};
+
+const PATHS = {
+  nodes: "/api/v1/nodes",
+  pods: "/api/v1/pods",
+  replicasets: "/apis/apps/v1/replicasets",
+  jobs: "/apis/batch/v1/jobs",
+} as const;
+
+/** A kubelet that reports `CRON_POD` on `node-a`, in the fixture's upstream shape. */
+class CronPodKubelet implements KubeletReader {
+  async summary<T>(): Promise<KubeletResult<T>> {
+    return {
+      state: "ok",
+      value: summaryFixture({
+        node: "node-a",
+        pods: [CRON_POD],
+        tick: 0,
+        periodMs: PERIOD_MS,
+        startMs: START_MS,
+      }) as T,
+    };
+  }
+  async cadvisor<T>(
+    _target: KubeletTarget,
+    consume: (lines: AsyncIterable<string>) => Promise<T>,
+  ): Promise<KubeletResult<T>> {
+    async function* nothing(): AsyncIterable<string> {}
+    return { state: "ok", value: await consume(nothing()) };
+  }
+}
+
+interface SeenRequest {
+  readonly path: string;
+  readonly accept: string;
+  readonly watch: boolean;
+}
+
+/**
+ * A fake apiserver that answers per PATH: a LIST with the items it is given,
+ * a WATCH that stays open until the test writes an event into it, or a fixed
+ * error status. Every request is recorded with its `Accept` header, which is
+ * how "metadata only" is measured rather than asserted from the source.
+ */
+async function routedApiserver(items: Record<string, unknown[]>, status: Record<string, number> = {}) {
+  const requests: SeenRequest[] = [];
+  const watches = new Map<string, Set<import("node:http").ServerResponse>>();
+  const server = createHttpServer((req, res) => {
+    const url = new URL(req.url ?? "/", "http://fake");
+    const watch = url.searchParams.get("watch") === "1";
+    requests.push({ path: url.pathname, accept: String(req.headers.accept ?? ""), watch });
+    const code = status[url.pathname];
+    if (code !== undefined) {
+      res.writeHead(code, { "content-type": "application/json" });
+      res.end(JSON.stringify({ kind: "Status", status: "Failure", code }));
+      return;
+    }
+    const list = items[url.pathname];
+    if (!list) {
+      res.writeHead(404, { "content-type": "application/json" });
+      res.end(JSON.stringify({ kind: "Status", status: "Failure", code: 404 }));
+      return;
+    }
+    if (watch) {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.flushHeaders();
+      const open = watches.get(url.pathname) ?? new Set();
+      open.add(res);
+      watches.set(url.pathname, open);
+      res.on("close", () => open.delete(res));
+      return;
+    }
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ kind: "List", metadata: { resourceVersion: "1" }, items: list }));
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const port = (server.address() as AddressInfo).port;
+  return {
+    items,
+    requests,
+    target: {
+      baseUrl: `http://127.0.0.1:${port}`,
+      authHeaders: async () => ({}),
+      dispatcher: new Agent(),
+      tlsOptions: () => ({ rejectUnauthorized: true }),
+      invalidateCredential: () => undefined,
+      close: async () => undefined,
+    } satisfies KubeTarget,
+    /** WATCH requests seen on `path`, open or already closed. */
+    watchesSeen(path: string): number {
+      return requests.filter((item) => item.path === path && item.watch).length;
+    },
+    /** Writes one watch event to every open watch on `path`. */
+    emit(path: string, event: { type: string; object?: unknown }): number {
+      const open = watches.get(path) ?? new Set();
+      for (const res of open) res.write(`${JSON.stringify(event)}\n`);
+      return open.size;
+    },
+    close: () =>
+      new Promise<void>((resolve) => {
+        for (const open of watches.values()) for (const res of open) res.end();
+        server.closeAllConnections?.();
+        server.close(() => resolve());
+      }),
+  };
+}
+
+async function waitFor(what: string, condition: () => boolean, timeoutMs = 2000): Promise<void> {
+  const start = Date.now();
+  while (!condition()) {
+    if (Date.now() - start > timeoutMs) throw new Error(`timed out waiting for: ${what}`);
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+}
+
+function collectorOn(target: KubeTarget) {
+  let clock = START_MS;
+  const collector = new Collector({
+    target,
+    kubelet: new CronPodKubelet(),
+    sink: new RecordingSink(),
+    periodMs: PERIOD_MS,
+    now: () => clock,
+  });
+  return {
+    collector,
+    async tick(): Promise<InternalFrame | undefined> {
+      const frame = await collector.tick();
+      clock += PERIOD_MS;
+      return frame;
+    },
+  };
+}
+
+function cronPodOwner(frame: InternalFrame | undefined) {
+  return entitiesOf(frame!).find((entity) => entity.id === `pod/${CRON_POD.uid}`)?.owner;
+}
+
+test("a CronJob's pod resolves to the CRONJOB through the Job watch, not to one Job per run", async () => {
+  const api = await routedApiserver({
+    [PATHS.nodes]: [NODE_OBJECT],
+    [PATHS.pods]: [POD_META],
+    [PATHS.replicasets]: [],
+    [PATHS.jobs]: [JOB_META],
+  });
+  const h = collectorOn(api.target);
+  try {
+    h.collector.start();
+    // A watch is opened only after its LIST has been applied, so an open
+    // watch on every path means every record is in the index.
+    for (const path of Object.values(PATHS)) {
+      await waitFor(`the ${path} watch to open`, () => api.watchesSeen(path) >= 1);
+    }
+    const frame = await h.tick();
+    // `resolveOwner` was not touched by this change: the walk crossed the Job
+    // because the Job watch put the Job into the index, nothing else.
+    assert.deepEqual(cronPodOwner(frame), CRON_JOB);
+  } finally {
+    await h.collector.stop();
+    await api.close();
+  }
+});
+
+test("the collector's apiserver reads are exactly nodes, pods, replicasets and jobs; jobs as metadata only", async () => {
+  const api = await routedApiserver({
+    [PATHS.nodes]: [NODE_OBJECT],
+    [PATHS.pods]: [POD_META],
+    [PATHS.replicasets]: [],
+    [PATHS.jobs]: [JOB_META],
+  });
+  const h = collectorOn(api.target);
+  try {
+    h.collector.start();
+    for (const path of Object.values(PATHS)) {
+      await waitFor(`the ${path} watch to open`, () => api.watchesSeen(path) >= 1);
+    }
+    await h.tick();
+
+    // K1's closed list, as the apiserver saw it: nothing outside these four.
+    assert.deepEqual(
+      [...new Set(api.requests.map((item) => item.path))].sort(),
+      Object.values(PATHS).slice().sort(),
+    );
+    const accepts = (path: string, watch: boolean) => [
+      ...new Set(api.requests.filter((item) => item.path === path && item.watch === watch).map((item) => item.accept)),
+    ];
+    // The Job watch is the ReplicaSet watch's exact twin: the apiserver is
+    // asked for `PartialObjectMetadata`, so a Job's spec (its pod template,
+    // `env` values included) is never sent to the agent at all.
+    for (const path of [PATHS.pods, PATHS.replicasets, PATHS.jobs]) {
+      assert.deepEqual(accepts(path, false), ["application/json;as=PartialObjectMetadataList;g=meta.k8s.io;v=v1"], path);
+      assert.deepEqual(accepts(path, true), ["application/json;as=PartialObjectMetadata;g=meta.k8s.io;v=v1"], path);
+    }
+    // ...and nodes are the one body K4 permits.
+    assert.deepEqual(accepts(PATHS.nodes, false), ["application/json"]);
+  } finally {
+    await h.collector.stop();
+    await api.close();
+  }
+});
+
+test("a pod reported before its Job record is re-declared with the CronJob once the Job arrives", async () => {
+  const api = await routedApiserver({
+    [PATHS.nodes]: [NODE_OBJECT],
+    [PATHS.pods]: [POD_META],
+    [PATHS.replicasets]: [],
+    [PATHS.jobs]: [],
+  });
+  const h = collectorOn(api.target);
+  const encoder = new SampleEncoder();
+  try {
+    h.collector.start();
+    for (const path of Object.values(PATHS)) {
+      await waitFor(`the ${path} watch to open`, () => api.watchesSeen(path) >= 1);
+    }
+
+    // The race: the pod is known, its Job is not yet. The walk stops at the
+    // link it knows — true, and one hop short.
+    const before = await h.tick();
+    assert.deepEqual(cronPodOwner(before), RUN_JOB);
+    const first = encoder.encode([before!]).map(({ message, payload }) => decodeSampleFrame(message, payload))[0]!;
+    const declared = first.entities.added.find((entry) => entry.uid === CRON_POD.uid);
+    assert.equal(declared?.owner?.kind, "Job");
+
+    // The Job arrives on the watch. The ERROR after it makes the agent relist,
+    // and the relist is something this side can SEE: events on one stream are
+    // applied in order, so a second watch request on `jobs` means the ADDED
+    // before it has been applied. (No sleep, no wall-clock guess.)
+    api.items[PATHS.jobs] = [JOB_META];
+    assert.equal(api.emit(PATHS.jobs, { type: "ADDED", object: JOB_META }), 1);
+    api.emit(PATHS.jobs, { type: "ERROR" });
+    await waitFor("the jobs watch to reopen", () => api.watchesSeen(PATHS.jobs) >= 2);
+
+    const after = await h.tick();
+    assert.deepEqual(cronPodOwner(after), CRON_JOB);
+    // `wire.ts`: an entity whose record changed is re-declared under the SAME
+    // alias. That is what moves the control plane's row off the Job.
+    const second = encoder.encode([after!]).map(({ message, payload }) => decodeSampleFrame(message, payload))[0]!;
+    const redeclared = second.entities.added.find((entry) => entry.uid === CRON_POD.uid);
+    assert.ok(redeclared, "the pod was not re-declared when its owner changed");
+    assert.equal(redeclared.id, declared?.id);
+    assert.equal(redeclared.owner?.kind, "CronJob");
+    assert.equal(redeclared.owner?.name, "yedek");
+  } finally {
+    await h.collector.stop();
+    await api.close();
+  }
+});
+
+test("a 403 on jobs does NOT make the collector forbidden; a 403 on pods still does", async () => {
+  // Half one: an old ClusterRole that grants everything except `jobs`.
+  {
+    const api = await routedApiserver(
+      {
+        [PATHS.nodes]: [NODE_OBJECT],
+        [PATHS.pods]: [POD_META],
+        [PATHS.replicasets]: [],
+        [PATHS.jobs]: [JOB_META],
+      },
+      { [PATHS.jobs]: 403 },
+    );
+    const h = collectorOn(api.target);
+    try {
+      let frame: InternalFrame | undefined;
+      const captures = await captured(async () => {
+        h.collector.start();
+        for (const path of [PATHS.nodes, PATHS.pods, PATHS.replicasets]) {
+          await waitFor(`the ${path} watch to open`, () => api.watchesSeen(path) >= 1);
+        }
+        // Only `jobs` can fail here, so one failure is the jobs 403 landing.
+        await waitFor("the jobs 403 to land", () => h.collector.stats().watchFailures >= 1);
+        frame = await h.tick();
+      });
+
+      assert.deepEqual(h.collector.stats().apiserverForbidden, []);
+      assert.equal(frame?.apiserverForbidden, false);
+      assert.notEqual(
+        collectorStatusOf(frame!.nodes, { apiserverForbidden: frame!.apiserverForbidden }).state,
+        "forbidden",
+      );
+      // The data is whole; only the CronJob hop is missing — the pre-Job-watch
+      // behaviour, not a regression.
+      assert.deepEqual(cronPodOwner(frame), RUN_JOB);
+      assert.ok(samplesOf(frame!).length > 0, "a jobs 403 must not cost any samples");
+      // The operator is still told, once, which grant is missing.
+      const denied = captures.warn.filter((line) => line.includes("apiserver denied jobs (403)"));
+      assert.equal(denied.length, 1, JSON.stringify(captures.warn));
+    } finally {
+      await h.collector.stop();
+      await api.close();
+    }
+  }
+
+  // Half two: `pods` denied (and `jobs` with it). The whole-collector signal
+  // is untouched, and `jobs` still does not appear in it.
+  {
+    const api = await routedApiserver(
+      {
+        [PATHS.nodes]: [NODE_OBJECT],
+        [PATHS.pods]: [POD_META],
+        [PATHS.replicasets]: [],
+        [PATHS.jobs]: [JOB_META],
+      },
+      { [PATHS.pods]: 403, [PATHS.jobs]: 403 },
+    );
+    const h = collectorOn(api.target);
+    try {
+      let frame: InternalFrame | undefined;
+      await captured(async () => {
+        h.collector.start();
+        await waitFor("the node and replicaset watches to open", () =>
+          api.watchesSeen(PATHS.nodes) >= 1 && api.watchesSeen(PATHS.replicasets) >= 1,
+        );
+        await waitFor("both 403s to land", () => h.collector.stats().watchFailures >= 2);
+        frame = await h.tick();
+      });
+      assert.deepEqual(h.collector.stats().apiserverForbidden, ["pods"]);
+      assert.equal(frame?.apiserverForbidden, true);
+      assert.equal(
+        collectorStatusOf(frame!.nodes, { apiserverForbidden: frame!.apiserverForbidden }).state,
+        "forbidden",
+      );
+    } finally {
+      await h.collector.stop();
+      await api.close();
+    }
   }
 });
