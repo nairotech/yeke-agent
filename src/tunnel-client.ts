@@ -870,7 +870,30 @@ export class TunnelClient {
               ? undefined
               : coreCaRootFingerprints,
       };
-      this.#send(hello);
+      // The `/version` read above is the one await in this handler, and it
+      // can outlive the session it was started for: a slow exec credential
+      // plugin or an apiserver that does not answer holds it while the socket
+      // drops and `#connect` opens the next one. `#send`'s default target is
+      // the socket OF THE MOMENT, so without this check the stale handler's
+      // `hello` landed on the NEXT session — measured: that session received
+      // two `hello` messages. Core's handler (`case "hello"` in its
+      // `tunnel/session.ts`) applies every one it gets: it overwrites the
+      // session's k8s version and `coreCaRoots`, records the agent version
+      // and answers with another `welcome` — so the stale one relabelled the
+      // new session with the old one's CA roots and k8s version. That is the same rule the
+      // streams follow (#14, see `#send`): a message is written only to the
+      // session it belongs to, because core keys its per-session state (ids,
+      // labels) on the session that carried it. The session this `hello`
+      // belongs to is the local `socket`, so it goes there and nowhere else.
+      // Nothing is lost by dropping it: that socket is closed, and the
+      // session that replaced it builds and sends its own `hello` from its
+      // own `open`. Logged because the one visible trace of a /version read
+      // that took longer than a session would otherwise be nothing at all.
+      if (this.#socket !== socket || socket.readyState !== WebSocket.OPEN) {
+        console.warn("[agent] session closed before its hello was sent; not sending it");
+        return;
+      }
+      this.#send(hello, socket);
     });
 
     socket.on("message", (data, isBinary) => {
