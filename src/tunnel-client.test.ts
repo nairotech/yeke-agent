@@ -2981,12 +2981,72 @@ test("a `/version` that does not answer holds `hello` back only until the read's
     const hello = live.core.received.find((r) => r.control?.t === "hello")!.control as HelloMessage;
     assert.equal(hello.kubernetesVersion, undefined);
     assert.ok(
-      warns.lines.some((line) => line.includes("did not answer within 100 ms")),
+      // Nothing was ever read, so there is no last known version to fall back
+      // on: the field stays absent, and the line says so.
+      warns.lines.some((line) =>
+        line.includes("identity or apiserver /version did not answer within 100 ms; hello is sent without kubernetesVersion"),
+      ),
       JSON.stringify(warns.lines),
     );
   } finally {
     warns.restore();
     await api.close();
+    await h?.close();
+    await rm(kc.directory, { recursive: true, force: true });
+  }
+});
+
+test("a `/version` read that runs past its deadline sends the version the agent last read, not nothing: the cluster card keeps its version across the reconnect", async () => {
+  // Base (577c1c4): the second session's `hello` went without
+  // kubernetesVersion, and core — which fills the version from `hello` alone —
+  // showed the cluster as "unavailable" for that whole session. Measured by
+  // the independent tester per session: ["v1.30.0", null, "v1.30.0"].
+  let versionReads = 0;
+  const api = createHttpServer((req, res) => {
+    if (req.url === "/version") {
+      versionReads += 1;
+      // The first read answers; every later one is held, as an apiserver (or
+      // a credential plugin) that outruns the deadline on a reconnect.
+      if (versionReads === 1) {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ gitVersion: "v1.30.0" }));
+      }
+      return;
+    }
+    res.writeHead(404);
+    res.end();
+  });
+  await new Promise<void>((resolve) => api.listen(0, "127.0.0.1", resolve));
+  const { port } = api.address() as AddressInfo;
+  const kc = await kubeconfigFor(`http://127.0.0.1:${port}`, ["      token: t"]);
+  const warns = warnLines();
+  let h: Harness | undefined;
+  try {
+    h = await harness({ kubeconfig: kc.path, config: { versionReadTimeoutMs: 100 } });
+    const live = h;
+    const hellos = (): HelloMessage[] =>
+      live.core.received.filter((r) => r.control?.t === "hello").map((r) => r.control as HelloMessage);
+    await until("session 1's hello arrived", () => hellos().length === 1);
+    live.core.drop();
+    await until("session 2's hello arrived", () => hellos().length === 2);
+    warns.restore();
+    assert.deepEqual(
+      hellos().map((hello) => hello.kubernetesVersion),
+      ["v1.30.0", "v1.30.0"],
+      "a session whose /version read outran its deadline lost the cluster's version",
+    );
+    assert.ok(
+      warns.lines.some((line) =>
+        line.includes("identity or apiserver /version did not answer within 100 ms; hello is sent with the last known kubernetesVersion v1.30.0"),
+      ),
+      JSON.stringify(warns.lines),
+    );
+  } finally {
+    warns.restore();
+    await new Promise<void>((resolve) => {
+      api.closeAllConnections();
+      api.close(() => resolve());
+    });
     await h?.close();
     await rm(kc.directory, { recursive: true, force: true });
   }

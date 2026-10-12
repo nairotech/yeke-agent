@@ -494,6 +494,13 @@ export class TunnelClient {
   #stopped = false;
   /** The one shutdown: `stop()` returns this same promise on every call (I9). */
   #stopping: Promise<void> | undefined;
+  /**
+   * The apiserver version this agent last read successfully, on any session —
+   * `undefined` until the first successful read. What `hello` carries when a
+   * session's own read runs past `VERSION_READ_TIMEOUT_MS` (see
+   * `#readVersionFor`).
+   */
+  #lastKubernetesVersion: string | undefined;
   /** The pending reconnect attempt, so that `stop()` can cancel it rather than let it fire into a stopped client. */
   #reconnectTimer: NodeJS.Timeout | null = null;
   readonly #createCollector: CollectorFactory;
@@ -1002,8 +1009,18 @@ export class TunnelClient {
   /**
    * The `/version` read for `session`'s `hello`: abandoned the moment the
    * session ends, and after `VERSION_READ_TIMEOUT_MS` (see the constant for
-   * why `hello` does not wait longer). `undefined` either way — the field is
-   * optional on the wire.
+   * why `hello` does not wait longer).
+   *
+   * Past the deadline, `hello` carries the version this agent last read
+   * successfully, if there is one. Core fills the cluster's version from
+   * `hello` alone (`case "hello"` in its `tunnel/session.ts`), so a session
+   * whose `hello` goes without it shows "unavailable" on the cluster card for
+   * the WHOLE session. Measured by the independent tester (12.10.2026), per
+   * session: `["v1.30.0", null, "v1.30.0"]` — the middle reconnect had to
+   * refresh an expired exec token first, and the plugin alone outran the
+   * deadline. An apiserver does not change version between two reconnects
+   * often enough for the last known value to be the worse answer than none;
+   * an agent that has never read it still sends the field absent.
    */
   async #readVersionFor(session: TunnelSession): Promise<string | undefined> {
     const target = this.#target;
@@ -1011,12 +1028,20 @@ export class TunnelClient {
     const limitMs = this.#config.versionReadTimeoutMs ?? VERSION_READ_TIMEOUT_MS;
     const deadline = AbortSignal.timeout(limitMs);
     const version = await readKubernetesVersion(target, AbortSignal.any([session.signal, deadline]));
-    if (version === undefined && deadline.aborted && !session.ended) {
-      console.warn(
-        `[agent] apiserver /version did not answer within ${limitMs} ms; hello is sent without kubernetesVersion`,
-      );
+    if (version !== undefined) {
+      this.#lastKubernetesVersion = version;
+      return version;
     }
-    return version;
+    if (!deadline.aborted || session.ended) return undefined;
+    const fallback = this.#lastKubernetesVersion;
+    // "identity or /version": the deadline covers the credential plugin as
+    // well as the request, and the slow half is as often the plugin.
+    console.warn(
+      `[agent] identity or apiserver /version did not answer within ${limitMs} ms; hello is sent ${
+        fallback === undefined ? "without kubernetesVersion" : `with the last known kubernetesVersion ${fallback}`
+      }`,
+    );
+    return fallback;
   }
 
   #scheduleReconnect(): void {
