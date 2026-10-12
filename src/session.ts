@@ -192,19 +192,32 @@ export abstract class IdRecord {
    * (the credential plugin family, for example); the line here is not a record
    * of that detail but of "what went on the wire".
    *
-   * Neither job is done for a record that is no longer `live`. Measured before
-   * this rule (12.10.2026): a `cancel`/`strclose` for a stream whose upstream
-   * WebSocket was still in its handshake made `ws` emit "WebSocket was closed
-   * before the connection was established", and the agent answered the
-   * control plane with an `err` for the id it had just forgotten — and logged
-   * "request N failed" for a stream nobody wanted any more. The same line came
-   * out for every such stream when the session dropped. Neither said anything
-   * true about the stream.
+   * The two jobs answer two different questions, so they have two gates.
+   *
+   *  · The LOG is skipped for a record that was STOPPED — the control plane
+   *    forgot the id (`cancel`, `strclose`) or the session ended. Measured
+   *    before this rule (12.10.2026): a `cancel`/`strclose` for a stream whose
+   *    upstream WebSocket was still in its handshake made `ws` emit "WebSocket
+   *    was closed before the connection was established", and the agent
+   *    logged "request N failed" for a stream nobody wanted any more; the same
+   *    line came out for every such stream when the session dropped. Neither
+   *    said anything true about the stream: the agent had torn it down itself.
+   *  · The WIRE write is skipped for a record that is not `live` — stopped,
+   *    OR its session's socket can no longer carry a frame. In that same
+   *    measurement the agent answered the control plane with an `err` for the
+   *    id it had just forgotten.
+   *
+   * The difference is a record that was never stopped while its socket is
+   * already closing (the peer has started the close, the 'close' event has
+   * not arrived yet): its failure is a REAL one — an upstream error the agent
+   * did not cause — and the operator's log is the only place it can still
+   * go. Gating the log on `live` as well (the first version of this method)
+   * swallowed exactly that line (found by the independent tester, 12.10.2026).
    */
   fail(failure: TunnelFailure): void {
-    if (!this.live) return;
+    if (this.#abort.signal.aborted) return;
     console.warn(`[agent] request ${this.id} failed: ${describeFailure(failure)}`);
-    this.session.send({ t: "err", id: this.id, ...failure });
+    if (this.live) this.session.send({ t: "err", id: this.id, ...failure });
   }
 
   /** Stopped from outside: the id is forgotten or the session is over. See the class comment. */
