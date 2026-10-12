@@ -879,6 +879,8 @@ interface FakeStreamApiserver {
    * has handled everything written before".
    */
   readonly ended: readonly boolean[];
+  /** Per socket (same order): every byte the agent wrote after the upgrade request. */
+  readonly received: readonly Buffer[];
   close(): Promise<void>;
 }
 
@@ -887,6 +889,7 @@ async function fakeStreamApiserver(options: { readonly holdUpgrade?: boolean } =
   const upgrades: string[] = [];
   const sockets: Duplex[] = [];
   const ended: boolean[] = [];
+  const received: Buffer[] = [];
   let socketsClosed = 0;
   const server = createHttpServer((req, res) => {
     // The agent reads /version on every `open`; answer it so the line is quiet.
@@ -902,10 +905,13 @@ async function fakeStreamApiserver(options: { readonly holdUpgrade?: boolean } =
     upgrades.push(req.url ?? "");
     const index = sockets.push(socket) - 1;
     ended.push(false);
+    received.push(Buffer.alloc(0));
     socket.on("end", () => {
       ended[index] = true;
     });
-    socket.on("data", () => {});
+    socket.on("data", (chunk: Buffer) => {
+      received[index] = Buffer.concat([received[index]!, chunk]);
+    });
     socket.on("error", () => {});
     socket.on("close", () => {
       socketsClosed += 1;
@@ -935,6 +941,7 @@ async function fakeStreamApiserver(options: { readonly holdUpgrade?: boolean } =
     upgrades,
     sockets,
     ended,
+    received,
     get socketsClosed() {
       return socketsClosed;
     },
@@ -3046,5 +3053,54 @@ test("`stop()` is one shutdown: a second and a third call return the same promis
     );
   } finally {
     await h.core.close();
+  }
+});
+
+/** The first frame a client wrote: opcode and unmasked payload (client frames are always masked, RFC 6455 §5.3). */
+function firstClientFrame(bytes: Buffer): { readonly opcode: number; readonly payload: Buffer } | undefined {
+  if (bytes.byteLength < 6) return undefined;
+  const opcode = bytes[0]! & 0x0f;
+  const length = bytes[1]! & 0x7f;
+  assert.ok(length < 126, "a close frame payload is at most 125 bytes");
+  if (bytes.byteLength < 6 + length) return undefined;
+  const mask = bytes.subarray(2, 6);
+  const payload = Buffer.from(bytes.subarray(6, 6 + length).map((byte, index) => byte ^ mask[index % 4]!));
+  return { opcode, payload };
+}
+
+test("a `strclose` whose code a WebSocket may not send, or whose reason does not fit a close frame, closes the stream instead of crashing the agent", async () => {
+  // Base: `ws.close(1005)` threw a TypeError inside the tunnel's message
+  // handler — an uncaught exception, i.e. the agent process gone. A reason
+  // over 123 bytes throws a RangeError the same way.
+  const api = await fakeStreamApiserver();
+  const kc = await kubeconfigFor(api.url, ["      token: t"]);
+  const h = await harness({ kubeconfig: kc.path });
+  try {
+    await until("the collector has started", () => h.starts === 1);
+    h.core.send({ t: "stropen", id: 1, path: EXEC_PATH, query: "command=sh", protocols: EXEC_PROTOCOLS });
+    await until("stream 1 is open", () => controlFor(h.core, 1).includes("strok"));
+    // 181 bytes: "a" and sixty 3-byte characters. The cut at 123 falls inside
+    // the 41st character, so the reason must end after the 40th (121 bytes).
+    const reason = `a${"\u20ac".repeat(60)}`;
+    h.core.send({ t: "strclose", id: 1, code: 1005, reason });
+    await until("the apiserver received the agent's close frame", () => firstClientFrame(api.received[0]!) !== undefined);
+    await handled(h.core, 16);
+
+    const frame = firstClientFrame(api.received[0]!)!;
+    const sentReason = frame.payload.subarray(2);
+    assert.deepEqual(
+      {
+        opcode: frame.opcode,
+        code: frame.payload.readUInt16BE(0),
+        reasonBytes: sentReason.byteLength,
+        reason: sentReason.toString("utf8"),
+        streams: h.client.streamCount,
+      },
+      { opcode: 0x8, code: 1000, reasonBytes: 121, reason: `a${"\u20ac".repeat(40)}`, streams: 0 },
+    );
+  } finally {
+    await h.close();
+    await api.close();
+    await rm(kc.directory, { recursive: true, force: true });
   }
 });
