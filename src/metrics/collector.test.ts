@@ -499,8 +499,14 @@ test("apiserver 403 on the node watch marks the frame apiserverForbidden, with n
   });
   try {
     collector.start();
-    // Give the watches' first LIST attempt time to land a 403.
-    await waitUntil(() => collector.stats().apiserverForbidden.includes("nodes"));
+    // Give the watches' first LIST attempt time to land a 403 -- ALL THREE of
+    // them. Waiting on `nodes` alone raced the pods/replicasets 403s, which
+    // can arrive a beat later than the node one (the list asserted below was
+    // then still `["nodes", "pods"]`).
+    await waitUntil(() => {
+      const forbidden = collector.stats().apiserverForbidden;
+      return ["nodes", "pods", "replicasets"].every((kind) => forbidden.includes(kind));
+    });
 
     const frame = await collector.tick();
     clock += PERIOD_MS;
