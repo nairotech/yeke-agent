@@ -153,6 +153,23 @@ function sameRootFingerprintSet(a: readonly string[], b: readonly string[]): boo
 const CORE_CA_HELLO_ROOTS_LIMIT = 16;
 
 /**
+ * How long the `/version` read behind `hello.kubernetesVersion` may take
+ * before `hello` goes without it (the field is optional on the wire).
+ *
+ * PO decision D2, 12.10.2026. The read used to be bounded only by undici's
+ * defaults (300 s for the headers, 300 s for the body) plus an exec credential
+ * plugin's 60 s, and core has no `hello` deadline of its own — so a slow
+ * apiserver or plugin kept the whole session at protocol 0 for minutes: core
+ * refuses every stream (`STREAM_TUNNEL_VERSION`) until `hello`, and the
+ * collector is not started until `welcome`. A missing version on the cluster
+ * card is a far smaller loss than an exec that does not open. Ten seconds is
+ * long for an apiserver to answer `/version` and short next to the reconnect
+ * and liveness periods. The read is also bound to its session: a session that
+ * ends stops waiting for it at once (see the `open` handler).
+ */
+const VERSION_READ_TIMEOUT_MS = 10_000;
+
+/**
  * Node's TLS error codes for "the certificate does not chain to anything I
  * trust" — the ONLY family a corporate CA can fix. A closed list on purpose:
  * an expired certificate or a hostname mismatch is a different problem that
@@ -476,6 +493,10 @@ export class TunnelClient {
    */
   #backoff: number;
   #stopped = false;
+  /** The one shutdown: `stop()` returns this same promise on every call (I9). */
+  #stopping: Promise<void> | undefined;
+  /** The pending reconnect attempt, so that `stop()` can cancel it rather than let it fire into a stopped client. */
+  #reconnectTimer: NodeJS.Timeout | null = null;
   readonly #createCollector: CollectorFactory;
   readonly #sampleWire: SampleWire;
   /**
@@ -611,11 +632,31 @@ export class TunnelClient {
     this.#connect();
   }
 
-  async stop(): Promise<void> {
+  /**
+   * Shuts the client down, once: every later call returns the same promise.
+   *
+   * `index.ts` can call this twice (SIGTERM and SIGINT are two handlers on one
+   * shutdown), and a second run of the body used to call `KubeTarget.close()`
+   * a second time, which undici's Agent rejects (`UND_ERR_DESTROYED`) — an
+   * unhandled rejection on the way out.
+   */
+  stop(): Promise<void> {
+    this.#stopping ??= this.#shutdown();
+    return this.#stopping;
+  }
+
+  async #shutdown(): Promise<void> {
     this.#stopped = true;
-    // The session first: every request, stream and timer it holds stops here,
-    // and from now on no message that still arrives on its socket starts
-    // anything new (see the 'message' handler in `#connect`).
+    if (this.#reconnectTimer) {
+      clearTimeout(this.#reconnectTimer);
+      this.#reconnectTimer = null;
+    }
+    // The session first: every request, stream, `/version` read and timer it
+    // holds stops here, and from now on no message that still arrives on its
+    // socket starts anything new (see the 'message' handler in `#connect`).
+    // Measured on the base before this ordering: a watch sent while `stop()`
+    // was waiting for the collector reached the apiserver, and a `/version`
+    // read nobody aborted kept `target.close()` waiting.
     this.#session?.end();
     // Before the target closes: the collector's watches and kubelet reads go
     // through it, and stopping them after its dispatcher is gone would produce
@@ -735,6 +776,14 @@ export class TunnelClient {
       // own `NODE_EXTRA_CA_CERTS` or `--use-system-ca` trust the moment this
       // option was also set.
       ...(coreCa ? { ca: [...defaultCoreCaCertificates(), ...coreCa.ca] } : {}),
+      // Measured on the base (12.10.2026): against an address that accepts
+      // the TCP connection and then never answers the upgrade (a stalled
+      // proxy or load balancer), the attempt stayed CONNECTING with no log
+      // line and no reconnect — `ws` sets no handshake deadline by default,
+      // Node's HTTP client has none either, and the liveness check only
+      // starts on 'open'. With a deadline the attempt fails like any other
+      // ('error', then 'close') and the backoff path takes over.
+      handshakeTimeout: this.#config.handshakeTimeoutMs ?? TUNNEL_LIVENESS_TIMEOUT_MS,
     });
     // One session per socket, created before any of its events can fire: every
     // handler below closes over THIS session, never over `this.#session`, which
@@ -792,7 +841,7 @@ export class TunnelClient {
         t: "hello",
         protocol: TUNNEL_PROTOCOL_VERSION,
         agentVersion: AGENT_VERSION,
-        kubernetesVersion: this.#target ? await readKubernetesVersion(this.#target) : undefined,
+        kubernetesVersion: await this.#readVersionFor(session),
         coreCaRoots:
           coreCaRootFingerprints === undefined
             ? []
@@ -801,9 +850,11 @@ export class TunnelClient {
               : coreCaRootFingerprints,
       };
       // The `/version` read above is the one await in this handler, and it
-      // can outlive the session it was started for: a slow exec credential
-      // plugin or an apiserver that does not answer holds it while the socket
-      // drops and `#connect` opens the next one. Before 12.10.2026 the write
+      // used to outlive the session it was started for: a slow exec credential
+      // plugin or an apiserver that does not answer held it while the socket
+      // dropped and `#connect` opened the next one. It is now abandoned when
+      // its session ends (`#readVersionFor`), but this handler still resumes
+      // after that, on a session that is over. Before 12.10.2026 the write
       // went to the socket OF THE MOMENT, so the stale handler's `hello`
       // landed on the NEXT session — measured: that session received two
       // `hello` messages. Core's handler (`case "hello"` in its
@@ -962,11 +1013,34 @@ export class TunnelClient {
     }
   }
 
+  /**
+   * The `/version` read for `session`'s `hello`: abandoned the moment the
+   * session ends, and after `VERSION_READ_TIMEOUT_MS` (see the constant for
+   * why `hello` does not wait longer). `undefined` either way — the field is
+   * optional on the wire.
+   */
+  async #readVersionFor(session: TunnelSession): Promise<string | undefined> {
+    const target = this.#target;
+    if (!target) return undefined;
+    const limitMs = this.#config.versionReadTimeoutMs ?? VERSION_READ_TIMEOUT_MS;
+    const deadline = AbortSignal.timeout(limitMs);
+    const version = await readKubernetesVersion(target, AbortSignal.any([session.signal, deadline]));
+    if (version === undefined && deadline.aborted && !session.ended) {
+      console.warn(
+        `[agent] apiserver /version did not answer within ${limitMs} ms; hello is sent without kubernetesVersion`,
+      );
+    }
+    return version;
+  }
+
   #scheduleReconnect(): void {
     if (this.#stopped) return;
     const delay = this.#backoff;
     this.#backoff = Math.min(this.#backoff * 2, this.#config.reconnectMaxMs);
-    setTimeout(() => this.#connect(), delay);
+    this.#reconnectTimer = setTimeout(() => {
+      this.#reconnectTimer = null;
+      this.#connect();
+    }, delay);
   }
 
   /**

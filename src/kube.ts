@@ -892,18 +892,55 @@ export function resolveKubeTarget(config: AgentConfig): Promise<KubeTarget> {
     : resolveKubeconfig(config.kubeContext);
 }
 
-/** At startup the agent reads the apiserver version; the control plane shows it in the inventory. */
-export async function readKubernetesVersion(target: KubeTarget): Promise<string | undefined> {
+/**
+ * `promise`, unless `signal` aborts first — then a rejection with the
+ * signal's reason. The work behind `promise` is NOT stopped (an exec
+ * credential plugin runs to completion and its result still fills the
+ * identity cache); only the caller stops waiting for it.
+ */
+function unlessAborted<T>(promise: Promise<T>, signal: AbortSignal | undefined): Promise<T> {
+  if (!signal) return promise;
+  if (signal.aborted) return Promise.reject(signal.reason);
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = (): void => reject(signal.reason);
+    signal.addEventListener("abort", onAbort, { once: true });
+    promise.then(
+      (value) => {
+        signal.removeEventListener("abort", onAbort);
+        resolve(value);
+      },
+      (err: unknown) => {
+        signal.removeEventListener("abort", onAbort);
+        reject(err);
+      },
+    );
+  });
+}
+
+/**
+ * At startup the agent reads the apiserver version; the control plane shows it in the inventory.
+ *
+ * `signal` is the caller's bound on the WHOLE read — identity resolution
+ * included, which an abort cannot interrupt but can stop waiting for (see
+ * `unlessAborted`). An aborted read is an abandoned one, not a failed one:
+ * it returns `undefined` without the error line, and the caller, which knows
+ * why it gave up, says so if it is worth saying.
+ */
+export async function readKubernetesVersion(
+  target: KubeTarget,
+  signal?: AbortSignal,
+): Promise<string | undefined> {
   try {
     const { request } = await import("undici");
     // The order matters: `authHeaders()` can replace the dispatcher during an
     // exec refresh, so the dispatcher is read AFTER it. Writing the
     // `dispatcher:` field first in the object literal would capture the old
     // dispatcher here.
-    const headers = await target.authHeaders();
+    const headers = await unlessAborted(target.authHeaders(), signal);
     const res = await request(`${target.baseUrl}/version`, {
       dispatcher: target.dispatcher,
       headers,
+      ...(signal ? { signal } : {}),
     });
     if (res.statusCode !== 200) {
       // A silent `undefined` was harmful at this point: in the control plane's
@@ -923,6 +960,7 @@ export async function readKubernetesVersion(target: KubeTarget): Promise<string 
     const body = (await res.body.json()) as { gitVersion?: string };
     return body.gitVersion;
   } catch (err) {
+    if (signal?.aborted) return undefined;
     console.error(`[agent] could not read apiserver /version: ${(err as Error).message}`);
     return undefined;
   }

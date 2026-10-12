@@ -64,6 +64,23 @@ export interface AgentConfig {
    * cases the typo lands on the safe side, which is not the same side.
    */
   metricsEnabled: boolean;
+  /**
+   * How long the tunnel's WebSocket handshake (TCP, TLS, HTTP upgrade) may
+   * take before the attempt is abandoned and the reconnect path takes over.
+   * Default: `TUNNEL_LIVENESS_TIMEOUT_MS`, the same silence after which an
+   * OPEN session is considered dead (see `tunnel-client.ts`).
+   *
+   * Optional, and not read from the environment on purpose: it is a seam for
+   * the tests (which cannot wait 45 seconds), not an operator setting — an
+   * operator knob would be a product surface nobody has asked for.
+   */
+  handshakeTimeoutMs?: number;
+  /**
+   * The bound on the `/version` read whose result rides `hello`. Default:
+   * `VERSION_READ_TIMEOUT_MS` (`tunnel-client.ts`). A test seam, for the same
+   * reason as `handshakeTimeoutMs`.
+   */
+  versionReadTimeoutMs?: number;
 }
 
 // These two errors are thrown at startup, they bring the process down, and they

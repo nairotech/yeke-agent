@@ -29,6 +29,7 @@ import {
   type ServerResponse,
 } from "node:http";
 import { createServer as createHttpsServer, type Server as HttpsServer } from "node:https";
+import { createServer as createNetServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
@@ -43,6 +44,7 @@ import {
   parseControlMessage,
   serializeControlMessage,
   type ControlMessage,
+  type HelloMessage,
   type SampleMessage,
 } from "@nairotech/yeke-tunnel";
 import type { AgentConfig } from "./config.js";
@@ -1090,7 +1092,7 @@ test("a `hello` the PREVIOUS session was still building when it dropped is never
   // a second `welcome`).
   const plugin = await slowPlugin({ gateFromRun: 2 });
   // A /version endpoint that counts the reads it ANSWERED: the barrier below
-  // waits until both sessions' reads are over, not for a duration.
+  // waits until the reads are over, not for a duration.
   let versionsAnswered = 0;
   const api = createHttpServer((req, res) => {
     res.on("finish", () => {
@@ -1124,10 +1126,18 @@ test("a `hello` the PREVIOUS session was still building when it dropped is never
     assert.equal(plugin.parked(), true, "session 1's /version read must still be parked when session 2 starts");
     await rm(plugin.marker);
 
-    // The barrier: both handlers' /version reads have been answered and the
+    // The barrier: session 2's /version read has been answered and the
     // plugin is idle, so both handlers have had their turn to send — then
     // `settle()` gives the stale one room to do the wrong thing.
-    await until("both sessions' /version reads were answered", () => versionsAnswered >= 2 && plugin.idle());
+    //
+    // Session 2's read only, since 12.10.2026 (D2): the stale handler's read
+    // is now abandoned the moment session 1 ends (`#readVersionFor`), so it
+    // never reaches the apiserver, and waiting for TWO answered reads (the
+    // barrier as first written) would wait for something that by design no
+    // longer happens. The stale handler still resumes — on the drop, instead
+    // of after the plugin — and still finds its session over; the assertion
+    // below is unchanged.
+    await until("session 2's /version read was answered", () => versionsAnswered >= 1 && plugin.idle());
     await until("session 2's own `hello` arrived", () => hellos() >= 1);
     await settle();
 
@@ -2860,5 +2870,181 @@ test("a new session's sink stays off until that session's own `welcome`: no samp
       for (const socket of server.clients) socket.terminate();
       server.close(() => resolve());
     });
+  }
+});
+
+// ─── Bounded waits and the one shutdown (I5, I7, I9) ─────────────────────────
+
+test("a core address that accepts TCP and never answers the upgrade is abandoned after the handshake deadline, and the agent tries again", async () => {
+  // Base: one connection, CONNECTING forever — no log line, no reconnect:
+  // `ws` sets no handshake deadline and the liveness check starts on 'open'.
+  process.env.KUBECONFIG = await kubeconfig();
+  let connections = 0;
+  const stalled = createNetServer((socket) => {
+    connections += 1;
+    socket.on("data", () => {});
+    socket.on("error", () => {});
+  });
+  await new Promise<void>((resolve) => stalled.listen(0, "127.0.0.1", resolve));
+  const { port } = stalled.address() as AddressInfo;
+  const client = new TunnelClient({
+    coreUrl: `ws://127.0.0.1:${port}/tunnel`,
+    clusterId: "cluster-1",
+    token: "agent-token",
+    kubeMode: "kubeconfig",
+    reconnectMinMs: 10,
+    reconnectMaxMs: 50,
+    kubeletInsecureTls: false,
+    metricsEnabled: false,
+    handshakeTimeoutMs: 100,
+  });
+  const originalError = console.error;
+  const lines: string[] = [];
+  console.error = (...args: unknown[]) => void lines.push(args.join(" "));
+  try {
+    await client.start();
+    await until("the agent gave up on the stalled handshake and connected again", () => connections >= 2);
+    assert.ok(
+      lines.some((line) => line.includes("[agent] connection error:")),
+      `the abandoned attempt left no line: ${JSON.stringify(lines)}`,
+    );
+  } finally {
+    console.error = originalError;
+    await client.stop();
+    await new Promise<void>((resolve) => stalled.close(() => resolve()));
+  }
+});
+
+/** An apiserver whose `/version` never answers; every other path is a 404. Counts the `/version` requests it saw close. */
+async function silentVersionApiserver(): Promise<{
+  readonly url: string;
+  readonly held: number;
+  readonly closed: number;
+  close(): Promise<void>;
+}> {
+  let held = 0;
+  let closed = 0;
+  const server = createHttpServer((req, res) => {
+    if (req.url === "/version") {
+      held += 1;
+      res.on("close", () => {
+        closed += 1;
+      });
+      return;
+    }
+    res.writeHead(404);
+    res.end();
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const { port } = server.address() as AddressInfo;
+  return {
+    url: `http://127.0.0.1:${port}`,
+    get held() {
+      return held;
+    },
+    get closed() {
+      return closed;
+    },
+    close: () =>
+      new Promise<void>((resolve) => {
+        server.closeAllConnections();
+        server.close(() => resolve());
+      }),
+  };
+}
+
+test("a `/version` that does not answer holds `hello` back only until the read's deadline: `hello` then goes without kubernetesVersion", async () => {
+  // Base: `hello` waited for undici's own 300 s header timeout, and core
+  // refuses every stream until `hello` arrives.
+  const api = await silentVersionApiserver();
+  const kc = await kubeconfigFor(api.url, ["      token: t"]);
+  const warns = warnLines();
+  let h: Harness | undefined;
+  try {
+    h = await harness({ kubeconfig: kc.path, config: { versionReadTimeoutMs: 100 } });
+    const live = h;
+    await until("hello arrived", () => helloSent(live.core));
+    warns.restore();
+    const hello = live.core.received.find((r) => r.control?.t === "hello")!.control as HelloMessage;
+    assert.equal(hello.kubernetesVersion, undefined);
+    assert.ok(
+      warns.lines.some((line) => line.includes("did not answer within 100 ms")),
+      JSON.stringify(warns.lines),
+    );
+  } finally {
+    warns.restore();
+    await api.close();
+    await h?.close();
+    await rm(kc.directory, { recursive: true, force: true });
+  }
+});
+
+test("a session that drops while its `/version` read is waiting abandons the read: the apiserver sees the request close", async () => {
+  // Base: the read was not tied to its session; it stayed open on the
+  // apiserver until undici's 300 s timeout, past the session it was for.
+  const api = await silentVersionApiserver();
+  const kc = await kubeconfigFor(api.url, ["      token: t"]);
+  let h: Harness | undefined;
+  try {
+    h = await harness({ kubeconfig: kc.path, config: { versionReadTimeoutMs: 60_000 } });
+    const live = h;
+    await until("session 1's /version read is held", () => api.held === 1);
+    live.core.drop();
+    await until("the apiserver saw session 1's /version request close", () => api.closed >= 1);
+  } finally {
+    await api.close();
+    await h?.close();
+    await rm(kc.directory, { recursive: true, force: true });
+  }
+});
+
+test("`stop()` returns while a `/version` read is still waiting on the apiserver", async () => {
+  // Base: `target.close()` (undici's graceful `Agent.close()`) waited for the
+  // read nobody had aborted.
+  const api = await silentVersionApiserver();
+  const kc = await kubeconfigFor(api.url, ["      token: t"]);
+  let h: Harness | undefined;
+  try {
+    h = await harness({ kubeconfig: kc.path, config: { versionReadTimeoutMs: 60_000 } });
+    const live = h;
+    await until("the /version read is held", () => api.held === 1);
+    let finished = false;
+    const stopping = live.client.stop().then(() => {
+      finished = true;
+    });
+    let timedOut = false;
+    await until("stop() returned", () => finished).catch(() => {
+      timedOut = true;
+    });
+    assert.equal(timedOut, false, "stop() waited on a /version read");
+    await stopping;
+  } finally {
+    await api.close();
+    await h?.core.close();
+    await rm(kc.directory, { recursive: true, force: true });
+  }
+});
+
+test("`stop()` is one shutdown: a second and a third call return the same promise and none of them throws", async () => {
+  // Base: each call ran the whole body again, and the second `target.close()`
+  // is rejected by undici (`UND_ERR_DESTROYED`) — `index.ts` reaches it with
+  // SIGTERM followed by SIGINT. Also: a stop during the reconnect backoff opens
+  // no further connection.
+  const h = await harness();
+  try {
+    await until("the collector has started", () => h.starts === 1);
+    h.core.drop();
+    const first = h.client.stop();
+    const second = h.client.stop();
+    await Promise.all([first, second]);
+    const third = h.client.stop();
+    await third;
+    await settle();
+    assert.deepEqual(
+      { sameSecond: first === second, sameThird: first === third, sessions: h.core.sessions, stops: h.stops },
+      { sameSecond: true, sameThird: true, sessions: 1, stops: 1 },
+    );
+  } finally {
+    await h.core.close();
   }
 });
