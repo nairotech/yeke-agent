@@ -947,8 +947,17 @@ async function fakeStreamApiserver(): Promise<FakeStreamApiserver> {
  * `failAfterGate`: a run that waited at the gate then exits 1 instead of
  * printing a credential, so the caller's `authHeaders()` REJECTS after the
  * test released it.
+ *
+ * `gateFromRun`: only the run with this ordinal (1-based) and later ones look
+ * at the marker; earlier runs pass straight through. For a test that must
+ * close the gate BEFORE the agent connects: `resolveKubeTarget` itself runs
+ * the plugin once (`resolveKubeconfig`'s initial credential), and that run has to
+ * get through for `start()` to return at all — the run to hold is the next
+ * one, the `open` handler's /version read.
  */
-async function slowPlugin(options: { readonly failAfterGate?: boolean } = {}): Promise<{
+async function slowPlugin(
+  options: { readonly failAfterGate?: boolean; readonly gateFromRun?: number } = {},
+): Promise<{
   readonly directory: string;
   readonly marker: string;
   readonly userLines: readonly string[];
@@ -968,7 +977,9 @@ async function slowPlugin(options: { readonly failAfterGate?: boolean } = {}): P
     [
       "#!/bin/sh",
       `printf s >> "${runs}"`,
-      `if [ -f "${marker}" ]; then printf w >> "${runs}"; while [ -f "${marker}" ]; do sleep 0.05; done; printf W >> "${runs}";${
+      // The run's own ordinal, counted after its `s` was written.
+      `n=$(( $(tr -cd s < "${runs}" | wc -c) ))`,
+      `if [ -f "${marker}" ] && [ "$n" -ge ${options.gateFromRun ?? 1} ]; then printf w >> "${runs}"; while [ -f "${marker}" ]; do sleep 0.05; done; printf W >> "${runs}";${
         options.failAfterGate ? ` printf e >> "${runs}"; echo "plugin refused" >&2; exit 1;` : ""
       } fi`,
       `printf e >> "${runs}"`,
@@ -1052,6 +1063,71 @@ test("a stream the PREVIOUS session asked for, still resolving its credentials w
     await rm(plugin.marker, { force: true });
     await h.close();
     await api.close();
+    await rm(kc.directory, { recursive: true, force: true });
+    await rm(plugin.directory, { recursive: true, force: true });
+  }
+});
+
+test("a `hello` the PREVIOUS session was still building when it dropped is never sent on the next session", async () => {
+  // The `open` handler awaits the apiserver's /version before it can build
+  // `hello`, and that await outlives the session when the credential plugin is
+  // slow (or the apiserver does not answer). Measured before the fix: the
+  // stale handler resumed after the reconnect and sent ITS `hello` — with ITS
+  // CA roots and k8s version — on session 2's socket, so session 2 received
+  // two `hello` messages and core processed both (version write, `coreCaRoots`,
+  // a second `welcome`).
+  const plugin = await slowPlugin({ gateFromRun: 2 });
+  // A /version endpoint that counts the reads it ANSWERED: the barrier below
+  // waits until both sessions' reads are over, not for a duration.
+  let versionsAnswered = 0;
+  const api = createHttpServer((req, res) => {
+    res.on("finish", () => {
+      if (req.url === "/version") versionsAnswered += 1;
+    });
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ gitVersion: "v1.31.0" }));
+  });
+  await new Promise<void>((resolve) => api.listen(0, "127.0.0.1", resolve));
+  const { port } = api.address() as AddressInfo;
+  const kc = await kubeconfigFor(`http://127.0.0.1:${port}`, plugin.userLines);
+  // The gate is closed BEFORE the agent connects: `start()`'s own credential
+  // run (run 1) passes, session 1's startup /version read (run 2) parks in the
+  // plugin, so its `hello` is not built yet.
+  await writeFile(plugin.marker, "");
+  let h: Harness | undefined;
+  const hellos = (): number => h!.core.received.filter((r) => r.control?.t === "hello").length;
+  try {
+    // Inside the `try`: should `start()` itself not return, the `finally`
+    // still removes the marker instead of leaving a plugin parked forever.
+    const live = await harness({ kubeconfig: kc.path });
+    h = live;
+    await until("session 1's /version read is held at the plugin gate", plugin.parked);
+    assert.equal(hellos(), 0, "session 1 sent `hello` before its /version read was released");
+
+    live.core.drop();
+    await until("the agent reconnected", () => live.core.sessions === 2);
+    // Session 1's handler must still be parked when session 2 exists, or the
+    // test would prove nothing. Session 2's own read parks too (a run of its
+    // own, or it joined session 1's — `CredentialCache` allows either).
+    assert.equal(plugin.parked(), true, "session 1's /version read must still be parked when session 2 starts");
+    await rm(plugin.marker);
+
+    // The barrier: both handlers' /version reads have been answered and the
+    // plugin is idle, so both handlers have had their turn to send — then
+    // `settle()` gives the stale one room to do the wrong thing.
+    await until("both sessions' /version reads were answered", () => versionsAnswered >= 2 && plugin.idle());
+    await until("session 2's own `hello` arrived", () => hellos() >= 1);
+    await settle();
+
+    assert.equal(hellos(), 1, `session 2 received ${hellos()} hello messages`);
+  } finally {
+    // Release a run still held at the gate, or its process outlives the test.
+    await rm(plugin.marker, { force: true });
+    await h?.close();
+    await new Promise<void>((resolve) => {
+      api.closeAllConnections();
+      api.close(() => resolve());
+    });
     await rm(kc.directory, { recursive: true, force: true });
     await rm(plugin.directory, { recursive: true, force: true });
   }
