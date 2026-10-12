@@ -476,11 +476,11 @@ export function packFrame(input: {
 /**
  * Where the collector writes.
  *
- * This is the seam between the collector and the wire, and it exists because
- * the two are being built at the same time: `@nairotech/yeke-tunnel` 5.0.0
- * (which carries the `sample` message) is not published yet. The collector is
- * finished, measured and merged against this interface; the encoder that binds
- * it to `tunnel-client.ts` is the second wave.
+ * This is the seam between the collector and the wire. It was cut when the two
+ * were being built at the same time (the `sample` message arrived with
+ * `@nairotech/yeke-tunnel` 5.0.0; the agent now pins 5.1.0), and it stays
+ * because it keeps the collector testable without a socket: `SampleWire` in
+ * `tunnel-client.ts` is the one implementation that binds it to a session.
  *
  * TWO flags, not one, and the distinction is the point:
  *
