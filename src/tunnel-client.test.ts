@@ -860,12 +860,20 @@ interface FakeStreamApiserver {
   readonly sockets: Duplex[];
   /** How many upgraded sockets have closed. */
   readonly socketsClosed: number;
+  /**
+   * Per socket (same order): the agent ended its side. `ws` does that from
+   * the very handler that processed the frame before it (the peer's close
+   * frame, or a protocol error), so it is the apiserver's view of "the agent
+   * has handled everything written before".
+   */
+  readonly ended: readonly boolean[];
   close(): Promise<void>;
 }
 
 async function fakeStreamApiserver(): Promise<FakeStreamApiserver> {
   const upgrades: string[] = [];
   const sockets: Duplex[] = [];
+  const ended: boolean[] = [];
   let socketsClosed = 0;
   const server = createHttpServer((req, res) => {
     // The agent reads /version on every `open`; answer it so the line is quiet.
@@ -879,7 +887,11 @@ async function fakeStreamApiserver(): Promise<FakeStreamApiserver> {
   });
   server.on("upgrade", (req: IncomingMessage, socket: Duplex) => {
     upgrades.push(req.url ?? "");
-    sockets.push(socket);
+    const index = sockets.push(socket) - 1;
+    ended.push(false);
+    socket.on("end", () => {
+      ended[index] = true;
+    });
     socket.on("data", () => {});
     socket.on("error", () => {});
     socket.on("close", () => {
@@ -908,6 +920,7 @@ async function fakeStreamApiserver(): Promise<FakeStreamApiserver> {
     url: `http://127.0.0.1:${port}`,
     upgrades,
     sockets,
+    ended,
     get socketsClosed() {
       return socketsClosed;
     },
@@ -1199,6 +1212,209 @@ test("the late upstream close of a stream the PREVIOUS session left behind neith
     await h.close();
     await api.close();
     await rm(kc.directory, { recursive: true, force: true });
+  }
+});
+
+/**
+ * One server-to-client WebSocket frame: FIN set, payload under 126 bytes.
+ * `masked` breaks the protocol on purpose — a client must reject a masked
+ * frame from the server (RFC 6455 §5.1) and `ws` does, with an error.
+ */
+function serverFrame(opcode: number, payload: Buffer, masked = false): Buffer {
+  assert.ok(payload.byteLength < 126);
+  if (!masked) return Buffer.concat([Buffer.from([0x80 | opcode, payload.byteLength]), payload]);
+  const key = Buffer.from([0x11, 0x22, 0x33, 0x44]);
+  const body = Buffer.from(payload.map((byte, index) => byte ^ key[index % 4]!));
+  return Buffer.concat([Buffer.from([0x80 | opcode, 0x80 | payload.byteLength]), key, body]);
+}
+
+/** Response/stream body frames the fake core received for `id`, as hex, from index `from` of `received` on. */
+function bodyFramesFor(core: FakeCore, id: number, from = 0): string[] {
+  const frames: string[] = [];
+  for (const entry of core.received.slice(from)) {
+    if (!entry.binary) continue;
+    const decoded = decodeBodyFrame(entry.binary);
+    if (decoded?.requestId === id) frames.push(Buffer.from(decoded.payload).toString("hex"));
+  }
+  return frames;
+}
+
+/** k8s channel 1 (stdout) carrying "OLD" / "NEW". */
+const STALE_STDOUT = Buffer.from([0x01, 0x4f, 0x4c, 0x44]);
+const FRESH_STDOUT = Buffer.from([0x01, 0x4e, 0x45, 0x57]);
+
+/**
+ * The setup the late-callback tests share: session 1's stream 1 is open, the
+ * session drops (`#abortAll` closes it, the fake apiserver never answers the
+ * close), and session 2 opens its own stream 1. Returns the index of
+ * `core.received` where session 2's stream starts.
+ */
+async function staleAndFreshStream1(h: Harness, api: FakeStreamApiserver): Promise<number> {
+  await until("the collector has started", () => h.starts === 1);
+  h.core.send({ t: "stropen", id: 1, path: EXEC_PATH, query: "command=sh&stdin=true", protocols: EXEC_PROTOCOLS });
+  await until("session 1's stream 1 is open", () => controlFor(h.core, 1).includes("strok"));
+  h.core.drop();
+  await until("the agent reconnected", () => h.core.sessions === 2 && h.sink!.ready);
+  assert.equal(h.client.streamCount, 0, "the disconnect released session 1's stream");
+  assert.equal(api.socketsClosed, 0, "the apiserver has not answered the close yet");
+  const mark = h.core.received.length;
+  h.core.send({ t: "stropen", id: 1, path: EXEC_PATH, query: "command=bash&stdin=true", protocols: EXEC_PROTOCOLS });
+  await until("session 2's stream 1 is open", () => controlFor(h.core, 1, mark).includes("strok"));
+  assert.equal(api.upgrades.length, 2);
+  return mark;
+}
+
+/** Session 2's stream 1 still carries its OWN output to session 2 (a positive check after the negative ones). */
+async function freshStreamStillFlows(h: Harness, api: FakeStreamApiserver, mark: number): Promise<void> {
+  api.sockets[1]!.write(serverFrame(0x2, FRESH_STDOUT));
+  await until("session 2's stream 1 delivered its own output", () =>
+    bodyFramesFor(h.core, 1, mark).includes(FRESH_STDOUT.toString("hex")),
+  );
+}
+
+test("a late data frame on the PREVIOUS session's stream is not written to the next session's stream with the same id", async () => {
+  // `#abortAll` closed session 1's stream, but until the apiserver answers the
+  // close, frames it already had in flight still arrive and `onFrame` runs
+  // (`UpstreamStream.close()` does not stop reading). Measured on the base
+  // before the session binding: the stale frame went to the socket of the
+  // moment, i.e. into session 2's stream 1.
+  //
+  // `onOpen` cannot fire late (a stream `#abortAll` finds still CONNECTING is
+  // terminated, so it never opens), and a late `onStdinDelivered` would need a
+  // write the kernel holds back until after the drop, which this test cannot
+  // arrange; `onFrame` is the late hook that can be driven deterministically.
+  const api = await fakeStreamApiserver();
+  const kc = await kubeconfigFor(api.url, ["      token: t"]);
+  const h = await harness({ kubeconfig: kc.path });
+  try {
+    const mark = await staleAndFreshStream1(h, api);
+
+    // The stale frame, then the apiserver's answer to the close: `ws` reads
+    // them in order and ends its socket from the close handler, so `ended[0]`
+    // means the stale frame's `onFrame` has run.
+    api.sockets[0]!.write(
+      Buffer.concat([serverFrame(0x2, STALE_STDOUT), serverFrame(0x8, Buffer.from([0x03, 0xe8]))]),
+    );
+    await until("the agent handled session 1's late frame and close", () => api.ended[0] === true);
+    await settle();
+    await freshStreamStillFlows(h, api, mark);
+
+    assert.deepEqual(
+      {
+        session2BodiesForId1: bodyFramesFor(h.core, 1, mark),
+        session2ForId1: controlFor(h.core, 1, mark),
+        streamCount: h.client.streamCount,
+      },
+      {
+        session2BodiesForId1: [FRESH_STDOUT.toString("hex")],
+        session2ForId1: ["strok"],
+        streamCount: 1,
+      },
+      "the previous session's late frame reached the next session's stream 1",
+    );
+  } finally {
+    await h.close();
+    await api.close();
+    await rm(kc.directory, { recursive: true, force: true });
+  }
+});
+
+test("a late upstream ERROR on the PREVIOUS session's stream neither sends `err` to the next session nor removes its stream with the same id", async () => {
+  // A masked server frame is a protocol error: `ws` emits 'error' on the
+  // closing stream, `UpstreamStream` fails it and `onError` runs — after the
+  // next session already opened stream 1.
+  const api = await fakeStreamApiserver();
+  const kc = await kubeconfigFor(api.url, ["      token: t"]);
+  const h = await harness({ kubeconfig: kc.path });
+  try {
+    const mark = await staleAndFreshStream1(h, api);
+
+    api.sockets[0]!.write(serverFrame(0x2, STALE_STDOUT, true));
+    // `ws`'s receiver-error handler ends the socket (`close()` while CLOSING)
+    // and emits 'error' in the same synchronous call, and `UpstreamStream`
+    // runs `onError` from that 'error': the apiserver seeing the end means
+    // `onError` has run.
+    await until("the agent failed session 1's stream", () => api.ended[0] === true);
+    await settle();
+    await freshStreamStillFlows(h, api, mark);
+
+    assert.deepEqual(
+      { session2ForId1: controlFor(h.core, 1, mark), streamCount: h.client.streamCount },
+      { session2ForId1: ["strok"], streamCount: 1 },
+      "the previous session's late onError spoke for, or removed, the next session's stream 1",
+    );
+  } finally {
+    await h.close();
+    await api.close();
+    await rm(kc.directory, { recursive: true, force: true });
+  }
+});
+
+// Not tested, on purpose: `#openStream`'s `finally` deleting its
+// `#openingStreams` entry only if it is still its own. The harm needs the
+// stale handler to reach that `finally` while the next session's `stropen`
+// for the same id is still waiting in `authHeaders()` on a SEPARATE run. With
+// `CredentialCache` that cannot happen: a call made while a run is in flight
+// joins it (both resume in the same microtask flush, no message can land in
+// between), and once the run has settled the stale handler resumes in that
+// same flush, before any new `stropen` is read. The comparison guards a
+// credential source with a gap there (none today); a test would have to
+// invent one.
+
+test("a second `stropen` for an id that is still OPENING in the same session is ignored: one upstream, one `strok`", async () => {
+  // The duplicate-id guard covers `#openingStreams` as well as `#streams`.
+  // Without the first, a duplicate arriving while the first is still in
+  // `authHeaders()` passed the guard, overwrote the first's abort controller
+  // and opened a second upstream for the same id — one of the two then
+  // unaddressable.
+  const plugin = await slowPlugin();
+  const api = await fakeStreamApiserver();
+  const kc = await kubeconfigFor(api.url, plugin.userLines);
+  const h = await harness({ kubeconfig: kc.path });
+  try {
+    await until("the collector has started", () => h.starts === 1);
+    await until("the startup /version read's credential is settled", () => helloSent(h.core));
+    const mark = h.core.received.length;
+
+    await writeFile(plugin.marker, "");
+    h.core.send({ t: "stropen", id: 1, path: EXEC_PATH, query: "command=sh&stdin=true", protocols: EXEC_PROTOCOLS });
+    await until("stream 1 is held at the plugin gate", plugin.parked);
+    h.core.send({ t: "stropen", id: 1, path: EXEC_PATH, query: "command=second", protocols: EXEC_PROTOCOLS });
+    // In-order handling on one socket: the `pong` proves the duplicate was handled.
+    h.core.send({ t: "ping", ts: 7 });
+    await until("the agent answered the ping", () =>
+      h.core.received.slice(mark).some((r) => r.control?.t === "pong"),
+    );
+    assert.equal(plugin.parked(), true, "stream 1 must still be parked when the duplicate is handled");
+    await rm(plugin.marker);
+
+    await until("the plugin run is over", () => plugin.count("W") >= 1 && plugin.idle());
+    // Same barrier as the stream tests above: stream 2 resolves its
+    // credentials after stream 1 (and a duplicate, had it been taken) did.
+    h.core.send({ t: "stropen", id: 2, path: EXEC_PATH, query: "command=true", protocols: EXEC_PROTOCOLS });
+    await until("stream 2 is open", () => controlFor(h.core, 2, mark).includes("strok"));
+    await settle();
+
+    assert.deepEqual(
+      {
+        upgrades: [...api.upgrades],
+        forId1: controlFor(h.core, 1, mark),
+        streamCount: h.client.streamCount,
+      },
+      {
+        upgrades: [`${EXEC_PATH}?command=sh&stdin=true`, `${EXEC_PATH}?command=true`],
+        forId1: ["strok"],
+        streamCount: 2,
+      },
+      "a duplicate `stropen` for an opening id was taken",
+    );
+  } finally {
+    // Release a run still held at the gate, or its process outlives the test.
+    await rm(plugin.marker, { force: true });
+    await h.close();
+    await api.close();
+    await rm(kc.directory, { recursive: true, force: true });
+    await rm(plugin.directory, { recursive: true, force: true });
   }
 });
 
