@@ -282,6 +282,56 @@ export function openStreamSocket(
 }
 
 /**
+ * The close codes a WebSocket endpoint may SEND (RFC 6455 §7.4): `ws` throws a
+ * `TypeError` synchronously for any other one. 1004 is reserved, and 1005,
+ * 1006 and 1015 are codes a receiver reports and a sender never writes.
+ */
+function isSendableCloseCode(code: number): boolean {
+  return (
+    Number.isInteger(code) &&
+    ((code >= 1000 && code <= 1014 && code !== 1004 && code !== 1005 && code !== 1006) ||
+      (code >= 3000 && code <= 4999))
+  );
+}
+
+/** The longest close reason a close frame can carry: 125 payload bytes minus the 2-byte code. */
+const MAX_CLOSE_REASON_BYTES = 123;
+
+/**
+ * The code the agent closes an upstream stream with when it was asked for
+ * `code`: `code` itself when a sender may write it, 1000 otherwise.
+ *
+ * I12 (12.10.2026): the code and reason of `strclose` come from the control
+ * plane, and the wire schema only says "an integer" and "a string". Measured
+ * on the base: a `strclose` with code 1005 — what a WebSocket reports when the
+ * peer sent no code, and so exactly what a core forwarding a browser's close
+ * would pass on — made `ws.close()` throw inside the tunnel's message handler,
+ * an uncaught exception that took the whole agent process down. A reason over
+ * 123 bytes throws the same way (a `RangeError`). Nothing the wire accepts may
+ * crash the agent; the stream still closes, with the closest thing it can send.
+ */
+export function upstreamCloseCode(code: number): number {
+  return isSendableCloseCode(code) ? code : 1000;
+}
+
+/**
+ * `reason` cut to the bytes a close frame can carry, on a UTF-8 character
+ * boundary: a cut in the middle of a multi-byte character would hand the
+ * apiserver an invalid UTF-8 close reason, which RFC 6455 tells it to treat as
+ * a protocol error.
+ */
+export function upstreamCloseReason(reason: string | undefined): string | undefined {
+  if (reason === undefined) return undefined;
+  const bytes = Buffer.from(reason, "utf8");
+  if (bytes.byteLength <= MAX_CLOSE_REASON_BYTES) return reason;
+  let end = MAX_CLOSE_REASON_BYTES;
+  // Back off while the byte at the cut is a continuation byte (10xxxxxx): the
+  // character it belongs to started before the cut and would be split.
+  while (end > 0 && ((bytes[end] ?? 0) & 0xc0) === 0x80) end -= 1;
+  return bytes.subarray(0, end).toString("utf8");
+}
+
+/**
  * Elle el sıkışmanın başarısız kolu — ws'in kendi `abortHandshake`ının sade
  * karşılığı: soketi kopar, `error` yay ki `UpstreamStream`ın `error`
  * dinleyicisi çözülsün.
@@ -484,7 +534,12 @@ export class UpstreamStream {
       this.#socket.terminate();
       return;
     }
-    this.#socket.close(code, reason);
+    // See `upstreamCloseCode` for why the code and reason are not passed through as given.
+    const sendable = upstreamCloseCode(code);
+    if (sendable !== code) {
+      console.warn(`[agent] stream close code ${code} cannot be sent on a WebSocket; closing the upstream with ${sendable}`);
+    }
+    this.#socket.close(sendable, upstreamCloseReason(reason));
   }
 
   #fail(failure: TunnelFailure): void {
