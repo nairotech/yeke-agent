@@ -19,24 +19,18 @@ import {
 import {
   AGENT_CLUSTER_HEADER,
   AGENT_TOKEN_HEADER,
-  CreditWindow,
   MAX_REQUEST_BODY_BYTES,
-  RESPONSE_CREDIT_WINDOW_BYTES,
   SAMPLE_FRAME_REQUEST_ID,
   SAMPLE_MIN_PROTOCOL_VERSION,
   TUNNEL_LIVENESS_TIMEOUT_MS,
   TUNNEL_PING_INTERVAL_MS,
   TUNNEL_PROTOCOL_VERSION,
   decodeBodyFrame,
-  describeFailure,
-  encodeBodyFrame,
   parseControlMessage,
-  serializeControlMessage,
   type ControlMessage,
   type HelloMessage,
   type RequestMessage,
   type StreamOpenMessage,
-  type TunnelFailure,
 } from "@nairotech/yeke-tunnel";
 import type { AgentConfig } from "./config.js";
 import { failureOf } from "./failure.js";
@@ -51,6 +45,7 @@ import { Collector, shouldCollect } from "./metrics/collector.js";
 import { KubeletClient } from "./metrics/kubelet-client.js";
 import type { InternalFrame, SampleSink } from "./metrics/types.js";
 import { SampleEncoder } from "./metrics/wire.js";
+import { type IdRecord, RequestRecord, StreamRecord, TunnelSession } from "./session.js";
 import { UpstreamStream } from "./stream.js";
 
 /**
@@ -200,91 +195,9 @@ const STRIPPED_REQUEST_HEADERS = new Set([
 // plane; stdin: control plane → agent) and lives in `@nairotech/yeke-tunnel`. Had
 // the waiting rule ("credit > 0", not "credit ≥ chunk") existed in two copies,
 // the day they diverged the result would have been a permanent deadlock —
-// visible only when a chunk larger than the window arrived.
-
-interface InFlight {
-  abort: AbortController;
-  /** Remaining credit for this request's response body. */
-  credit: CreditWindow;
-  /**
-   * `res` has gone out: the apiserver answered and the body is flowing (or
-   * about to). From here on the request is no longer WAITING for anything the
-   * agent could give it sooner, which is what `SampleWire.busy` asks about.
-   */
-  responding: boolean;
-}
-
-/**
- * The buffer that collects one request's body.
- *
- * It exists to close a race: the `req` control message and the body frames are
- * delivered by separate 'message' events, usually in separate IO turns. If the
- * request handler read the body as "whatever I have right now", large bodies
- * would come out truncated or empty almost every time. So the handler waits here
- * until `reqend` arrives — the wait is not a latency guess but the end signal
- * the protocol declares explicitly.
- *
- * Kept as a list of chunks (not a single Buffer): the protocol allows the body
- * to be split into N frames, and streaming request bodies will take the same
- * path later.
- */
-class RequestBody {
-  #chunks: Buffer[] = [];
-  #bytes = 0;
-  #state: "open" | "complete" | "aborted" | "overflow" = "open";
-  #wake: (() => void) | null = null;
-
-  get state(): "open" | "complete" | "aborted" | "overflow" {
-    return this.#state;
-  }
-
-  push(chunk: Buffer): void {
-    if (this.#state !== "open") return;
-    this.#bytes += chunk.byteLength;
-    if (this.#bytes > MAX_REQUEST_BODY_BYTES) {
-      // A request over the limit will be rejected anyway; drop what was
-      // collected immediately so a compromised control plane cannot inflate the
-      // agent's memory.
-      this.#chunks = [];
-      this.#settle("overflow");
-      return;
-    }
-    this.#chunks.push(chunk);
-  }
-
-  /** `reqend`: the body is complete. */
-  complete(): void {
-    this.#settle("complete");
-  }
-
-  /** Cancellation or a dropped connection: discard the half buffer, wake the waiter. */
-  abort(): void {
-    this.#chunks = [];
-    this.#settle("aborted");
-  }
-
-  /** Waits until the body closes (complete/aborted/over the limit). */
-  wait(): Promise<void> {
-    if (this.#state !== "open") return Promise.resolve();
-    return new Promise((resolve) => {
-      this.#wake = resolve;
-    });
-  }
-
-  take(): Buffer {
-    const body = Buffer.concat(this.#chunks);
-    this.#chunks = [];
-    return body;
-  }
-
-  #settle(state: "complete" | "aborted" | "overflow"): void {
-    if (this.#state !== "open") return;
-    this.#state = state;
-    const wake = this.#wake;
-    this.#wake = null;
-    wake?.();
-  }
-}
+// visible only when a chunk larger than the window arrived. The agent's copies
+// of the window, and the request body buffer, live on the per-id records in
+// `session.ts` (`RequestRecord`), next to the session that owns them.
 
 /**
  * How many internal frames share one wire frame.
@@ -498,33 +411,22 @@ class SampleWire implements SampleSink {
 export class TunnelClient {
   #config: AgentConfig;
   #target: KubeTarget | null = null;
-  #socket: WebSocket | null = null;
-  #inFlight = new Map<number, InFlight>();
-  #requestBodies = new Map<number, RequestBody>();
   /**
-   * Open v4 streams; the id space is shared with requests (the control plane splits it).
+   * The session of the socket `#connect` opened last — `null` before the
+   * first attempt. Possibly already ended: between a 'close' and the next
+   * attempt it is the session that just finished.
    *
-   * Holds only the CURRENT session's streams: `#abortAll` clears it when a
-   * session ends, and a stream's own late callbacks remove it only while the
-   * entry is still that very stream (see `#openStream`). That is what lets
-   * `#onBodyFrame` and the `credit` branch look a stream up by id alone.
+   * Read ONLY by what is agent-wide by nature: the diagnostic counters, the
+   * sample sink (whose frames go to whichever session is open, see
+   * `SampleWire`) and `stop()`. Everything the control plane addressed by id —
+   * requests, streams, their buffers and abort controllers — and everything a
+   * session negotiated (`welcome.protocol`) lives on the `TunnelSession` that
+   * carried it, and a handler holds that session (or its own record), never
+   * this field. Until 12.10.2026 that state was four id-keyed maps here and a
+   * `#send` whose default target was "the socket of the moment"; the four
+   * failures that came out of it are the header of `session.ts`.
    */
-  #streams = new Map<number, UpstreamStream>();
-  /**
-   * Streams between `stropen` and their upstream socket existing, i.e. still in
-   * `await target.authHeaders()`. The controller is how `cancel`/`strclose` and
-   * `#abortAll` reach a stream that `#streams` cannot show yet (see
-   * `#openStream`).
-   */
-  #openingStreams = new Map<number, AbortController>();
-  /**
-   * The negotiated version reported by the control plane (`welcome.protocol`).
-   *
-   * If the field is absent the peer is a v3 control plane and 3 is the correct
-   * assumption: treating the unknown as 4 would mean trying to send stream
-   * frames to a v3 peer.
-   */
-  #protocol = 0;
+  #session: TunnelSession | null = null;
   /**
    * Delay before the next reconnect attempt — exponential, reset only on a
    * CONFIRMED registration.
@@ -552,9 +454,6 @@ export class TunnelClient {
    */
   #backoff: number;
   #stopped = false;
-  /** When the last message was received from the control plane; the sole criterion for the keepalive decision. */
-  #lastSeenAt = Date.now();
-  #liveness: NodeJS.Timeout | null = null;
   readonly #createCollector: CollectorFactory;
   readonly #sampleWire: SampleWire;
   /**
@@ -638,15 +537,19 @@ export class TunnelClient {
     this.#backoff = config.reconnectMinMs;
     this.#createCollector = hooks.createCollector ?? inClusterCollector;
     this.#sampleWire = new SampleWire({
-      isOpen: () => this.#socket?.readyState === WebSocket.OPEN,
-      protocol: () => this.#protocol,
-      hasUserRequest: () => {
-        for (const flight of this.#inFlight.values()) if (!flight.responding) return true;
-        return false;
-      },
-      sendMessage: (message) => this.#send(message),
-      sendFrame: (payload) => this.#sendBody(SAMPLE_FRAME_REQUEST_ID, payload),
+      isOpen: () => this.#session?.live ?? false,
+      protocol: () => this.#session?.protocol ?? 0,
+      hasUserRequest: () => this.#session?.hasWaitingRequest() ?? false,
+      sendMessage: (message) => this.#session?.send(message),
+      sendFrame: (payload) => this.#session?.sendBody(SAMPLE_FRAME_REQUEST_ID, payload),
     });
+  }
+
+  /** How many of the current session's records satisfy `which`; 0 when there is no session. */
+  #count(which: (record: IdRecord) => boolean): number {
+    let found = 0;
+    for (const record of this.#session?.records() ?? []) if (which(record)) found += 1;
+    return found;
   }
 
   /**
@@ -655,22 +558,27 @@ export class TunnelClient {
    * leak buffers.
    */
   get pendingBodyCount(): number {
-    return this.#requestBodies.size;
+    return this.#count((record) => record instanceof RequestRecord && record.body !== undefined);
   }
 
   /** Diagnostic: requests waiting to be applied to the apiserver, or in progress. */
   get inFlightCount(): number {
-    return this.#inFlight.size;
+    return this.#count((record) => record instanceof RequestRecord);
   }
 
   /** Diagnostic: streams open to the apiserver (so a leak can be measured from the outside). */
   get streamCount(): number {
-    return this.#streams.size;
+    return this.#count((record) => record instanceof StreamRecord && record.upstream !== undefined);
   }
 
-  /** Diagnostic: the negotiated tunnel version reported by the control plane. */
+  /**
+   * Diagnostic: the negotiated tunnel version the current session's `welcome`
+   * reported — 0 between sessions and before `welcome`, since the number
+   * belongs to the session, not to the agent.
+   */
   get protocolVersion(): number {
-    return this.#protocol;
+    const session = this.#session;
+    return session && !session.ended ? session.protocol : 0;
   }
 
   /** Diagnostic: sample frames written to the wire, and frames the encoder refused. */
@@ -689,14 +597,16 @@ export class TunnelClient {
 
   async stop(): Promise<void> {
     this.#stopped = true;
-    this.#stopLiveness();
-    this.#abortAll();
+    // The session first: every request, stream and timer it holds stops here,
+    // and from now on no message that still arrives on its socket starts
+    // anything new (see the 'message' handler in `#connect`).
+    this.#session?.end();
     // Before the target closes: the collector's watches and kubelet reads go
     // through it, and stopping them after its dispatcher is gone would produce
     // a burst of connection errors on the way out.
     await this.#collector?.stop();
     this.#collector = undefined;
-    this.#socket?.close();
+    this.#session?.socket.close();
     await this.#target?.close();
   }
 
@@ -810,14 +720,18 @@ export class TunnelClient {
       // option was also set.
       ...(coreCa ? { ca: [...defaultCoreCaCertificates(), ...coreCa.ca] } : {}),
     });
-    this.#socket = socket;
+    // One session per socket, created before any of its events can fire: every
+    // handler below closes over THIS session, never over `this.#session`, which
+    // will name a different session after the next reconnect.
+    const session = new TunnelSession(socket);
+    this.#session = session;
 
     socket.on("open", async () => {
       // `#backoff` is NOT reset here — see its own comment. `open` proves
       // only the TCP+TLS handshake; the reset waits for `welcome`.
       console.log("[agent] core connection opened");
-      this.#lastSeenAt = Date.now();
-      this.#startLiveness(socket);
+      session.lastSeenAt = Date.now();
+      this.#startLiveness(session);
       // K15 (architecture decision §3.15): the sha256 fingerprints of the
       // ROOTS this very connection's `ca` option carries — read from `coreCa`
       // above, the local binding `#loadCoreCaForConnect` just refreshed for
@@ -873,41 +787,45 @@ export class TunnelClient {
       // The `/version` read above is the one await in this handler, and it
       // can outlive the session it was started for: a slow exec credential
       // plugin or an apiserver that does not answer holds it while the socket
-      // drops and `#connect` opens the next one. `#send`'s default target is
-      // the socket OF THE MOMENT, so without this check the stale handler's
-      // `hello` landed on the NEXT session — measured: that session received
-      // two `hello` messages. Core's handler (`case "hello"` in its
+      // drops and `#connect` opens the next one. Before 12.10.2026 the write
+      // went to the socket OF THE MOMENT, so the stale handler's `hello`
+      // landed on the NEXT session — measured: that session received two
+      // `hello` messages. Core's handler (`case "hello"` in its
       // `tunnel/session.ts`) applies every one it gets: it overwrites the
       // session's k8s version and `coreCaRoots`, records the agent version
       // and answers with another `welcome` — so the stale one relabelled the
-      // new session with the old one's CA roots and k8s version. That is the same rule the
-      // streams follow (#14, see `#send`): a message is written only to the
-      // session it belongs to, because core keys its per-session state (ids,
-      // labels) on the session that carried it. The session this `hello`
-      // belongs to is the local `socket`, so it goes there and nowhere else.
-      // Nothing is lost by dropping it: that socket is closed, and the
-      // session that replaced it builds and sends its own `hello` from its
-      // own `open`. Logged because the one visible trace of a /version read
-      // that took longer than a session would otherwise be nothing at all.
-      if (this.#socket !== socket || socket.readyState !== WebSocket.OPEN) {
+      // new session with the old one's CA roots and k8s version. A message is
+      // written only to the session it belongs to, because core keys its
+      // per-session state (ids, labels) on the session that carried it; this
+      // `hello` belongs to the `session` this handler closes over, and
+      // `session.send` cannot reach any other socket. The check below only
+      // adds the log line: nothing is lost by dropping the `hello` (that
+      // socket is closed, and the session that replaced it builds and sends
+      // its own from its own `open`), but the one visible trace of a /version
+      // read that took longer than a session would otherwise be nothing at all.
+      if (!session.live) {
         console.warn("[agent] session closed before its hello was sent; not sending it");
         return;
       }
-      this.#send(hello, socket);
+      session.send(hello);
     });
 
     socket.on("message", (data, isBinary) => {
+      // A session the agent has already given up on (the liveness check,
+      // `stop()`) or whose socket is closing starts nothing new: a `req` read
+      // in that gap used to reach the apiserver — measured, a watch applied
+      // after `stop()` had begun — with nobody left to read its answer.
+      if (!session.live) return;
       // The criterion is "any message", not "pong": the control plane's `ping`,
       // its `req` or its `credit` — each of them is proof that it is alive.
-      this.#lastSeenAt = Date.now();
-      if (isBinary) this.#onBodyFrame(data as Buffer);
-      else this.#onControl(data, socket);
+      session.lastSeenAt = Date.now();
+      if (isBinary) this.#onBodyFrame(data as Buffer, session);
+      else this.#onControl(data, session);
     });
 
     socket.on("close", (code, reason) => {
       console.warn(`[agent] connection closed (${code}) ${reason.toString()}`);
-      this.#stopLiveness();
-      this.#cleanupAfterDisconnect();
+      this.#cleanupAfterDisconnect(session);
       this.#scheduleReconnect();
     });
 
@@ -938,35 +856,32 @@ export class TunnelClient {
    * would never be triggered either. `terminate()` produces the 'close' event
    * immediately, so the existing reconnect/backoff logic engages through its
    * normal path.
+   *
+   * The session is ended BEFORE the socket is terminated: the decision that it
+   * is dead is the moment it is over, and the messages `ws` may still emit
+   * between `terminate()` and 'close' are dropped by the 'message' handler
+   * instead of starting work nobody will read. The timer is the session's
+   * (`TunnelSession.own`), so it cannot outlive it either.
    */
-  #startLiveness(socket: WebSocket): void {
-    this.#stopLiveness();
-    this.#liveness = setInterval(() => {
-      if (Date.now() - this.#lastSeenAt <= TUNNEL_LIVENESS_TIMEOUT_MS) return;
+  #startLiveness(session: TunnelSession): void {
+    const timer = setInterval(() => {
+      if (Date.now() - session.lastSeenAt <= TUNNEL_LIVENESS_TIMEOUT_MS) return;
       console.warn(
         `[agent] core silent for ${TUNNEL_LIVENESS_TIMEOUT_MS} ms; connection considered dead`,
       );
-      socket.terminate();
+      session.end();
+      session.socket.terminate();
     }, TUNNEL_PING_INTERVAL_MS);
-    this.#liveness.unref();
+    timer.unref();
+    session.own(timer);
   }
 
-  #stopLiveness(): void {
-    if (this.#liveness) clearInterval(this.#liveness);
-    this.#liveness = null;
-  }
-
-  #cleanupAfterDisconnect(): void {
-    // Open requests belong to this session; when the control plane reconnects it
-    // re-establishes the watches from scratch, so cancelling all of them is the
-    // correct behaviour.
-    this.#abortAll();
-    // The negotiated version belongs to the SESSION, not to the agent. Left
-    // standing, it would answer for the next peer before that peer has spoken —
-    // and a reconnect onto an older control plane (a rollback, a load balancer
-    // with two versions behind it) would then be handed sample frames it cannot
-    // read. Zero is the honest value until the next `welcome`.
-    this.#protocol = 0;
+  #cleanupAfterDisconnect(session: TunnelSession): void {
+    // Open requests and streams belong to this session; when the control plane
+    // reconnects it re-establishes the watches from scratch, so stopping all of
+    // them is the correct behaviour. The negotiated version goes with the
+    // session object: the next session starts at 0 until its own `welcome`.
+    session.end();
     // Aliases are connection-local (see `SampleEncoder`): the next session's
     // first frame carries the dictionary in full.
     this.#sampleWire.sessionEnded();
@@ -990,9 +905,9 @@ export class TunnelClient {
    * cluster without monitoring; a tunnel that cannot start is an unmanageable
    * cluster, and the second is not an acceptable price for the first.
    */
-  async #startCollector(): Promise<void> {
+  async #startCollector(session: TunnelSession): Promise<void> {
     if (!this.#config.metricsEnabled) return;
-    if (!shouldCollect(this.#protocol)) return;
+    if (!shouldCollect(session.protocol)) return;
     if (this.#collectorStarting) return;
     // A reconnect. The collector outlived the session on purpose (see the field
     // below), so there is nothing to start — but there IS a ring holding
@@ -1024,36 +939,12 @@ export class TunnelClient {
       }
       collector.start();
       this.#collector = collector;
-      console.log(`[metrics] collector started (control plane protocol v${this.#protocol})`);
+      console.log(`[metrics] collector started (control plane protocol v${session.protocol})`);
     } catch (err) {
       console.error(`[metrics] collector not started: ${(err as Error).message}`);
     } finally {
       this.#collectorStarting = false;
     }
-  }
-
-  /**
-   * Releases every open request and body buffer.
-   *
-   * Handlers waiting on a body are woken up via `RequestBody.abort()`; otherwise
-   * they would wait forever for a `reqend` that will never come, leaking both
-   * the buffer and their own completion.
-   */
-  #abortAll(): void {
-    for (const { abort } of this.#inFlight.values()) abort.abort();
-    this.#inFlight.clear();
-    for (const body of this.#requestBodies.values()) body.abort();
-    this.#requestBodies.clear();
-    // Streams close as well: when the tunnel drops, the control plane cannot
-    // **resume** that session (exec has no `resync`), and a pty left open on the
-    // apiserver side would be a process nobody is reading.
-    for (const stream of this.#streams.values()) stream.close(1001, "tunnel disconnected");
-    this.#streams.clear();
-    // A stream still resolving its credentials is aborted, not merely
-    // forgotten: `#openStream` checks the signal after `authHeaders()` and does
-    // not open upstream at all (nothing would ever read that pty).
-    for (const abort of this.#openingStreams.values()) abort.abort();
-    this.#openingStreams.clear();
   }
 
   #scheduleReconnect(): void {
@@ -1064,50 +955,19 @@ export class TunnelClient {
   }
 
   /**
-   * Writes a control message to `session` — by default the socket of the
-   * moment. A stream passes the session it was opened on instead (see
-   * `#openStream`): a socket that has closed never becomes OPEN again (a
-   * reconnect is a new `WebSocket`), so whatever a finished session's stream
-   * still has to say is dropped here rather than landing on the next session.
+   * D3 (12.10.2026): a `req`/`stropen` for an id this session already holds —
+   * as a request OR as a stream — is not taken (`TunnelSession.claim`), and
+   * nothing goes on the wire for it: the closed failure code set has no
+   * "duplicate id" branch, and adding one would be a wire change for a message
+   * a correct control plane never sends. The line is the operator's only
+   * trace that it happened.
    */
-  #send(message: ControlMessage, session: WebSocket | null = this.#socket): void {
-    if (session?.readyState === WebSocket.OPEN) {
-      session.send(serializeControlMessage(message));
-    }
+  #ignoreDuplicate(kind: "req" | "stropen", id: number): void {
+    console.warn(`[agent] ${kind} for id ${id} ignored: this session already has a request or stream with that id`);
   }
 
-  /** Same session rule as `#send`. */
-  #sendBody(requestId: number, payload: Uint8Array, session: WebSocket | null = this.#socket): void {
-    if (session?.readyState === WebSocket.OPEN) {
-      session.send(encodeBodyFrame(requestId, payload));
-    }
-  }
-
-  /**
-   * Writes the failure to the wire and drops **the same line** into the agent's
-   * own stdout.
-   *
-   * Both jobs in one place because if they are separated one of them gets
-   * forgotten: a failure written to the wire but not to the log is invisible to
-   * the operator running `kubectl logs yeke-agent` — and that visibility was the
-   * only legitimate function of the `message` field removed in that round. The
-   * line is English and machine-readable (`describeFailure`): its reader is the
-   * operator of the customer's cluster, not the user in front of the interface
-   * (see "Conventions" in README.md).
-   *
-   * Most branches also write a more detailed English line at their own point
-   * (the credential plugin family, for example); the line here is not a record
-   * of that detail but of "what went on the wire".
-   *
-   * `session` follows `#send`'s rule: a stream names the session it belongs to.
-   */
-  #fail(id: number, failure: TunnelFailure, session: WebSocket | null = this.#socket): void {
-    console.warn(`[agent] request ${id} failed: ${describeFailure(failure)}`);
-    this.#send({ t: "err", id, ...failure }, session);
-  }
-
-  /** `session` is the socket the message arrived on: a stream is bound to it (see `#openStream`). */
-  #onControl(raw: RawData, session: WebSocket): void {
+  /** `session` is the session the message arrived on; every record it creates belongs to it. */
+  #onControl(raw: RawData, session: TunnelSession): void {
     let message: ControlMessage;
     try {
       message = parseControlMessage(raw.toString());
@@ -1118,6 +978,18 @@ export class TunnelClient {
 
     switch (message.t) {
       case "welcome":
+        // A session applies ONE `welcome`. Core answers each `hello` with one,
+        // and the agent sends one `hello` per session (#16); a second one would
+        // otherwise rewrite the negotiated version under the session's feet
+        // (measured: a second `welcome` with `protocol: 4` turned the sample
+        // sink off on a v5 session) and re-run the collector's resume path.
+        if (session.welcomed) {
+          console.warn(
+            `[agent] a second welcome on one session ignored (session=${message.sessionId} protocol=v${message.protocol ?? 3})`,
+          );
+          break;
+        }
+        session.welcomed = true;
         // Independent finding, 15.09.2026: the backoff reset lives HERE, not
         // in `#connect`'s `open` handler — see `#backoff`'s own comment for
         // why. `welcome` is the one message that proves core accepted this
@@ -1125,110 +997,102 @@ export class TunnelClient {
         // opening) meant a control plane that rejects every `hello` never
         // saw the exponential curve engage at all.
         this.#backoff = this.#config.reconnectMinMs;
-        // No `protocol` means the peer is a v3 control plane (it never sends the field).
-        this.#protocol = message.protocol ?? 3;
+        // No `protocol` means the peer is a v3 control plane (it never sends
+        // the field), and 3 is the correct assumption: treating the unknown as
+        // 4 would mean trying to send stream frames to a v3 peer.
+        session.protocol = message.protocol ?? 3;
         console.log(
-          `[agent] registered — cluster=${message.clusterId} session=${message.sessionId} protocol=v${this.#protocol}`,
+          `[agent] registered — cluster=${message.clusterId} session=${message.sessionId} protocol=v${session.protocol}`,
         );
         // The handshake is the ONLY place this decision is made: the collector
         // spends the customer's CPU and their kubelets' capacity, and a peer
         // that cannot read `sample` would drop every frame of it in silence.
-        void this.#startCollector();
+        void this.#startCollector(session);
         break;
       case "req": {
-        // Both the body buffer and the abort controller are registered **here**,
-        // before the handler starts. In the time it takes the handler to reach
-        // its first await, a body frame or a `cancel` may arrive; had the
-        // registrations been on that side, the body would be orphaned and the
-        // `cancel` would be lost, leaving a watch on the apiserver that never
-        // closes.
-        const abort = new AbortController();
-        // The window opens implicitly together with `req`: both ends know
-        // RESPONSE_CREDIT_WINDOW_BYTES, so there is no opening round trip.
-        const credit = new CreditWindow(RESPONSE_CREDIT_WINDOW_BYTES);
-        const flight: InFlight = { abort, credit, responding: false };
-        this.#inFlight.set(message.id, flight);
-        if (message.hasBody) this.#requestBodies.set(message.id, new RequestBody());
-        // The entry itself is passed to the handler as a parameter: even if
-        // `cancel` removes it from the map, the reference the handler holds
-        // stays valid, so an `undefined` check cannot silently degrade into an
-        // unbounded stream — and `responding` is set on THIS request's entry,
-        // never on a later session's request that reuses the id.
-        void this.#handleRequest(message, flight);
+        // The record — body buffer, abort controller, credit window — is
+        // registered **here**, before the handler starts. In the time it takes
+        // the handler to reach its first await, a body frame or a `cancel` may
+        // arrive; had the registration been on that side, the body would be
+        // orphaned and the `cancel` would be lost, leaving a watch on the
+        // apiserver that never closes. The record itself is what the handler
+        // holds, so `responding` is set on THIS request, never on a later
+        // session's request that reuses the id.
+        const record = session.claim(message.id, (owner) => new RequestRecord(owner, message.id, message.hasBody));
+        if (!record) {
+          this.#ignoreDuplicate("req", message.id);
+          break;
+        }
+        void this.#handleRequest(message, record);
         break;
       }
-      case "reqend":
-        this.#requestBodies.get(message.id)?.complete();
-        break;
-      case "cancel": {
-        this.#inFlight.get(message.id)?.abort.abort();
-        this.#inFlight.delete(message.id);
-        // A handler waiting on the body is woken up; a half buffer that never
-        // reached a handler is dropped here too (so nothing leaks).
-        this.#requestBodies.get(message.id)?.abort();
-        this.#requestBodies.delete(message.id);
-        // `cancel` can also arrive with a stream id (the id space is shared):
-        // cancelling a stream means closing its upstream socket — or, if it is
-        // still resolving its credentials, never opening one.
-        this.#closeStream(message.id, 1000, "cancelled");
+      case "reqend": {
+        const record = session.lookup(message.id);
+        if (record instanceof RequestRecord) record.body?.complete();
         break;
       }
-      case "credit": {
+      case "cancel":
+        // Either kind (the id space is shared): a request is aborted and its
+        // half buffer dropped; a stream's upstream socket is closed — or, if it
+        // is still resolving its credentials, never opened. Either way the
+        // control plane has forgotten the id, and the record stops speaking.
+        session.lookup(message.id)?.stop(1000, "cancelled");
+        break;
+      case "credit":
         // An id with no record is dropped silently: the late credit of a
         // cancelled request must not open a new window. In v4 the same message
         // also arrives for the stdout/stderr direction of a stream — that it
         // does not state a direction is by design: credit is always granted by
-        // the **receiver**. Looking the stream up by id alone is safe because
-        // `#streams` holds only this session's streams (see its comment).
-        this.#inFlight.get(message.id)?.credit.grant(message.bytes);
-        this.#streams.get(message.id)?.grantCredit(message.bytes);
+        // the **receiver**. The lookup is in the session the credit arrived on,
+        // which holds nothing of any other session.
+        session.lookup(message.id)?.grantCredit(message.bytes);
         break;
-      }
       case "stropen": {
         // Registered HERE, before the handler starts, for the same reason as
         // `req` above: the handler's first await is `authHeaders()`, which an
         // abort cannot interrupt, and a `cancel`/`strclose` arriving meanwhile
-        // must find something to abort — `#streams` has no entry until the
-        // upstream socket exists.
-        //
-        // A duplicate id is ignored, and the check covers a stream still
-        // opening as well as an open one: two handlers racing for one id would
-        // leave one upstream socket nobody can address.
-        if (this.#streams.has(message.id) || this.#openingStreams.has(message.id)) break;
-        const abort = new AbortController();
-        this.#openingStreams.set(message.id, abort);
-        void this.#openStream(message, abort, session);
+        // must find something to stop even though no upstream socket exists
+        // yet. A duplicate id — a stream still opening, an open one, or a
+        // request — is ignored: two handlers racing for one id would leave one
+        // upstream socket nobody can address.
+        const record = session.claim(message.id, (owner) => new StreamRecord(owner, message.id));
+        if (!record) {
+          this.#ignoreDuplicate("stropen", message.id);
+          break;
+        }
+        void this.#openStream(message, record);
         break;
       }
       case "strclose": {
-        this.#closeStream(message.id, message.code ?? 1000, message.reason);
+        const record = session.lookup(message.id);
+        if (record instanceof StreamRecord) record.stop(message.code ?? 1000, message.reason);
         break;
       }
       case "ping":
-        this.#send({ t: "pong", ts: message.ts });
+        session.send({ t: "pong", ts: message.ts });
         break;
       default:
         break;
     }
   }
 
-  #onBodyFrame(frame: Buffer): void {
+  #onBodyFrame(frame: Buffer, session: TunnelSession): void {
     const decoded = decodeBodyFrame(frame);
     if (!decoded) return;
+    const record = session.lookup(decoded.requestId);
     // If it is a stream id, the payload is written straight to the apiserver:
     // its first byte is k8s's channel byte and the agent does **not** interpret
     // it (the one exception being the half-close gate, see
-    // `UpstreamStream.write`). By id alone, as in the `credit` branch:
-    // `#streams` holds only this session's streams.
-    const stream = this.#streams.get(decoded.requestId);
-    if (stream) {
-      stream.write(decoded.payload);
+    // `UpstreamStream.write`). A stream still resolving its credentials has no
+    // upstream yet, and the frame is dropped, as it always was.
+    if (record instanceof StreamRecord) {
+      record.upstream?.write(decoded.payload);
       return;
     }
     // Ids with no record are dropped silently: a late frame of a cancelled or
     // rejected request must not create a new map entry — in v1 that left buffers
     // that were never collected.
-    this.#requestBodies.get(decoded.requestId)?.push(decoded.payload);
+    if (record instanceof RequestRecord) record.body?.push(decoded.payload);
   }
 
   /**
@@ -1242,45 +1106,42 @@ export class TunnelClient {
    * impersonation headers are both carried and enforced on the WS upgrade
    * request.
    *
-   * A stream belongs to ONE session, the `session` its `stropen` arrived on,
-   * and every message it ever sends goes to that socket only. Stream ids are
-   * per session, exactly like request ids (the control plane allocates them
-   * from 1 again on every connection, in the same id space; see
-   * `#handleRequest`'s `finally`), and a stream can outlive its session in two
-   * ways:
+   * The stream belongs to ONE session, the one its `stropen` arrived on, and
+   * every message it ever sends goes through its `record` — so to that
+   * session's socket only, and only while the control plane still waits for
+   * the id. Stream ids are per session, exactly like request ids (the control
+   * plane allocates them from 1 again on every connection, in the same id
+   * space), and a stream can outlive what it was opened for in three ways,
+   * each of them measured as a failure before the record existed:
    *
-   *  - Still opening: `await target.authHeaders()` cannot be interrupted (an
-   *    exec plugin runs to completion), so the session may drop, and even the
-   *    next one connect, before it returns. Measured before this rule: the
-   *    stale handler then opened the exec upgrade on the apiserver, put the
-   *    stream into the next session's `#streams` and sent that session `strok`
-   *    (or `err`) for an id it had never allocated — a pty nobody reads.
-   *  - Open: `#abortAll` closes it, but the upstream close completes later, and
-   *    its `onClose`/`onError` run then. Deleting by id would remove the next
-   *    session's stream that reuses the id, and `this.#socket` would by then
-   *    be the next session's socket.
+   *  - Still opening when the session drops: `await target.authHeaders()`
+   *    cannot be interrupted (an exec plugin runs to completion), so the next
+   *    session may already be connected when it returns. The stale handler
+   *    used to open the exec upgrade on the apiserver, put the stream into
+   *    the next session's map and send that session `strok` (or `err`) for an
+   *    id it had never allocated — a pty nobody reads.
+   *  - Open when the session drops: the session ends the stream, but the
+   *    upstream close completes later, and its `onClose`/`onError` run then;
+   *    deleting by id removed the next session's stream that reused the id,
+   *    and "the socket of the moment" was by then the next session's.
+   *  - Cancelled by the control plane (`cancel`/`strclose`) while its upstream
+   *    WebSocket was still in its handshake: `ws` reports that as an error,
+   *    and the agent answered with `err` for the id core had just forgotten.
    *
-   * The same holds within one session for the cancellation race: a
-   * `cancel`/`strclose` that arrives while the stream is still resolving its
-   * credentials aborts `abort` (registered by the `stropen` branch). After
-   * `authHeaders()` an aborted stream — or one whose session is no longer open
-   * — is NOT opened upstream, and no `err` is sent either: the control plane
-   * has already forgotten the id.
+   * After `authHeaders()` a record that is no longer `live` is NOT opened
+   * upstream, and nothing is sent for it: the control plane has forgotten the
+   * id, or its session is gone.
    */
-  async #openStream(
-    message: StreamOpenMessage,
-    abort: AbortController,
-    session: WebSocket,
-  ): Promise<void> {
+  async #openStream(message: StreamOpenMessage, record: StreamRecord): Promise<void> {
     const { id } = message;
     try {
       const target = this.#target;
       if (!target) {
-        this.#fail(id, { code: "NO_TARGET", params: {} }, session);
+        record.fail({ code: "NO_TARGET", params: {} });
         return;
       }
       if (!isAllowedPath(message.path)) {
-        this.#fail(id, { code: "PATH_NOT_ALLOWED", params: { path: message.path } }, session);
+        record.fail({ code: "PATH_NOT_ALLOWED", params: { path: message.path } });
         return;
       }
       if (message.protocols.length === 0) {
@@ -1288,7 +1149,7 @@ export class TunnelClient {
         // here too because a stream opened with an empty list would fall back to
         // the unversioned `channel.k8s.io` and the failure would surface months
         // later as "exit codes are always 0".
-        this.#fail(id, { code: "STREAM_PROTOCOL_REQUIRED", params: {} }, session);
+        record.fail({ code: "STREAM_PROTOCOL_REQUIRED", params: {} });
         return;
       }
 
@@ -1304,10 +1165,10 @@ export class TunnelClient {
         // during an exec refresh, so `tlsOptions()` is read AFTER it (the same
         // rule as the dispatcher in `#handleRequest`).
         Object.assign(headers, await target.authHeaders());
-        // The one await is behind us; see the doc comment. From here to
-        // `#streams.set` everything is synchronous, so no `cancel` and no
-        // disconnect can slip in between this check and the registration.
-        if (abort.signal.aborted || session.readyState !== WebSocket.OPEN) return;
+        // The one await is behind us; see the doc comment. From here to the
+        // `upstream` assignment everything is synchronous, so no `cancel` and
+        // no disconnect can slip in between this check and the registration.
+        if (!record.live) return;
         const tls = target.tlsOptions();
 
         // `https:` → `wss:`. Rather than writing the scheme by hand we derive it
@@ -1316,34 +1177,34 @@ export class TunnelClient {
         const url = `${base}${message.path}${message.query ? `?${message.query}` : ""}`;
 
         // The hooks only ever run from the upstream socket's events, never
-        // during construction, so `stream` is assigned by the time they read it.
-        const stream: UpstreamStream = new UpstreamStream(
+        // during construction. Each one writes through `record`, so a hook that
+        // runs after the record stopped (a late frame, a late close or error)
+        // writes nothing and needs no guard of its own.
+        record.upstream = new UpstreamStream(
           { url, protocols: [...message.protocols], headers, tls },
           {
-            onOpen: (protocol) => this.#send({ t: "strok", id, protocol }, session),
-            onFrame: (frame) => this.#sendBody(id, frame, session),
-            onStdinDelivered: (bytes) => this.#send({ t: "credit", id, bytes }, session),
+            onOpen: (protocol) => record.send({ t: "strok", id, protocol }),
+            onFrame: (frame) => record.sendBody(frame),
+            onStdinDelivered: (bytes) => record.send({ t: "credit", id, bytes }),
             onClose: (code, reason) => {
-              this.#forgetStream(id, stream);
-              this.#send({ t: "strclose", id, code, reason }, session);
+              record.send({ t: "strclose", id, code, reason });
+              record.finish();
             },
             onError: (failure) => {
-              this.#forgetStream(id, stream);
-              this.#fail(id, failure, session);
+              record.fail(failure);
+              record.finish();
             },
           },
         );
-        this.#streams.set(id, stream);
       } catch (err) {
-        // Not dead code, and not the same check as the one after the await:
-        // the only throw that can arrive here with the signal already aborted
-        // is `authHeaders()` REJECTING after a `cancel`/`strclose`/disconnect
-        // (the plugin failed or timed out while the control plane gave up on
-        // the id). Everything after the post-await check is synchronous, so a
-        // throw from `tlsOptions()` or the constructor arrives un-aborted. The
-        // control plane has forgotten this id (or its session is gone), so
-        // there is nobody to tell.
-        if (abort.signal.aborted) return;
+        // `record.fail` writes nothing for a record that is no longer `live`,
+        // which is the case this `catch` used to need its own abort check for:
+        // `authHeaders()` REJECTING after a `cancel`/`strclose`/disconnect (the
+        // plugin failed or timed out while the control plane gave up on the
+        // id). Everything after the post-await check is synchronous, so a
+        // throw from `tlsOptions()` or the constructor arrives with the record
+        // still live and is reported.
+        //
         // The only way to land here is identity resolution and TLS material
         // (`authHeaders`, `tlsOptions`): the socket does not exist yet. Identity
         // failures arrive already typed as `AgentFailure` and pass through AS IS —
@@ -1355,73 +1216,37 @@ export class TunnelClient {
         // printed "what the socket reported:" — while no socket had reported
         // anything. The comment was right, nobody read it; a truth without a gate
         // is violated sooner or later.
-        this.#fail(
-          id,
+        record.fail(
           failureOf(err, (detail) => ({
             code: "EXEC_UPGRADE_UNREACHABLE",
             params: { origin: "node", detail },
           })),
-          session,
         );
       }
     } finally {
-      // Only OUR registration: by now `#abortAll` may have cleared it and the
-      // next session's `stropen` may have registered the same id.
-      if (this.#openingStreams.get(id) === abort) this.#openingStreams.delete(id);
+      // A stream that never got an upstream is over here (rejected, failed, or
+      // stopped while opening). One that did is over when its upstream closes
+      // or fails, or when it is stopped.
+      if (!record.upstream) record.finish();
     }
   }
 
-  /**
-   * Removes `stream` from `#streams` only if the entry is still that stream: a
-   * late callback of a stream `#abortAll` already closed must not remove the
-   * next session's stream that reuses its id (see `#openStream`).
-   */
-  #forgetStream(id: number, stream: UpstreamStream): void {
-    if (this.#streams.get(id) === stream) this.#streams.delete(id);
-  }
-
-  /**
-   * The control plane closes (`strclose`) or cancels (`cancel`) a stream. The
-   * lookups by id are safe here: this runs on a message of the current
-   * session, and both maps hold only the current session's entries.
-   */
-  #closeStream(id: number, code: number, reason?: string): void {
-    // Still resolving its credentials: there is no socket to close yet, so the
-    // abort is what keeps `#openStream` from opening one.
-    const opening = this.#openingStreams.get(id);
-    if (opening) {
-      opening.abort();
-      this.#openingStreams.delete(id);
-    }
-    const stream = this.#streams.get(id);
-    if (!stream) return;
-    this.#streams.delete(id);
-    stream.close(code, reason);
-  }
-
-  async #handleRequest(
-    req: RequestMessage,
-    flight: InFlight,
-  ): Promise<void> {
-    const { abort, credit } = flight;
-    // This handler's own body buffer, taken before the first await — the same
-    // moment the `req` branch registered it. See the `finally` for why the
-    // cleanup compares against it instead of deleting by id.
-    const ownBody = this.#requestBodies.get(req.id);
-    const target = this.#target;
-    if (!target) {
-      this.#rejectRequest(req, { code: "NO_TARGET", params: {} });
-      return;
-    }
-
-    if (!isAllowedPath(req.path)) {
-      // Defense in depth: even if the control plane is compromised, the agent
-      // only goes to apiserver paths.
-      this.#rejectRequest(req, { code: "PATH_NOT_ALLOWED", params: { path: req.path } });
-      return;
-    }
-
+  async #handleRequest(req: RequestMessage, record: RequestRecord): Promise<void> {
+    const { credit, signal } = record;
     try {
+      const target = this.#target;
+      if (!target) {
+        record.fail({ code: "NO_TARGET", params: {} });
+        return;
+      }
+
+      if (!isAllowedPath(req.path)) {
+        // Defense in depth: even if the control plane is compromised, the agent
+        // only goes to apiserver paths.
+        record.fail({ code: "PATH_NOT_ALLOWED", params: { path: req.path } });
+        return;
+      }
+
       const headers: Record<string, string> = {};
       for (const [key, value] of Object.entries(req.headers)) {
         if (!STRIPPED_REQUEST_HEADERS.has(key.toLowerCase())) headers[key] = value;
@@ -1449,16 +1274,14 @@ export class TunnelClient {
       // apiserver means the apiserver treats it as an empty body and returns
       // 400 — that is, silent data loss.
       let payload: Buffer | undefined;
-      if (req.hasBody) {
-        const body = ownBody;
-        // No buffer means the request was cancelled before we took it over; the
-        // control plane has long forgotten this id, so there is no point sending
-        // an error either.
-        if (!body) return;
+      const body = record.body;
+      if (body) {
         await body.wait();
-        if (body.state === "aborted" || abort.signal.aborted) return;
+        // Cancelled or disconnected while waiting: the control plane has
+        // forgotten this id, so there is no point sending an error either.
+        if (body.state === "aborted" || !record.live) return;
         if (body.state === "overflow") {
-          this.#fail(req.id, {
+          record.fail({
             code: "BODY_TOO_LARGE",
             params: { maxBytes: MAX_REQUEST_BODY_BYTES },
           });
@@ -1480,7 +1303,7 @@ export class TunnelClient {
         headers: finalHeaders,
         body: payload,
         dispatcher: target.dispatcher,
-        signal: abort.signal,
+        signal,
         // Watches and `logs -f` flow indefinitely; we disable undici's default timeouts.
         headersTimeout: 0,
         bodyTimeout: 0,
@@ -1503,10 +1326,10 @@ export class TunnelClient {
         responseHeaders[key] = Array.isArray(value) ? value.join(", ") : String(value);
       }
 
-      this.#send({ t: "res", id: req.id, status: response.statusCode, headers: responseHeaders });
+      record.send({ t: "res", id: req.id, status: response.statusCode, headers: responseHeaders });
       // From here the request is a flowing response, not a queued one: it no
       // longer makes the sample sink `busy` (see `SampleWire`).
-      flight.responding = true;
+      record.responding = true;
 
       // Response-body flow control is applied here. Because the `await` is
       // inside the loop, `for await` is suspended when credit runs out; undici
@@ -1514,60 +1337,40 @@ export class TunnelClient {
       // way to the apiserver. We do not take the chunk into memory and count it
       // as "sent" — no buffer is displaced, production really stops.
       for await (const chunk of response.body) {
-        if (abort.signal.aborted) break;
+        if (!record.live) break;
         const payload = chunk as Uint8Array;
-        await credit.wait(abort.signal);
-        // The session may have been cancelled or dropped while waiting; leave
-        // without trying to write to a closed one.
-        if (abort.signal.aborted) break;
+        await credit.wait(signal);
+        // The request may have been cancelled, or its session dropped, while
+        // waiting; leave without trying to write to a closed one.
+        if (!record.live) break;
         credit.consume(payload.byteLength);
-        this.#sendBody(req.id, payload);
+        record.sendBody(payload);
       }
 
-      if (!abort.signal.aborted) this.#send({ t: "end", id: req.id });
+      record.send({ t: "end", id: req.id });
     } catch (err) {
-      if (!abort.signal.aborted) {
-        // The fallback branch is `UPSTREAM_ERROR` and `detail` is undici's/Node's
-        // OWN text. The agent's own diagnostic sentence cannot enter here: the
-        // failures the agent knows about (the identity family) arrive typed as
-        // `AgentFailure` and `failureOf` passes them through untouched.
-        this.#fail(
-          req.id,
-          failureOf(err, (detail) => ({ code: "UPSTREAM_ERROR", params: { detail } })),
-        );
-      }
+      // The fallback branch is `UPSTREAM_ERROR` and `detail` is undici's/Node's
+      // OWN text. The agent's own diagnostic sentence cannot enter here: the
+      // failures the agent knows about (the identity family) arrive typed as
+      // `AgentFailure` and `failureOf` passes them through untouched. A request
+      // that was cancelled or whose session ended writes nothing (`record.fail`).
+      record.fail(failureOf(err, (detail) => ({ code: "UPSTREAM_ERROR", params: { detail } })));
     } finally {
-      // Whichever way we leave (success, upstream error, cancellation) the
-      // records are released here; late frames now land on an unregistered id.
+      // Whichever way we leave (success, upstream error, rejection,
+      // cancellation) the record is released here; late frames now land on an
+      // unregistered id.
       //
-      // Only OUR records, though. Request ids are per session — the control
-      // plane allocates them from 1 again on every connection — and this
-      // handler can outlive its session: `#abortAll` aborts it, but an abort
-      // cannot interrupt `await target.authHeaders()` (an exec plugin runs to
-      // completion). When it finally gets here, the id may already belong to
-      // the NEXT session's request; deleting by id alone would erase that
-      // request's entry (it drops out of `busy`/`inFlightCount`) and its body
-      // buffer (its `reqend` lands nowhere and it never gets an answer).
-      // Streams share the id space and the same hazard; see `#openStream`.
-      if (this.#inFlight.get(req.id)?.abort === abort) this.#inFlight.delete(req.id);
-      if (this.#requestBodies.get(req.id) === ownBody) this.#requestBodies.delete(req.id);
+      // Only THIS record, and only in its own session. Request ids are per
+      // session — the control plane allocates them from 1 again on every
+      // connection — and this handler can outlive its session: the session's
+      // end aborts it, but an abort cannot interrupt `await
+      // target.authHeaders()` (an exec plugin runs to completion). Before the
+      // records (#12, 12.10.2026) this `finally` deleted by id from maps that
+      // outlived sessions, and erased the NEXT session's request that reused
+      // the id (it dropped out of `busy`/`inFlightCount`, and its `reqend`
+      // landed nowhere). `finish()` releases from `record.session`, by
+      // identity, so it cannot reach another session's request at all.
+      record.finish();
     }
-  }
-
-  /**
-   * The request was rejected before being applied. Body frames may still be in
-   * flight, so we close the buffer and delete the records: the remaining frames
-   * land on an unregistered id and `reqend` is not orphaned either.
-   *
-   * Deleting by id is safe HERE, unlike in `#handleRequest`'s `finally`: both
-   * callers run before that handler's first await, i.e. in the same turn the
-   * `req` branch registered the records, so the id cannot belong to anyone else
-   * yet.
-   */
-  #rejectRequest(req: RequestMessage, failure: TunnelFailure): void {
-    this.#inFlight.delete(req.id);
-    this.#requestBodies.get(req.id)?.abort();
-    this.#requestBodies.delete(req.id);
-    this.#fail(req.id, failure);
   }
 }

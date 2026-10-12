@@ -283,7 +283,15 @@ interface Harness {
 }
 
 async function harness(
-  options: { protocol?: number | undefined; metricsEnabled?: boolean; kubeconfig?: string } = {},
+  options: {
+    protocol?: number | undefined;
+    metricsEnabled?: boolean;
+    kubeconfig?: string;
+    /** What the fake collector's `stop()` waits for; a test that needs `stop()` held open passes a gate. */
+    collectorStop?: () => Promise<void>;
+    /** Fields a test overrides on top of the harness's own config (the lifecycle timeouts). */
+    config?: Partial<AgentConfig>;
+  } = {},
 ): Promise<Harness> {
   // `kubeconfig`: a test that needs a REAL (fake) apiserver or a credential
   // plugin passes its own file; everything else keeps the unreachable one.
@@ -298,6 +306,7 @@ async function harness(
     reconnectMaxMs: 50,
     kubeletInsecureTls: false,
     metricsEnabled: options.metricsEnabled ?? true,
+    ...options.config,
   };
 
   const state = { sink: undefined as SampleSink | undefined, starts: 0, stops: 0, queued: 0, flushes: 0 };
@@ -309,6 +318,7 @@ async function harness(
       },
       stop: async () => {
         state.stops += 1;
+        await options.collectorStop?.();
       },
       get queuedFrames() {
         return state.queued;
@@ -870,7 +880,8 @@ interface FakeStreamApiserver {
   close(): Promise<void>;
 }
 
-async function fakeStreamApiserver(): Promise<FakeStreamApiserver> {
+/** `holdUpgrade`: the apiserver reads the upgrade request and never answers it, so the agent's upstream stays CONNECTING. */
+async function fakeStreamApiserver(options: { readonly holdUpgrade?: boolean } = {}): Promise<FakeStreamApiserver> {
   const upgrades: string[] = [];
   const sockets: Duplex[] = [];
   const ended: boolean[] = [];
@@ -897,6 +908,7 @@ async function fakeStreamApiserver(): Promise<FakeStreamApiserver> {
     socket.on("close", () => {
       socketsClosed += 1;
     });
+    if (options.holdUpgrade) return;
     const accept = createHash("sha1")
       .update(`${String(req.headers["sec-websocket-key"])}258EAFA5-E914-47DA-95CA-C5AB0DC85B11`)
       .digest("base64");
@@ -2492,3 +2504,281 @@ test("a session that DID register (received welcome) and later drops keeps recon
   }
 });
 
+
+// ─── Session ownership (`TunnelSession`, 12.10.2026) ─────────────────────────
+//
+// Each test below was first run against the code before `session.ts` (base
+// 4751dc7) and failed there; the failure it reproduced is named in the test.
+// The invariants they pin are listed in `session.ts`'s header: a message goes
+// only to the session it belongs to, a record is changed only by its owner,
+// nothing is written for an id the control plane has forgotten, one id is one
+// record, a session the agent has given up on starts nothing new.
+
+/** Messages on one socket are handled in order: once the `pong` is back, everything sent before the `ping` was handled too. */
+async function handled(core: FakeCore, ts: number): Promise<void> {
+  const mark = core.received.length;
+  core.send({ t: "ping", ts });
+  await until(`the agent answered ping ${ts}`, () =>
+    core.received.slice(mark).some((r) => r.control?.t === "pong" && r.control.ts === ts),
+  );
+}
+
+/** Captures `console.warn` lines until `restore()`. */
+function warnLines(): { readonly lines: string[]; restore(): void } {
+  const lines: string[] = [];
+  const original = console.warn;
+  console.warn = (...args: unknown[]) => void lines.push(args.join(" "));
+  return {
+    lines,
+    restore() {
+      console.warn = original;
+    },
+  };
+}
+
+test("a duplicate `req` id in one session is ignored: the apiserver sees one request, and after a drop nothing of it reaches the next session", async () => {
+  // Base: a second `req` for id 1 overwrote the first one's entry, so the
+  // first handler was never aborted; after the drop its watch went on writing
+  // into session 2 under an id session 2 never allocated (and `stop()` then
+  // waited on it).
+  const responses: ServerResponse[] = [];
+  const api = await fakeApiserver((_req, res) => {
+    responses.push(res);
+    res.writeHead(200, { "content-type": "application/json" });
+    res.write(`${JSON.stringify({ type: "ADDED", n: responses.length })}\n`);
+  });
+  const kc = await kubeconfigFor(api.url, ["      token: t"]);
+  const h = await harness({ kubeconfig: kc.path });
+  try {
+    await until("the collector has started", () => h.starts === 1);
+    h.core.send({ t: "req", id: 1, method: "GET", path: "/api/v1/pods", query: "watch=true&copy=1", headers: {}, hasBody: false });
+    await until("the first watch is flowing", () => bodyBytesFor(h.core, 1) > 0);
+    h.core.send({ t: "req", id: 1, method: "GET", path: "/api/v1/pods", query: "watch=true&copy=2", headers: {}, hasBody: false });
+    h.core.send({ t: "req", id: 1, method: "GET", path: "/api/v1/pods", query: "watch=true&copy=3", headers: {}, hasBody: false });
+    await handled(h.core, 11);
+    await settle();
+    assert.equal(h.client.inFlightCount, 1);
+
+    h.core.drop();
+    await until("the agent reconnected", () => h.core.sessions === 2 && h.sink!.ready);
+    await until("the drop closed the first watch", () => api.closed >= 1);
+    const mark = h.core.received.length;
+    // The apiserver emits one more event on every watch still open: only a
+    // watch nobody stopped can carry it to the wire.
+    for (const res of responses) if (!res.destroyed) res.write(`${JSON.stringify({ type: "MODIFIED" })}\n`);
+    await settle();
+    await settle();
+
+    assert.deepEqual(
+      { seen: [...api.seen], closed: api.closed, session2ForId1: bodyFramesFor(h.core, 1, mark) },
+      { seen: ["GET /api/v1/pods?watch=true&copy=1"], closed: 1, session2ForId1: [] },
+      "a duplicate `req` was applied, or its watch outlived the session",
+    );
+  } finally {
+    await api.close();
+    await h.close();
+    await rm(kc.directory, { recursive: true, force: true });
+  }
+});
+
+test("one id is one record across kinds: a `req` for an open stream's id and a `stropen` for a pending request's id are both ignored", async () => {
+  // Base: the `stropen` duplicate check looked only at streams and the `req`
+  // branch had none, so the apiserver was asked for both; body frames, `credit`
+  // and `cancel` for the id would then reach two records.
+  const api = await fakeStreamApiserver();
+  const kc = await kubeconfigFor(api.url, ["      token: t"]);
+  const h = await harness({ kubeconfig: kc.path });
+  try {
+    await until("the collector has started", () => h.starts === 1);
+    h.core.send({ t: "stropen", id: 1, path: EXEC_PATH, query: "command=sh", protocols: EXEC_PROTOCOLS });
+    await until("stream 1 is open", () => controlFor(h.core, 1).includes("strok"));
+    // A request still waiting for its body holds id 2.
+    h.core.send({ t: "req", id: 2, method: "PATCH", path: "/api/v1/namespaces/default/configmaps/x", headers: {}, hasBody: true });
+    await until("request 2 is in flight", () => h.client.inFlightCount === 1);
+    const mark = h.core.received.length;
+
+    h.core.send({ t: "req", id: 1, method: "GET", path: "/api/v1/pods", headers: {}, hasBody: false });
+    h.core.send({ t: "stropen", id: 2, path: EXEC_PATH, query: "command=second", protocols: EXEC_PROTOCOLS });
+    await handled(h.core, 12);
+    await settle();
+    // Stream 1 is still the stream it was.
+    api.sockets[0]!.write(serverFrame(0x2, FRESH_STDOUT));
+    await until("stream 1 still delivers its own output", () =>
+      bodyFramesFor(h.core, 1, mark).includes(FRESH_STDOUT.toString("hex")),
+    );
+
+    assert.deepEqual(
+      {
+        upgrades: [...api.upgrades],
+        forId1: controlFor(h.core, 1, mark),
+        forId2: controlFor(h.core, 2, mark),
+        inFlight: h.client.inFlightCount,
+        streams: h.client.streamCount,
+      },
+      { upgrades: [`${EXEC_PATH}?command=sh`], forId1: [], forId2: [], inFlight: 1, streams: 1 },
+      "a second record was taken for an id that already had one of the other kind",
+    );
+  } finally {
+    await h.close();
+    await api.close();
+    await rm(kc.directory, { recursive: true, force: true });
+  }
+});
+
+for (const kind of ["cancel", "strclose"] as const) {
+  test(`a \`${kind}\` while the stream's upstream WebSocket is still in its handshake abandons the handshake and writes nothing for the forgotten id`, async () => {
+    // Base: `close()` on a CONNECTING socket terminates it, `ws` reports
+    // "WebSocket was closed before the connection was established" as an
+    // error, and the agent answered core with `err` (EXEC_UPGRADE_UNREACHABLE)
+    // for the id it had just forgotten — plus a "request 1 failed" line.
+    const api = await fakeStreamApiserver({ holdUpgrade: true });
+    const kc = await kubeconfigFor(api.url, ["      token: t"]);
+    const h = await harness({ kubeconfig: kc.path });
+    const warns = warnLines();
+    try {
+      await until("the collector has started", () => h.starts === 1);
+      const mark = h.core.received.length;
+      h.core.send({ t: "stropen", id: 1, path: EXEC_PATH, query: "command=sh", protocols: EXEC_PROTOCOLS });
+      await until("the apiserver holds the upgrade (upstream CONNECTING)", () => api.upgrades.length === 1);
+      h.core.send(kind === "cancel" ? { t: "cancel", id: 1 } : { t: "strclose", id: 1, code: 1000 });
+      await handled(h.core, 13);
+      // `ended`, not `socketsClosed`: the apiserver's upgraded socket is
+      // half-open by Node's default, so the agent ending its side is what shows.
+      await until("the agent abandoned the handshake", () => api.ended[0] === true);
+      await settle();
+      warns.restore();
+
+      assert.deepEqual(
+        {
+          forId1: controlFor(h.core, 1, mark),
+          failedLines: warns.lines.filter((line) => line.includes("request 1 failed")),
+          streams: h.client.streamCount,
+        },
+        { forId1: [], failedLines: [], streams: 0 },
+        `the agent spoke for a stream \`${kind}\`led in its handshake`,
+      );
+    } finally {
+      warns.restore();
+      await h.close();
+      await api.close();
+      await rm(kc.directory, { recursive: true, force: true });
+    }
+  });
+}
+
+test("a session drop while a stream's upstream is still in its handshake releases it without logging a failure nobody will hear about", async () => {
+  // Base: the drop closed the CONNECTING upstream, `ws` reported it as an
+  // error, and the agent logged "request 1 failed: EXEC_UPGRADE_UNREACHABLE
+  // ... WebSocket was closed before the connection was established" — for a
+  // stream the agent had torn down itself.
+  const api = await fakeStreamApiserver({ holdUpgrade: true });
+  const kc = await kubeconfigFor(api.url, ["      token: t"]);
+  const h = await harness({ kubeconfig: kc.path });
+  const warns = warnLines();
+  try {
+    await until("the collector has started", () => h.starts === 1);
+    h.core.send({ t: "stropen", id: 1, path: EXEC_PATH, query: "command=sh", protocols: EXEC_PROTOCOLS });
+    await until("the apiserver holds the upgrade", () => api.upgrades.length === 1);
+    h.core.drop();
+    await until("the agent reconnected", () => h.core.sessions === 2 && h.sink!.ready);
+    await until("the drop abandoned the handshake", () => api.ended[0] === true);
+    await settle();
+    warns.restore();
+    assert.deepEqual(warns.lines.filter((line) => line.includes("request 1 failed")), []);
+  } finally {
+    warns.restore();
+    await h.close();
+    await api.close();
+    await rm(kc.directory, { recursive: true, force: true });
+  }
+});
+
+test("after core's `strclose` of an open stream, the apiserver's late output and its close are not echoed for the forgotten id", async () => {
+  // Base: `UpstreamStream.close()` does not stop reading, so a frame the
+  // apiserver already had in flight still went out as a body frame for id 1,
+  // and the upstream's close was echoed back as `strclose` — both for an id
+  // core had forgotten.
+  const api = await fakeStreamApiserver();
+  const kc = await kubeconfigFor(api.url, ["      token: t"]);
+  const h = await harness({ kubeconfig: kc.path });
+  try {
+    await until("the collector has started", () => h.starts === 1);
+    h.core.send({ t: "stropen", id: 1, path: EXEC_PATH, query: "command=sh", protocols: EXEC_PROTOCOLS });
+    await until("stream 1 is open", () => controlFor(h.core, 1).includes("strok"));
+    const mark = h.core.received.length;
+    h.core.send({ t: "strclose", id: 1, code: 1000 });
+    await handled(h.core, 14);
+    // The apiserver: one stdout frame already in flight, then its answer to
+    // the close, then its side of the TCP connection.
+    api.sockets[0]!.write(Buffer.concat([serverFrame(0x2, STALE_STDOUT), serverFrame(0x8, Buffer.from([0x03, 0xe8]))]));
+    await until("the agent handled the late frame and the close", () => api.ended[0] === true);
+    api.sockets[0]!.end();
+    await until("the upstream socket is closed", () => api.socketsClosed >= 1);
+    await settle();
+
+    assert.deepEqual(
+      { control: controlFor(h.core, 1, mark), bodies: bodyFramesFor(h.core, 1, mark) },
+      { control: [], bodies: [] },
+      "the agent wrote for a stream core had already closed",
+    );
+  } finally {
+    await h.close();
+    await api.close();
+    await rm(kc.directory, { recursive: true, force: true });
+  }
+});
+
+test("a second `welcome` on one session is ignored: the negotiated version stays, the sink stays on, the collector is not resumed again", async () => {
+  // Base: every `welcome` was applied — a second one with `protocol: 4`
+  // turned the sample sink off on a v5 session, and one with `protocol: 5`
+  // ran the reconnect path (`collector resumed`, a flush) without a reconnect.
+  const h = await harness();
+  try {
+    await until("the collector has started", () => h.starts === 1);
+    const flushes = h.flushes;
+    h.core.send({ t: "welcome", clusterId: "cluster-1", sessionId: "again", protocol: 5 });
+    h.core.send({ t: "welcome", clusterId: "cluster-1", sessionId: "older", protocol: 4 });
+    await handled(h.core, 15);
+    await settle();
+    assert.deepEqual(
+      { protocol: h.client.protocolVersion, ready: h.sink!.ready, flushes: h.flushes },
+      { protocol: 5, ready: true, flushes },
+    );
+  } finally {
+    await h.close();
+  }
+});
+
+test("once `stop()` has begun, a `req` that still arrives on the session is not applied", async () => {
+  // Base: `stop()` aborted what it held, then awaited the collector with the
+  // socket still open and read — a watch sent in that window reached the
+  // apiserver (and answered `res`) after shutdown had begun.
+  const api = await fakeApiserver((_req, res) => {
+    res.writeHead(200, { "content-type": "application/json" });
+    res.write("{}\n");
+  });
+  const kc = await kubeconfigFor(api.url, ["      token: t"]);
+  let releaseStop: (() => void) | undefined;
+  const stopGate = new Promise<void>((resolve) => {
+    releaseStop = resolve;
+  });
+  const h = await harness({ kubeconfig: kc.path, collectorStop: () => stopGate });
+  try {
+    await until("the collector has started", () => h.starts === 1);
+    const stopping = h.client.stop();
+    await until("stop() is waiting on the collector", () => h.stops === 1);
+    h.core.send({ t: "req", id: 5, method: "GET", path: "/api/v1/pods", query: "watch=true", headers: {}, hasBody: false });
+    await settle();
+    await settle();
+    const seen = [...api.seen];
+    const forId5 = controlFor(h.core, 5);
+    releaseStop!();
+    await stopping;
+    assert.deepEqual({ seen, forId5 }, { seen: [], forId5: [] }, "a request was applied after shutdown began");
+  } finally {
+    releaseStop?.();
+    await api.close();
+    await h.core.close();
+    await rm(kc.directory, { recursive: true, force: true });
+  }
+});
