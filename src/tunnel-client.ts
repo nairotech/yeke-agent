@@ -1241,6 +1241,10 @@ export class TunnelClient {
     abort: AbortController,
     credit: CreditWindow,
   ): Promise<void> {
+    // This handler's own body buffer, taken before the first await — the same
+    // moment the `req` branch registered it. See the `finally` for why the
+    // cleanup compares against it instead of deleting by id.
+    const ownBody = this.#requestBodies.get(req.id);
     const target = this.#target;
     if (!target) {
       this.#rejectRequest(req, { code: "NO_TARGET", params: {} });
@@ -1283,7 +1287,7 @@ export class TunnelClient {
       // 400 — that is, silent data loss.
       let payload: Buffer | undefined;
       if (req.hasBody) {
-        const body = this.#requestBodies.get(req.id);
+        const body = ownBody;
         // No buffer means the request was cancelled before we took it over; the
         // control plane has long forgotten this id, so there is no point sending
         // an error either.
@@ -1367,10 +1371,19 @@ export class TunnelClient {
         );
       }
     } finally {
-      this.#inFlight.delete(req.id);
       // Whichever way we leave (success, upstream error, cancellation) the
-      // buffer is released here; late frames now land on an unregistered id.
-      this.#requestBodies.delete(req.id);
+      // records are released here; late frames now land on an unregistered id.
+      //
+      // Only OUR records, though. Request ids are per session — the control
+      // plane allocates them from 1 again on every connection — and this
+      // handler can outlive its session: `#abortAll` aborts it, but an abort
+      // cannot interrupt `await target.authHeaders()` (an exec plugin runs to
+      // completion). When it finally gets here, the id may already belong to
+      // the NEXT session's request; deleting by id alone would erase that
+      // request's entry (it drops out of `busy`/`inFlightCount`) and its body
+      // buffer (its `reqend` lands nowhere and it never gets an answer).
+      if (this.#inFlight.get(req.id)?.abort === abort) this.#inFlight.delete(req.id);
+      if (this.#requestBodies.get(req.id) === ownBody) this.#requestBodies.delete(req.id);
     }
   }
 
@@ -1378,6 +1391,11 @@ export class TunnelClient {
    * The request was rejected before being applied. Body frames may still be in
    * flight, so we close the buffer and delete the records: the remaining frames
    * land on an unregistered id and `reqend` is not orphaned either.
+   *
+   * Deleting by id is safe HERE, unlike in `#handleRequest`'s `finally`: both
+   * callers run before that handler's first await, i.e. in the same turn the
+   * `req` branch registered the records, so the id cannot belong to anyone else
+   * yet.
    */
   #rejectRequest(req: RequestMessage, failure: TunnelFailure): void {
     this.#inFlight.delete(req.id);
