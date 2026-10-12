@@ -19,6 +19,7 @@ import {
 import {
   AGENT_CLUSTER_HEADER,
   AGENT_TOKEN_HEADER,
+  HELLO_CORE_CA_ROOTS_MAX,
   MAX_REQUEST_BODY_BYTES,
   SAMPLE_FRAME_REQUEST_ID,
   SAMPLE_MIN_PROTOCOL_VERSION,
@@ -127,18 +128,16 @@ function sameRootFingerprintSet(a: readonly string[], b: readonly string[]): boo
 }
 
 /**
- * The ceiling `hello.coreCaRoots` (K15) can carry on the wire — a LOCAL
- * mirror of `HelloMessage.coreCaRoots`'s `z.array(...).max(16)` in
- * `packages/tunnel/src/tunnel.ts` (architecture decision §3.15: "en çok 16
- * öğe"). Not read from the installed package: this repository is pinned to
- * `@nairotech/yeke-tunnel` 5.0.0 (`boundary.test.ts`'s exact-version gate),
- * and 5.0.0's `HelloMessage` schema does not have `coreCaRoots` at all — the
- * 5.1.0 release that adds it had not reached the registry when this
- * constant was written (see the architecture decision's release order,
- * §5). Once the pin moves to 5.1.0 this MAY be readable from the package's
- * own schema instead of duplicated here; until then, drifting silently from
- * the wire's real limit is the failure mode a duplicated constant risks, so
- * this comment is the cross-reference that catches it.
+ * The ceiling `hello.coreCaRoots` (K15) can carry on the wire
+ * (architecture decision §3.15: "en çok 16 öğe").
+ *
+ * Read from the installed contract (`HELLO_CORE_CA_ROOTS_MAX`, the same
+ * constant behind `HelloMessage.coreCaRoots`'s `.max()`). When this was first
+ * written the repository was pinned to `@nairotech/yeke-tunnel` 5.0.0, whose
+ * schema had no `coreCaRoots` at all, so the value was a local mirror with
+ * this comment as its only cross-reference. The pin has been 5.1.0 since
+ * 16.09.2026 (`c0e69c5`); the mirror — and the drift it risked — went on
+ * 12.10.2026.
  *
  * Independent finding, 15.09.2026: with more roots loaded than this, the
  * agent sent a `coreCaRoots` array over the cap and core rejected the whole
@@ -150,7 +149,7 @@ function sameRootFingerprintSet(a: readonly string[], b: readonly string[]): boo
  * predates the field — see the `open` handler) rather than send something
  * the wire will not accept.
  */
-const CORE_CA_HELLO_ROOTS_LIMIT = 16;
+const CORE_CA_HELLO_ROOTS_LIMIT = HELLO_CORE_CA_ROOTS_MAX;
 
 /**
  * How long the `/version` read behind `hello.kubernetesVersion` may take
@@ -812,32 +811,19 @@ export class TunnelClient {
       // and that is the correct fallback — sending the array anyway is the
       // independent finding this comment's neighbour constant fixes.
       //
-      // `@nairotech/yeke-tunnel` stays pinned to 5.0.0 in this repository's
-      // package.json for this change: the 5.1.0 release that adds
-      // `coreCaRoots` to `HelloMessage`'s zod schema is published from the
-      // monorepo separately and had not reached the registry yet when this
-      // landed (see the architecture decision's release order, §5) — bumping
-      // the pin here ahead of that publish would make `pin: the installed
-      // contract is the pinned version` in `boundary.test.ts` fail against
-      // whatever 5.1.0 happens to resolve to locally. Nothing about SENDING
-      // the field depends on the installed package's schema: on the wire,
-      // `serializeControlMessage` is a plain `JSON.stringify` with no
-      // validation on the way out (only `parseControlMessage`, on the
-      // RECEIVING side, strips unknown keys — irrelevant here, core is the
-      // receiver and core's copy of the schema does know the field), and
-      // `JSON.stringify` itself drops a property whose value is `undefined`
-      // — exactly the mechanism `kubernetesVersion` below already relies on,
-      // and now `coreCaRoots` does too when it is left out. The one real
-      // obstacle is TypeScript: 5.0.0's `HelloMessage` type has no
-      // `coreCaRoots` property, so an object literal passed straight to
-      // `#send(message: ControlMessage)` would fail an excess-property check.
-      // Resolved in the narrowest way available — an explicit intersection
-      // type on this local `hello` binding, not `as any`/`as unknown as` —
-      // so TypeScript still checks every OTHER field of this object against
-      // the real 5.0.0 shape; only the one additive field is exempted, and by
-      // name.
+      // Leaving the field OUT relies on `serializeControlMessage` being a
+      // plain `JSON.stringify` (no validation on the way out), which drops a
+      // property whose value is `undefined` — the mechanism `kubernetesVersion`
+      // below relies on as well.
+      //
+      // History (corrected 12.10.2026): this field first shipped while the
+      // repository was still pinned to `@nairotech/yeke-tunnel` 5.0.0, whose
+      // `HelloMessage` type had no `coreCaRoots`, and this binding carried an
+      // explicit intersection type to get past the excess-property check. The
+      // pin has been 5.1.0 since 16.09.2026 (`c0e69c5`), whose `HelloMessage`
+      // has the field, so the binding is the plain contract type again.
       const coreCaRootFingerprints = coreCa?.roots.map((root) => root.fingerprint256);
-      const hello: HelloMessage & { readonly coreCaRoots?: readonly string[] } = {
+      const hello: HelloMessage = {
         t: "hello",
         protocol: TUNNEL_PROTOCOL_VERSION,
         agentVersion: AGENT_VERSION,

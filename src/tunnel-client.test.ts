@@ -109,11 +109,13 @@ interface Received {
    * ran it through the installed `@nairotech/yeke-tunnel` zod schema and
    * STRIPPED whatever field that schema does not know about.
    *
-   * K15's `hello.coreCaRoots` is exactly such a field while this repository
-   * is pinned to tunnel 5.0.0 (see `tunnel-client.ts`'s comment at the send
-   * site): `.control` alone can never show it, because by the time a test
-   * reads `.control` the stripping has already happened. Undefined for a
-   * binary frame.
+   * K15's `hello.coreCaRoots` was exactly such a field while this repository
+   * was pinned to tunnel 5.0.0, and `.control` alone could not show it,
+   * because by the time a test reads `.control` the stripping has already
+   * happened. The pin has been 5.1.0 (which knows the field) since 16.09.2026;
+   * the K15 tests keep reading the raw bytes, which is still the stricter
+   * measurement: it is what core's parser receives. Undefined for a binary
+   * frame.
    */
   readonly raw?: string;
 }
@@ -522,7 +524,10 @@ test("a user request in the queue makes the sink BUSY, and cancelling it frees t
   }
 });
 
-// ─── `#inFlight` bookkeeping: what `busy` counts, and what may erase an entry ─
+// ─── Request bookkeeping: what `busy` counts, and what may erase an entry ────
+//
+// (Titled after `#inFlight`, the map that held these entries until the
+// per-session records of `session.ts`, 12.10.2026.)
 //
 // 12.10.2026, production: every cluster's sink read `busy` on almost every
 // tick, because the control plane's long-lived watches were counted as queued
@@ -792,8 +797,8 @@ test("a request of the PREVIOUS session does not erase the next session's reques
     await until("request 1 is in flight", () => h.client.inFlightCount === 1);
     await until("request 1 is parked in the slow plugin", parked);
 
-    // The session drops. `#abortAll` clears the map and aborts the handler, but
-    // the handler cannot see the abort until the plugin returns.
+    // The session drops. Its end aborts the handler's record, but the handler
+    // cannot see the abort until the plugin returns.
     h.core.drop();
     await until("the agent reconnected", () => h.core.sessions === 2 && h.sink!.ready);
 
@@ -1224,11 +1229,12 @@ for (const kind of ["cancel", "strclose"] as const) {
 }
 
 test("a stream whose credential plugin FAILS after a `cancel` sends no `err` for the id the control plane has forgotten", async () => {
-  // The `catch` in `#openStream` starts with its own abort check, and this is
-  // the one path that reaches it with the signal aborted: `authHeaders()`
-  // REJECTS after the abort (the plugin fails or times out). Measured with the
-  // check removed: `err` (AUTH_PLUGIN_FAILED) went out for id 1 on the open
-  // session, to a control plane that had already dropped the id.
+  // This is the one path that reaches the `catch` in `#openStream` with the
+  // record already stopped: `authHeaders()` REJECTS after the `cancel` (the
+  // plugin fails or times out). Measured with the `catch`'s own abort check
+  // removed (before 12.10.2026 it had one; now `record.fail` writes nothing
+  // for a stopped record): `err` (AUTH_PLUGIN_FAILED) went out for id 1 on the
+  // open session, to a control plane that had already dropped the id.
   const plugin = await slowPlugin({ failAfterGate: true });
   const api = await fakeStreamApiserver();
   const kc = await kubeconfigFor(api.url, plugin.userLines);
@@ -1276,9 +1282,9 @@ test("a stream whose credential plugin FAILS after a `cancel` sends no `err` for
 });
 
 test("the late upstream close of a stream the PREVIOUS session left behind neither removes nor speaks for the next session's stream with the same id", async () => {
-  // `#abortAll` closes the stream when the session drops, but the upstream
-  // close completes only when the apiserver answers — here, when the test
-  // says so. Before the fix the stale `onClose` then deleted `#streams` by id
+  // The session's end closes the stream when the session drops, but the
+  // upstream close completes only when the apiserver answers — here, when the
+  // test says so. Before the fix the stale `onClose` then deleted `#streams` by id
   // (taking session 2's stream 1 with it) and sent `strclose` for id 1 on the
   // socket of the moment: session 2's.
   const api = await fakeStreamApiserver();
@@ -1350,8 +1356,8 @@ const FRESH_STDOUT = Buffer.from([0x01, 0x4e, 0x45, 0x57]);
 
 /**
  * The setup the late-callback tests share: session 1's stream 1 is open, the
- * session drops (`#abortAll` closes it, the fake apiserver never answers the
- * close), and session 2 opens its own stream 1. Returns the index of
+ * session drops (its end closes the stream, the fake apiserver never answers
+ * the close), and session 2 opens its own stream 1. Returns the index of
  * `core.received` where session 2's stream starts.
  */
 async function staleAndFreshStream1(h: Harness, api: FakeStreamApiserver): Promise<number> {
@@ -1378,14 +1384,14 @@ async function freshStreamStillFlows(h: Harness, api: FakeStreamApiserver, mark:
 }
 
 test("a late data frame on the PREVIOUS session's stream is not written to the next session's stream with the same id", async () => {
-  // `#abortAll` closed session 1's stream, but until the apiserver answers the
+  // Session 1's end closed its stream, but until the apiserver answers the
   // close, frames it already had in flight still arrive and `onFrame` runs
   // (`UpstreamStream.close()` does not stop reading). Measured on the base
   // before the session binding: the stale frame went to the socket of the
   // moment, i.e. into session 2's stream 1.
   //
-  // `onOpen` cannot fire late (a stream `#abortAll` finds still CONNECTING is
-  // terminated, so it never opens), and a late `onStdinDelivered` would need a
+  // `onOpen` cannot fire late (a stream the session's end finds still
+  // CONNECTING is terminated, so it never opens), and a late `onStdinDelivered` would need a
   // write the kernel holds back until after the drop, which this test cannot
   // arrange; `onFrame` is the late hook that can be driven deterministically.
   const api = await fakeStreamApiserver();
@@ -1455,20 +1461,20 @@ test("a late upstream ERROR on the PREVIOUS session's stream neither sends `err`
   }
 });
 
-// Not tested, on purpose: `#openStream`'s `finally` deleting its
-// `#openingStreams` entry only if it is still its own. The harm needs the
-// stale handler to reach that `finally` while the next session's `stropen`
-// for the same id is still waiting in `authHeaders()` on a SEPARATE run. With
-// `CredentialCache` that cannot happen: a call made while a run is in flight
-// joins it (both resume in the same microtask flush, no message can land in
-// between), and once the run has settled the stale handler resumes in that
-// same flush, before any new `stropen` is read. The comparison guards a
-// credential source with a gap there (none today); a test would have to
-// invent one.
+// Not tested HERE, on purpose: a stale record releasing an id only while it
+// still holds it. End to end the harm needs the stale handler to release
+// while the id's next owner is still waiting in `authHeaders()` on a SEPARATE
+// run, and with `CredentialCache` that cannot happen (a call made while a run
+// is in flight joins it, and both resume in the same microtask flush). Since
+// 12.10.2026 a stale record also lives in its OWN session, which cannot hold
+// the next session's records at all. The identity rule itself is measured
+// without a network, in `session.test.ts` ("release: only the record that
+// holds the id can remove it").
 
 test("a second `stropen` for an id that is still OPENING in the same session is ignored: one upstream, one `strok`", async () => {
-  // The duplicate-id guard covers `#openingStreams` as well as `#streams`.
-  // Without the first, a duplicate arriving while the first is still in
+  // The duplicate-id guard covers a stream still opening as well as an open
+  // one (since 12.10.2026, `TunnelSession.claim`, and a request too). Before
+  // `#openingStreams` was added to it, a duplicate arriving while the first is still in
   // `authHeaders()` passed the guard, overwrote the first's abort controller
   // and opened a second upstream for the same id — one of the two then
   // unaddressable.
