@@ -23,6 +23,11 @@ import { execFile, execFileSync } from "node:child_process";
 import { X509Certificate } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import {
+  createServer as createHttpServer,
+  type IncomingMessage,
+  type ServerResponse,
+} from "node:http";
 import { createServer as createHttpsServer, type Server as HttpsServer } from "node:https";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -30,6 +35,7 @@ import { promisify } from "node:util";
 import type { AddressInfo } from "node:net";
 import { WebSocketServer, type WebSocket as CoreSocket } from "ws";
 import {
+  RESPONSE_CREDIT_WINDOW_BYTES,
   SAMPLE_FRAME_REQUEST_ID,
   decodeBodyFrame,
   decodeSampleFrame,
@@ -503,7 +509,56 @@ test("a user request in the queue makes the sink BUSY, and cancelling it frees t
   }
 });
 
-// ─── `#inFlight` bookkeeping across sessions ─────────────────────────────────
+// ─── `#inFlight` bookkeeping: what `busy` counts, and what may erase an entry ─
+//
+// 12.10.2026, production: every cluster's sink read `busy` on almost every
+// tick, because the control plane's long-lived watches were counted as queued
+// requests. `busy` now counts only requests whose response has not started;
+// `inFlightCount` still counts every request the agent holds.
+
+/** An apiserver in this process, plain HTTP, that a test scripts per path. */
+interface FakeApiserver {
+  readonly url: string;
+  /** Requests seen, as `METHOD path?query`, in arrival order. */
+  readonly seen: string[];
+  /** How many request sockets the apiserver saw close (abort reaches here). */
+  readonly closed: number;
+  close(): Promise<void>;
+}
+
+async function fakeApiserver(
+  route: (req: IncomingMessage, res: ServerResponse) => void,
+): Promise<FakeApiserver> {
+  const seen: string[] = [];
+  let closed = 0;
+  const server = createHttpServer((req, res) => {
+    // The agent reads /version on every `open`; answer it so the line is quiet.
+    if (req.url === "/version") {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ gitVersion: "v1.31.0" }));
+      return;
+    }
+    seen.push(`${req.method} ${req.url}`);
+    res.on("close", () => {
+      closed += 1;
+    });
+    route(req, res);
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const { port } = server.address() as AddressInfo;
+  return {
+    url: `http://127.0.0.1:${port}`,
+    seen,
+    get closed() {
+      return closed;
+    },
+    close: () =>
+      new Promise<void>((resolve) => {
+        server.closeAllConnections();
+        server.close(() => resolve());
+      }),
+  };
+}
 
 /** A kubeconfig in its own directory, pointing at `server`, with the given user block. */
 async function kubeconfigFor(server: string, userLines: readonly string[]): Promise<{
@@ -536,6 +591,120 @@ async function kubeconfigFor(server: string, userLines: readonly string[]): Prom
   );
   return { path, directory };
 }
+
+/** Response-body bytes the fake core received for request `id`. */
+function bodyBytesFor(core: FakeCore, id: number): number {
+  let bytes = 0;
+  for (const entry of core.received) {
+    if (!entry.binary) continue;
+    const decoded = decodeBodyFrame(entry.binary);
+    if (decoded?.requestId === id) bytes += decoded.payload.byteLength;
+  }
+  return bytes;
+}
+
+function controlFor(core: FakeCore, id: number): string[] {
+  const kinds: string[] = [];
+  for (const entry of core.received) {
+    const message = entry.control;
+    if (message && "id" in message && message.id === id) kinds.push(message.t);
+  }
+  return kinds;
+}
+
+test("an open watch whose response is flowing does not make the sink BUSY; a request still waiting for its headers does", async () => {
+  // The watch: headers and one event, then the body stays open, exactly like
+  // `?watch=true` against a real apiserver between two events. The list is
+  // held back — no headers — until the test releases it, which is the window
+  // in which it is a queued user request.
+  let releaseList: (() => void) | undefined;
+  const api = await fakeApiserver((req, res) => {
+    if (req.url?.includes("watch=true")) {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.write(`${JSON.stringify({ type: "ADDED", object: { kind: "Pod" } })}\n`);
+      return;
+    }
+    releaseList = () => {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ kind: "PodList", items: [] }));
+    };
+  });
+  const kc = await kubeconfigFor(api.url, ["      token: t"]);
+  const h = await harness({ kubeconfig: kc.path });
+  try {
+    await until("the collector has started", () => h.starts === 1);
+    const sink = h.sink!;
+    assert.equal(sink.busy, false);
+
+    h.core.send({ t: "req", id: 1, method: "GET", path: "/api/v1/pods", query: "watch=true", headers: {}, hasBody: false });
+    await until("the watch's first event reached the control plane", () => bodyBytesFor(h.core, 1) > 0);
+    assert.deepEqual(controlFor(h.core, 1), ["res"], "headers went out, `end` did not — the watch is open");
+    await settle();
+    assert.equal(h.client.inFlightCount, 1, "the watch is still a request the agent holds");
+    assert.equal(sink.busy, false, "a response that is already flowing is not a queued request");
+
+    // A short list arrives while the watch is open. Until its headers come
+    // back it IS waiting in the queue, and K5 gives it priority.
+    h.core.send({ t: "req", id: 2, method: "GET", path: "/api/v1/pods", headers: {}, hasBody: false });
+    await until("the apiserver holds the list", () => releaseList !== undefined);
+    assert.equal(h.client.inFlightCount, 2);
+    assert.equal(sink.busy, true, "a request waiting for its response makes the sink busy");
+
+    releaseList!();
+    await until("the list request ended", () => controlFor(h.core, 2).includes("end"));
+    await settle();
+    assert.equal(h.client.inFlightCount, 1);
+    assert.equal(sink.busy, false);
+
+    // Only the control plane can release the watch — the agent has no timeout
+    // of its own on a request (headersTimeout/bodyTimeout are 0 for EVERY
+    // request, not only for watches).
+    h.core.send({ t: "cancel", id: 1 });
+    await until("the watch is gone", () => h.client.inFlightCount === 0);
+    assert.equal(sink.busy, false);
+    await until("the apiserver saw the watch socket close", () => api.closed >= 2);
+  } finally {
+    await h.close();
+    await api.close();
+    await rm(kc.directory, { recursive: true, force: true });
+  }
+});
+
+test("credit starvation holds a request in flight with no agent-side bound, without making the sink busy; a disconnect (not a timer) releases it and wakes `credit.wait`", async () => {
+  // Twice the response window, and the body never ends: the agent sends the
+  // window's worth, then waits for a `credit` this control plane never sends.
+  const api = await fakeApiserver((_req, res) => {
+    res.writeHead(200, { "content-type": "application/octet-stream" });
+    res.write(Buffer.alloc(RESPONSE_CREDIT_WINDOW_BYTES * 2, 0x61));
+  });
+  const kc = await kubeconfigFor(api.url, ["      token: t"]);
+  const h = await harness({ kubeconfig: kc.path });
+  try {
+    await until("the collector has started", () => h.starts === 1);
+    const sink = h.sink!;
+
+    h.core.send({ t: "req", id: 3, method: "GET", path: "/api/v1/configmaps", headers: {}, hasBody: false });
+    await until("the window was used up", () => bodyBytesFor(h.core, 3) >= RESPONSE_CREDIT_WINDOW_BYTES);
+    const before = bodyBytesFor(h.core, 3);
+    await settle();
+    assert.equal(bodyBytesFor(h.core, 3), before, "no byte past the window without credit");
+    assert.equal(h.client.inFlightCount, 1);
+    // `res` went out before the window ran dry: the request is a stalled
+    // response, not a queued one, so it does not hold the sample frames back.
+    assert.equal(sink.busy, false, "a response stalled on credit is not a queued request");
+
+    // A disconnect clears the map AND aborts the handler: the apiserver socket
+    // closing is the proof that `credit.wait(signal)` returned on abort rather
+    // than hanging with the entry merely removed from the map.
+    h.core.drop();
+    await until("the map is empty", () => h.client.inFlightCount === 0);
+    await until("the apiserver saw the request socket close", () => api.closed >= 1);
+  } finally {
+    await h.close();
+    await api.close();
+    await rm(kc.directory, { recursive: true, force: true });
+  }
+});
 
 test("a request of the PREVIOUS session does not erase the next session's request that reuses its id (core restarts ids at 1 per session)", async () => {
   // A credential plugin that is slow on demand: its token is always already

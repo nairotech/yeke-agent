@@ -486,10 +486,12 @@ export function packFrame(input: {
  *
  *  · `ready` — is there a wire at all? False while the tunnel is down. Frames
  *    accumulate in the ring (K5's 30-minute buffer).
- *  · `busy`  — is a USER request in flight? K5 gives a queued `req` priority
- *    over a sample frame. The collector does not send THIS tick; the ring
- *    already holds the frame, so one tick of yielding costs nothing and needs
- *    no second queue.
+ *  · `busy`  — is a USER request waiting in the queue (its response not
+ *    started yet)? K5 gives a queued `req` priority over a sample frame. The
+ *    collector does not send THIS tick; the ring already holds the frame, so
+ *    one tick of yielding costs no throughput and needs no second queue (it
+ *    does cost latency when it happens on every tick: `collector.ts`, header,
+ *    12.10.2026).
  *
  * Collapsing them into one boolean was rejected: the same `false` would then
  * mean "disconnected" and "wait your turn", and every reader downstream would
@@ -498,14 +500,16 @@ export function packFrame(input: {
  *
  * ─── `busy` is bounded on the READER's side, and why that is written here ───
  *
- * "Yielding costs nothing" is true of one tick and false of a hundred. The
+ * "Yielding costs no throughput" is true of one tick and false of a hundred. The
  * sentence above was read as a veto, and the veto silenced a cluster for
  * eleven minutes on 09.09.2026 (`collector.ts`, header): the control plane
- * holds long-lived apiserver watches open through the tunnel, so `busy` is not
- * a brief queue — it is the normal state of a control plane with a screen
- * open. The bound lives in `Collector.#drain`, and it is named here because
- * this is the doc comment a future implementer of the sink will read before
- * deciding what `busy` is allowed to mean.
+ * holds long-lived apiserver watches open through the tunnel, and while they
+ * counted, `busy` was not a brief queue — it was the normal state of a control
+ * plane with a screen open. The bound lives in `Collector.#drain`; since
+ * 12.10.2026 the tunnel's sink also counts only requests whose response has
+ * not started (`collector.ts`, header). Both are named here because this is
+ * the doc comment a future implementer of the sink will read before deciding
+ * what `busy` is allowed to mean.
  */
 export interface SampleSink {
   readonly ready: boolean;
