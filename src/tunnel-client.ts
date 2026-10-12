@@ -1312,8 +1312,14 @@ export class TunnelClient {
         );
         this.#streams.set(id, stream);
       } catch (err) {
-        // Aborted: the control plane has forgotten this id (or its session is
-        // gone), so there is nobody to tell.
+        // Not dead code, and not the same check as the one after the await:
+        // the only throw that can arrive here with the signal already aborted
+        // is `authHeaders()` REJECTING after a `cancel`/`strclose`/disconnect
+        // (the plugin failed or timed out while the control plane gave up on
+        // the id). Everything after the post-await check is synchronous, so a
+        // throw from `tlsOptions()` or the constructor arrives un-aborted. The
+        // control plane has forgotten this id (or its session is gone), so
+        // there is nobody to tell.
         if (abort.signal.aborted) return;
         // The only way to land here is identity resolution and TLS material
         // (`authHeaders`, `tlsOptions`): the socket does not exist yet. Identity
