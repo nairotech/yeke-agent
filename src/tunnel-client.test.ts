@@ -2782,3 +2782,83 @@ test("once `stop()` has begun, a `req` that still arrives on the session is not 
     await rm(kc.directory, { recursive: true, force: true });
   }
 });
+
+test("a new session's sink stays off until that session's own `welcome`: no sample frame reaches a peer that has not negotiated yet", async () => {
+  // Not a base failure: base cleared an agent-wide protocol number on every
+  // disconnect, and that clearing was the only thing between a reconnect and a
+  // sample frame sent before the new peer's `welcome`. The number now lives on
+  // the session, and this test is what goes red if that ever stops being so.
+  process.env.KUBECONFIG = await kubeconfig();
+  const server = new WebSocketServer({ host: "127.0.0.1", port: 0 });
+  const sockets: CoreSocket[] = [];
+  const received: { session: number; control?: ControlMessage }[] = [];
+  const welcome = (n: number): string =>
+    serializeControlMessage({ t: "welcome", clusterId: "cluster-1", sessionId: `session-${n}`, protocol: 5 });
+  server.on("connection", (connection) => {
+    const session = sockets.push(connection);
+    connection.on("message", (data, isBinary) => {
+      received.push(isBinary ? { session } : { session, control: parseControlMessage(data.toString()) });
+    });
+    // Session 2's `welcome` is held back until the test sends it.
+    if (session === 1) connection.send(welcome(1));
+  });
+  await new Promise<void>((resolve) => server.once("listening", resolve));
+  const { port } = server.address() as AddressInfo;
+  let sink: SampleSink | undefined;
+  const client = new TunnelClient(
+    {
+      coreUrl: `ws://127.0.0.1:${port}/tunnel`,
+      clusterId: "cluster-1",
+      token: "agent-token",
+      kubeMode: "kubeconfig",
+      reconnectMinMs: 10,
+      reconnectMaxMs: 50,
+      kubeletInsecureTls: false,
+      metricsEnabled: true,
+    },
+    {
+      createCollector: async (context) => {
+        sink = context.sink;
+        return { start: () => {}, stop: async () => {}, queuedFrames: 0, flush: () => {} };
+      },
+    },
+  );
+  try {
+    await client.start();
+    await until("session 1 is ready for samples", () => sink?.ready === true);
+    sockets[0]!.terminate();
+    await until("session 2 sent its hello", () =>
+      received.some((r) => r.session === 2 && r.control?.t === "hello"),
+    );
+    const pods = [podEntity("web-1")];
+    const beforeWelcome = {
+      ready: sink!.ready,
+      accepted: [
+        sink!.push(frameOf(pods, START_MS, "cpu.cores")),
+        sink!.push(frameOf(pods, START_MS + PERIOD_MS, "cpu.cores")),
+      ],
+    };
+    await settle();
+    const samplesBeforeWelcome = received.filter((r) => r.session === 2 && r.control?.t === "sample").length;
+
+    sockets[1]!.send(welcome(2));
+    await until("session 2 is ready after its own welcome", () => sink!.ready);
+    sink!.push(frameOf(pods, START_MS + 2 * PERIOD_MS, "cpu.cores"));
+    sink!.push(frameOf(pods, START_MS + 3 * PERIOD_MS, "cpu.cores"));
+    await until("session 2 received a sample", () =>
+      received.some((r) => r.session === 2 && r.control?.t === "sample"),
+    );
+
+    assert.deepEqual(
+      { ...beforeWelcome, samplesBeforeWelcome },
+      { ready: false, accepted: [false, false], samplesBeforeWelcome: 0 },
+      "the sink took frames for a session whose peer had not sent `welcome`",
+    );
+  } finally {
+    await client.stop();
+    await new Promise<void>((resolve) => {
+      for (const socket of server.clients) socket.terminate();
+      server.close(() => resolve());
+    });
+  }
+});
