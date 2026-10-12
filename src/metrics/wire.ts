@@ -8,7 +8,9 @@
  * `pod/<uid>`) — and the wire wants something else entirely: a DENSE
  * `entities x samples x metrics` matrix of `Float32`, addressed by small
  * connection-local integers. Everything that turns one into the other lives
- * here, and nothing here touches a socket, a clock or a timer.
+ * here, and nothing here touches a socket or a timer. The one clock it reads is
+ * an injected seam (`SampleEncoderOptions.now`), read once per `encode` call to
+ * stamp `agentTimeMs`; see "Why `agentTimeMs` is the encoding time" below.
  *
  * ─── Why the aliases are connection-local ───────────────────────────────────
  *
@@ -93,6 +95,12 @@ export interface SampleEncoderOptions {
    * cannot widen a limit the receiver also enforces.
    */
   readonly maxPayloadBytes?: number;
+  /**
+   * The agent clock read for `agentTimeMs`, once per `encode` call. Defaults to
+   * `Date.now`; the tests pass a fixed value so nothing here depends on when
+   * the suite runs.
+   */
+  readonly now?: () => number;
 }
 
 export interface EncodeOptions {
@@ -128,6 +136,7 @@ interface AliasEntry {
  */
 export class SampleEncoder {
   readonly #maxPayloadBytes: number;
+  readonly #now: () => number;
   #aliases = new Map<string, AliasEntry>();
   #nextAlias = 1;
   #seq = 0;
@@ -137,6 +146,7 @@ export class SampleEncoder {
       options.maxPayloadBytes ?? MAX_SAMPLE_PAYLOAD_BYTES,
       MAX_SAMPLE_PAYLOAD_BYTES,
     );
+    this.#now = options.now ?? Date.now;
   }
 
   /** The `seq` of the last frame handed out. Diagnostic, and asserted by the tests. */
@@ -179,6 +189,35 @@ export class SampleEncoder {
     const newest = frames[frames.length - 1];
     if (!newest) return [];
 
+    // ─── Why `agentTimeMs` is the encoding time ────────────────────────────
+    //
+    // The control plane estimates the agent↔core clock skew from every frame
+    // as `receivedAt − agentTimeMs`. That difference is only a skew if
+    // `agentTimeMs` is taken when the frame leaves; the contract
+    // (`SampleMessage.agentTimeMs`) defines it as the agent's time at which the
+    // FRAME was produced, and a frame is produced here, on its way to the
+    // socket. The capture times stay in `sampleTimesMs` — they place the
+    // samples, and the receiver shifts them by the skew it estimates.
+    //
+    // The rejected alternative is what this was before: the newest frame's
+    // `capturedAt`. It writes every wait between capture and send into the
+    // difference as if it were skew — a reconnect draining minutes of ring in
+    // milliseconds, or, with `BUSY_YIELD_TICKS = 1` (collector.ts) and two
+    // samples per wire frame (tunnel-client.ts), a steadily busy sink that
+    // sends EVERY frame one full tick late.
+    // Measured: on dev, a replay after reconnect lost 6 of 8 ticks (core
+    // 0.76.0). On production, 4 of 14 clusters showed a 30.6–31.0 s skew
+    // estimate — one tick plus a collection pass, just over the receiver's
+    // 30 s threshold, which shifts the whole series by a slot and raises the
+    // "clock skew" chip. That pattern fits the busy case above; why those
+    // sinks stay busy was not measured. Either way the core cannot tell a
+    // systematic send delay from a real skew; only the agent knows when it
+    // sent.
+    //
+    // Read ONCE per call: every part of a split frame carries the same value,
+    // so the parts of one frame never disagree about the skew.
+    const agentTimeMs = this.#now();
+
     const collector = collectorStatusOf(newest.nodes, {
       apiserverForbidden: newest.apiserverForbidden,
     });
@@ -205,7 +244,7 @@ export class SampleEncoder {
     const metrics = METRIC_NAMES.filter((name) => present.has(name));
 
     if (order.length === 0 || metrics.length === 0) {
-      return [this.#emit(this.#emptyFrame(newest.capturedAt, dropped, collector))];
+      return [this.#emit(this.#emptyFrame(newest.capturedAt, agentTimeMs, dropped, collector))];
     }
 
     const samplesPerEntity = frames.length;
@@ -247,7 +286,7 @@ export class SampleEncoder {
       const first = start === 0;
       encoded.push(
         this.#emit({
-          agentTimeMs: newest.capturedAt,
+          agentTimeMs,
           metrics,
           entities: {
             added: slice.flatMap((row) => (row.declare ? [row.declare] : [])),
@@ -282,11 +321,12 @@ export class SampleEncoder {
    */
   #emptyFrame(
     capturedAt: number,
+    agentTimeMs: number,
     dropped: number,
     collector: SampleCollectorStatus,
   ): Omit<SampleFrameInput, "seq"> {
     return {
-      agentTimeMs: capturedAt,
+      agentTimeMs,
       metrics: [],
       entities: { added: [], removed: this.#forgetAbsent(new Map()) },
       entityIds: [],

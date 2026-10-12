@@ -8,8 +8,9 @@
  * agree with the encoder about a shape the receiver reads differently — the
  * silent failure the contract's four gates exist to prevent.
  *
- * Nothing here sleeps, opens a socket or reads a clock: the encoder is pure and
- * every timestamp is a number this file chose.
+ * Nothing here sleeps or opens a socket, and no assertion depends on a real
+ * clock: every timestamp a test checks is a number this file chose (the
+ * `agentTimeMs` tests at the end pin the encoder's `now` seam).
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
@@ -705,4 +706,102 @@ test("apiserver 403 on a closed-list watch reports the collector forbidden, not 
     ),
     { state: "degraded", nodes: [{ name: "node-a", state: "unreachable" }] },
   );
+});
+
+// ─── agentTimeMs is the ENCODING time, not the capture time ────────────────
+//
+// The control plane estimates clock skew as `receivedAt − agentTimeMs`. If
+// `agentTimeMs` were a capture time, every wait between capture and send would
+// be read as skew (see the comment in `SampleEncoder.encode`). These tests pin
+// the clock through the `now` seam so they stay independent of wall time.
+
+test("agentTimeMs is the encoder's clock; capture times stay in sampleTimesMs", () => {
+  const node = nodeEntity("node-a");
+  const sentAt = START_MS + 2 * PERIOD_MS + 1_234;
+  const encoder = new SampleEncoder({ now: () => sentAt });
+
+  const [only] = encoder.encode([
+    internalFrame({ capturedAt: START_MS, entities: [node], values: [[node, "cpu.cores", 1]] }),
+    internalFrame({
+      capturedAt: START_MS + PERIOD_MS,
+      entities: [node],
+      values: [[node, "cpu.cores", 2]],
+    }),
+  ]);
+  assert.ok(only);
+  assert.equal(only.message.agentTimeMs, sentAt);
+  assert.deepEqual(only.message.sampleTimesMs, [START_MS, START_MS + PERIOD_MS]);
+});
+
+test("a ring drained after a reconnect is stamped NOW, its samples keep their old times", () => {
+  // Two ticks captured ten minutes ago, sent only now: the wait is not skew.
+  const node = nodeEntity("node-a");
+  const now = START_MS + 10 * 60_000;
+  const capturedA = now - 10 * 60_000;
+  const capturedB = capturedA + PERIOD_MS;
+  const encoder = new SampleEncoder({ now: () => now });
+
+  const [decoded] = decodeAll(
+    encoder.encode([
+      internalFrame({ capturedAt: capturedA, entities: [node], values: [[node, "cpu.cores", 1]] }),
+      internalFrame({ capturedAt: capturedB, entities: [node], values: [[node, "cpu.cores", 2]] }),
+    ]),
+  );
+  assert.ok(decoded);
+  assert.equal(decoded.agentTimeMs, now);
+  assert.deepEqual(decoded.sampleTimesMs, [capturedA, capturedB]);
+});
+
+test("every part of a split frame carries the SAME agentTimeMs, the clock is read once", () => {
+  const node = nodeEntity("node-a");
+  const pods = Array.from({ length: 7 }, (_, index) => podEntity(`uid-${index}`, `web-${index}`));
+  const entities = [node, ...pods];
+  // A clock that moves on every read: if the encoder read it per part, the
+  // parts would disagree.
+  let clock = START_MS + 5 * PERIOD_MS;
+  let reads = 0;
+  const encoder = new SampleEncoder({
+    maxPayloadBytes: 24,
+    now: () => {
+      reads += 1;
+      clock += 17;
+      return clock;
+    },
+  });
+
+  const encoded = encoder.encode([
+    internalFrame({
+      capturedAt: START_MS,
+      entities,
+      values: entities.map((entity) => [entity, "cpu.cores", 1] as const),
+    }),
+    internalFrame({
+      capturedAt: START_MS + PERIOD_MS,
+      entities,
+      values: entities.map((entity) => [entity, "cpu.cores", 2] as const),
+    }),
+  ]);
+  assert.equal(encoded.length, 3);
+  assert.equal(reads, 1);
+  assert.deepEqual(
+    encoded.map((frame) => frame.message.agentTimeMs),
+    [clock, clock, clock],
+  );
+  for (const frame of encoded) {
+    assert.deepEqual(frame.message.sampleTimesMs, [START_MS, START_MS + PERIOD_MS]);
+  }
+});
+
+test("the empty frame is stamped with the encoder's clock too", () => {
+  const sentAt = START_MS + 7 * PERIOD_MS;
+  const encoder = new SampleEncoder({ now: () => sentAt });
+  const forbidden: NodeState[] = [
+    { node: "node-a", state: "forbidden", psi: false, ioUnmeasurable: false },
+  ];
+  const [only] = encoder.encode([
+    internalFrame({ capturedAt: START_MS, entities: [], values: [], nodes: forbidden }),
+  ]);
+  assert.ok(only);
+  assert.equal(only.message.agentTimeMs, sentAt);
+  assert.deepEqual(only.message.sampleTimesMs, [START_MS]);
 });

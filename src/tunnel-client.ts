@@ -406,6 +406,7 @@ interface SampleWireHooks {
  * number nobody measured.
  */
 class SampleWire implements SampleSink {
+  // Default clock: `agentTimeMs` is stamped at encode (= send) time, see wire.ts.
   readonly #encoder = new SampleEncoder();
   readonly #hooks: SampleWireHooks;
   #pending: InternalFrame[] = [];
