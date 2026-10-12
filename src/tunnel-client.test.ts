@@ -20,7 +20,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { execFile, execFileSync } from "node:child_process";
-import { X509Certificate } from "node:crypto";
+import { X509Certificate, createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import {
@@ -33,6 +33,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import type { AddressInfo } from "node:net";
+import type { Duplex } from "node:stream";
 import { WebSocketServer, type WebSocket as CoreSocket } from "ws";
 import {
   RESPONSE_CREDIT_WINDOW_BYTES,
@@ -603,9 +604,10 @@ function bodyBytesFor(core: FakeCore, id: number): number {
   return bytes;
 }
 
-function controlFor(core: FakeCore, id: number): string[] {
+/** Control message kinds the fake core received for `id`, from index `from` of `received` on. */
+function controlFor(core: FakeCore, id: number, from = 0): string[] {
   const kinds: string[] = [];
-  for (const entry of core.received) {
+  for (const entry of core.received.slice(from)) {
     const message = entry.control;
     if (message && "id" in message && message.id === id) kinds.push(message.t);
   }
@@ -818,6 +820,322 @@ test("a request of the PREVIOUS session does not erase the next session's reques
     await h.close();
     await rm(kc.directory, { recursive: true, force: true });
     await rm(directory, { recursive: true, force: true });
+  }
+});
+
+// ─── Streams (`stropen`) across sessions and cancellations ───────────────────
+
+/**
+ * An apiserver end for exec streams that answers the WebSocket upgrade itself,
+ * on the raw socket, and then never says another word.
+ *
+ * Not a `ws` server, on purpose: `ws` answers the agent's close frame at once,
+ * and the stream tests below need to choose WHEN an upstream close lands. Here
+ * nothing reaches the agent until the test ends a socket (`sockets[i]`).
+ */
+interface FakeStreamApiserver {
+  readonly url: string;
+  /** Upgrade requests seen, as `path?query`, in arrival order. */
+  readonly upgrades: string[];
+  /** The upgraded sockets, in the same order. */
+  readonly sockets: Duplex[];
+  /** How many upgraded sockets have closed. */
+  readonly socketsClosed: number;
+  close(): Promise<void>;
+}
+
+async function fakeStreamApiserver(): Promise<FakeStreamApiserver> {
+  const upgrades: string[] = [];
+  const sockets: Duplex[] = [];
+  let socketsClosed = 0;
+  const server = createHttpServer((req, res) => {
+    // The agent reads /version on every `open`; answer it so the line is quiet.
+    if (req.url === "/version") {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ gitVersion: "v1.31.0" }));
+      return;
+    }
+    res.writeHead(404);
+    res.end();
+  });
+  server.on("upgrade", (req: IncomingMessage, socket: Duplex) => {
+    upgrades.push(req.url ?? "");
+    sockets.push(socket);
+    socket.on("data", () => {});
+    socket.on("error", () => {});
+    socket.on("close", () => {
+      socketsClosed += 1;
+    });
+    const accept = createHash("sha1")
+      .update(`${String(req.headers["sec-websocket-key"])}258EAFA5-E914-47DA-95CA-C5AB0DC85B11`)
+      .digest("base64");
+    // The first offered subprotocol, as a real apiserver picks `v5.channel.k8s.io`.
+    const protocol = String(req.headers["sec-websocket-protocol"] ?? "").split(",")[0]!.trim();
+    socket.write(
+      [
+        "HTTP/1.1 101 Switching Protocols",
+        "Upgrade: websocket",
+        "Connection: Upgrade",
+        `Sec-WebSocket-Accept: ${accept}`,
+        `Sec-WebSocket-Protocol: ${protocol}`,
+        "",
+        "",
+      ].join("\r\n"),
+    );
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const { port } = server.address() as AddressInfo;
+  return {
+    url: `http://127.0.0.1:${port}`,
+    upgrades,
+    sockets,
+    get socketsClosed() {
+      return socketsClosed;
+    },
+    close: () =>
+      new Promise<void>((resolve) => {
+        for (const socket of sockets) socket.destroy();
+        server.closeAllConnections();
+        server.close(() => resolve());
+      }),
+  };
+}
+
+/**
+ * A credential plugin the TEST holds: every run re-executes it (its token is
+ * always expired), and a run that starts while `marker` exists waits until the
+ * test removes it. `runs` records `s`/`e` on entry and exit and `w`/`W` around
+ * the wait, so a test waits on what the plugin did, not on a clock.
+ *
+ * Gated like the request test above, not a fixed sleep: a clock-bound park
+ * lets a loaded machine that needs longer for "drop, reconnect, collide" wake
+ * the handler too early. The park lasts exactly until the test has built the
+ * collision and removes the marker.
+ */
+async function slowPlugin(): Promise<{
+  readonly directory: string;
+  readonly marker: string;
+  readonly userLines: readonly string[];
+  count(mark: string): number;
+  /** At least one run happened and none is in progress. */
+  idle(): boolean;
+  /** A run is held at the gate: whoever called `authHeaders()` is parked in it. */
+  parked(): boolean;
+}> {
+  const directory = await mkdtemp(join(tmpdir(), "yeke-agent-plugin-"));
+  const marker = join(directory, "slow");
+  const runs = join(directory, "runs");
+  const plugin = join(directory, "plugin.sh");
+  await writeFile(runs, "");
+  await writeFile(
+    plugin,
+    [
+      "#!/bin/sh",
+      `printf s >> "${runs}"`,
+      `if [ -f "${marker}" ]; then printf w >> "${runs}"; while [ -f "${marker}" ]; do sleep 0.05; done; printf W >> "${runs}"; fi`,
+      `printf e >> "${runs}"`,
+      `printf '%s' '{"apiVersion":"client.authentication.k8s.io/v1","kind":"ExecCredential","status":{"token":"t","expirationTimestamp":"2000-01-01T00:00:00Z"}}'`,
+      "",
+    ].join("\n"),
+    { mode: 0o755 },
+  );
+  const count = (mark: string): number => readFileSync(runs, "utf8").split(mark).length - 1;
+  return {
+    directory,
+    marker,
+    userLines: [
+      "      exec:",
+      "        apiVersion: client.authentication.k8s.io/v1",
+      `        command: ${plugin}`,
+      "        interactiveMode: Never",
+    ],
+    count,
+    idle: () => count("s") > 0 && count("s") === count("e"),
+    parked: () => count("w") > count("W"),
+  };
+}
+
+/**
+ * The session's `hello` is in: the /version read it carries has resolved its
+ * credential and `CredentialCache` has dropped the in-flight run, so the next
+ * `authHeaders()` starts a run of its own rather than joining that one.
+ *
+ * `plugin.idle()` is not enough for this: the plugin writes `e` before it
+ * prints its credential and exits, and a call landing in that gap joins the
+ * finishing run (fast, past the marker check) and never parks. Measured once
+ * in a full-suite run: "timed out waiting until stream 1 is parked".
+ */
+function helloSent(core: FakeCore): boolean {
+  return core.received.some((r) => r.control?.t === "hello");
+}
+
+const EXEC_PATH = "/api/v1/namespaces/default/pods/x/exec";
+const EXEC_PROTOCOLS = ["v5.channel.k8s.io"];
+
+test("a stream the PREVIOUS session asked for, still resolving its credentials when the session drops, never reaches the apiserver and writes nothing to the next session", async () => {
+  // `authHeaders()` is the one await in `#openStream` an abort cannot
+  // interrupt (an exec plugin runs to completion), so a `stropen` parked in it
+  // outlives its session. Measured before the fix: it then opened the exec pty
+  // on the apiserver, put the stream into the NEXT session's map and sent that
+  // session `strok` for an id it had never allocated.
+  const plugin = await slowPlugin();
+  const api = await fakeStreamApiserver();
+  const kc = await kubeconfigFor(api.url, plugin.userLines);
+  const h = await harness({ kubeconfig: kc.path });
+  try {
+    await until("the collector has started", () => h.starts === 1);
+    await until("the startup /version read's credential is settled", () => helloSent(h.core));
+
+    // Session 1, stream 1: held at the plugin's gate.
+    await writeFile(plugin.marker, "");
+    h.core.send({ t: "stropen", id: 1, path: EXEC_PATH, query: "command=sh&stdin=true", protocols: EXEC_PROTOCOLS });
+    await until("stream 1 is held at the plugin gate", plugin.parked);
+
+    h.core.drop();
+    await until("the agent reconnected", () => h.core.sessions === 2 && h.sink!.ready);
+    const mark = h.core.received.length;
+    // The collision is built (session 2 exists, the stale handler is held);
+    // only now does the test let the plugin return. The gate makes "still
+    // parked" a given, the assertion keeps it checked.
+    assert.equal(plugin.parked(), true, "session 1's stream must still be parked when session 2 starts");
+    await rm(plugin.marker);
+
+    await until("session 1's plugin run is over", () => plugin.count("W") >= 1 && plugin.idle());
+    // A barrier the stale handler cannot overtake: session 2's own stream 2
+    // resolves its credentials AFTER the stale one did, so by the time its
+    // `strok` is here, the stale handler has long had its turn to misbehave.
+    h.core.send({ t: "stropen", id: 2, path: EXEC_PATH, query: "command=true", protocols: EXEC_PROTOCOLS });
+    await until("session 2's own stream 2 is open", () => controlFor(h.core, 2, mark).includes("strok"));
+    await settle();
+
+    assert.deepEqual(
+      {
+        upgrades: [...api.upgrades],
+        session2ForId1: controlFor(h.core, 1, mark),
+        streamCount: h.client.streamCount,
+      },
+      {
+        upgrades: [`${EXEC_PATH}?command=true`],
+        session2ForId1: [],
+        streamCount: 1,
+      },
+      "the previous session's stream opened upstream and/or wrote to the next session",
+    );
+    h.core.send({ t: "strclose", id: 2 });
+    await until("stream 2 is closed", () => h.client.streamCount === 0);
+  } finally {
+    // Release a run still held at the gate, or its process outlives the test.
+    await rm(plugin.marker, { force: true });
+    await h.close();
+    await api.close();
+    await rm(kc.directory, { recursive: true, force: true });
+    await rm(plugin.directory, { recursive: true, force: true });
+  }
+});
+
+for (const kind of ["cancel", "strclose"] as const) {
+  test(`a \`${kind}\` that arrives while a stream is still resolving its credentials stops it from ever opening upstream`, async () => {
+    // The control plane forgets the id the moment it sends `${kind}`. Before
+    // the fix the agent had nothing to find in `#streams` yet (the stream did
+    // not exist), so it did nothing, and once the plugin returned it opened
+    // the exec pty anyway and sent `strok` for a forgotten id.
+    const plugin = await slowPlugin();
+    const api = await fakeStreamApiserver();
+    const kc = await kubeconfigFor(api.url, plugin.userLines);
+    const h = await harness({ kubeconfig: kc.path });
+    try {
+      await until("the collector has started", () => h.starts === 1);
+      await until("the startup /version read's credential is settled", () => helloSent(h.core));
+      const mark = h.core.received.length;
+
+      await writeFile(plugin.marker, "");
+      h.core.send({ t: "stropen", id: 1, path: EXEC_PATH, query: "command=sh&stdin=true", protocols: EXEC_PROTOCOLS });
+      await until("stream 1 is held at the plugin gate", plugin.parked);
+
+      h.core.send(kind === "cancel" ? { t: "cancel", id: 1 } : { t: "strclose", id: 1, code: 1000 });
+      // Messages on one socket are handled in order: once the `pong` is back,
+      // the agent has handled the `${kind}` too.
+      h.core.send({ t: "ping", ts: 7 });
+      await until("the agent answered the ping", () =>
+        h.core.received.slice(mark).some((r) => r.control?.t === "pong"),
+      );
+      assert.equal(plugin.parked(), true, `stream 1 must still be parked when \`${kind}\` is handled`);
+      await rm(plugin.marker);
+
+      await until("the plugin run is over", () => plugin.count("W") >= 1 && plugin.idle());
+      // Same barrier as above: stream 2 resolves its credentials after stream 1 did.
+      h.core.send({ t: "stropen", id: 2, path: EXEC_PATH, query: "command=true", protocols: EXEC_PROTOCOLS });
+      await until("stream 2 is open", () => controlFor(h.core, 2, mark).includes("strok"));
+      await settle();
+
+      assert.deepEqual(
+        {
+          upgrades: [...api.upgrades],
+          forId1: controlFor(h.core, 1, mark),
+          streamCount: h.client.streamCount,
+        },
+        {
+          upgrades: [`${EXEC_PATH}?command=true`],
+          forId1: [],
+          streamCount: 1,
+        },
+        `a stream \`${kind}\`led while resolving its credentials was opened anyway`,
+      );
+      h.core.send({ t: "strclose", id: 2 });
+      await until("stream 2 is closed", () => h.client.streamCount === 0);
+    } finally {
+      // Release a run still held at the gate, or its process outlives the test.
+      await rm(plugin.marker, { force: true });
+      await h.close();
+      await api.close();
+      await rm(kc.directory, { recursive: true, force: true });
+      await rm(plugin.directory, { recursive: true, force: true });
+    }
+  });
+}
+
+test("the late upstream close of a stream the PREVIOUS session left behind neither removes nor speaks for the next session's stream with the same id", async () => {
+  // `#abortAll` closes the stream when the session drops, but the upstream
+  // close completes only when the apiserver answers — here, when the test
+  // says so. Before the fix the stale `onClose` then deleted `#streams` by id
+  // (taking session 2's stream 1 with it) and sent `strclose` for id 1 on the
+  // socket of the moment: session 2's.
+  const api = await fakeStreamApiserver();
+  const kc = await kubeconfigFor(api.url, ["      token: t"]);
+  const h = await harness({ kubeconfig: kc.path });
+  try {
+    await until("the collector has started", () => h.starts === 1);
+
+    h.core.send({ t: "stropen", id: 1, path: EXEC_PATH, query: "command=sh&stdin=true", protocols: EXEC_PROTOCOLS });
+    await until("session 1's stream 1 is open", () => controlFor(h.core, 1).includes("strok"));
+    assert.equal(h.client.streamCount, 1);
+
+    h.core.drop();
+    await until("the agent reconnected", () => h.core.sessions === 2 && h.sink!.ready);
+    assert.equal(h.client.streamCount, 0, "the disconnect released session 1's stream");
+    assert.equal(api.socketsClosed, 0, "the apiserver has not answered the close yet");
+    const mark = h.core.received.length;
+
+    // Session 2 allocates from 1 again.
+    h.core.send({ t: "stropen", id: 1, path: EXEC_PATH, query: "command=bash&stdin=true", protocols: EXEC_PROTOCOLS });
+    await until("session 2's stream 1 is open", () => controlFor(h.core, 1, mark).includes("strok"));
+    assert.equal(h.client.streamCount, 1);
+    assert.equal(api.upgrades.length, 2);
+
+    // NOW session 1's upstream close lands.
+    api.sockets[0]!.destroy();
+    await until("the apiserver side of session 1's stream is closed", () => api.socketsClosed >= 1);
+    await settle();
+
+    assert.deepEqual(
+      { streamCount: h.client.streamCount, session2ForId1: controlFor(h.core, 1, mark) },
+      { streamCount: 1, session2ForId1: ["strok"] },
+      "the previous session's late onClose removed or spoke for the next session's stream 1",
+    );
+  } finally {
+    await h.close();
+    await api.close();
+    await rm(kc.directory, { recursive: true, force: true });
   }
 });
 

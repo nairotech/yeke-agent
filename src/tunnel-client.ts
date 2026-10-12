@@ -501,8 +501,22 @@ export class TunnelClient {
   #socket: WebSocket | null = null;
   #inFlight = new Map<number, InFlight>();
   #requestBodies = new Map<number, RequestBody>();
-  /** Open v4 streams; the id space is shared with requests (the control plane splits it). */
+  /**
+   * Open v4 streams; the id space is shared with requests (the control plane splits it).
+   *
+   * Holds only the CURRENT session's streams: `#abortAll` clears it when a
+   * session ends, and a stream's own late callbacks remove it only while the
+   * entry is still that very stream (see `#openStream`). That is what lets
+   * `#onBodyFrame` and the `credit` branch look a stream up by id alone.
+   */
   #streams = new Map<number, UpstreamStream>();
+  /**
+   * Streams between `stropen` and their upstream socket existing, i.e. still in
+   * `await target.authHeaders()`. The controller is how `cancel`/`strclose` and
+   * `#abortAll` reach a stream that `#streams` cannot show yet (see
+   * `#openStream`).
+   */
+  #openingStreams = new Map<number, AbortController>();
   /**
    * The negotiated version reported by the control plane (`welcome.protocol`).
    *
@@ -864,7 +878,7 @@ export class TunnelClient {
       // its `req` or its `credit` — each of them is proof that it is alive.
       this.#lastSeenAt = Date.now();
       if (isBinary) this.#onBodyFrame(data as Buffer);
-      else this.#onControl(data);
+      else this.#onControl(data, socket);
     });
 
     socket.on("close", (code, reason) => {
@@ -1012,6 +1026,11 @@ export class TunnelClient {
     // apiserver side would be a process nobody is reading.
     for (const stream of this.#streams.values()) stream.close(1001, "tunnel disconnected");
     this.#streams.clear();
+    // A stream still resolving its credentials is aborted, not merely
+    // forgotten: `#openStream` checks the signal after `authHeaders()` and does
+    // not open upstream at all (nothing would ever read that pty).
+    for (const abort of this.#openingStreams.values()) abort.abort();
+    this.#openingStreams.clear();
   }
 
   #scheduleReconnect(): void {
@@ -1021,15 +1040,23 @@ export class TunnelClient {
     setTimeout(() => this.#connect(), delay);
   }
 
-  #send(message: ControlMessage): void {
-    if (this.#socket?.readyState === WebSocket.OPEN) {
-      this.#socket.send(serializeControlMessage(message));
+  /**
+   * Writes a control message to `session` — by default the socket of the
+   * moment. A stream passes the session it was opened on instead (see
+   * `#openStream`): a socket that has closed never becomes OPEN again (a
+   * reconnect is a new `WebSocket`), so whatever a finished session's stream
+   * still has to say is dropped here rather than landing on the next session.
+   */
+  #send(message: ControlMessage, session: WebSocket | null = this.#socket): void {
+    if (session?.readyState === WebSocket.OPEN) {
+      session.send(serializeControlMessage(message));
     }
   }
 
-  #sendBody(requestId: number, payload: Uint8Array): void {
-    if (this.#socket?.readyState === WebSocket.OPEN) {
-      this.#socket.send(encodeBodyFrame(requestId, payload));
+  /** Same session rule as `#send`. */
+  #sendBody(requestId: number, payload: Uint8Array, session: WebSocket | null = this.#socket): void {
+    if (session?.readyState === WebSocket.OPEN) {
+      session.send(encodeBodyFrame(requestId, payload));
     }
   }
 
@@ -1048,13 +1075,16 @@ export class TunnelClient {
    * Most branches also write a more detailed English line at their own point
    * (the credential plugin family, for example); the line here is not a record
    * of that detail but of "what went on the wire".
+   *
+   * `session` follows `#send`'s rule: a stream names the session it belongs to.
    */
-  #fail(id: number, failure: TunnelFailure): void {
+  #fail(id: number, failure: TunnelFailure, session: WebSocket | null = this.#socket): void {
     console.warn(`[agent] request ${id} failed: ${describeFailure(failure)}`);
-    this.#send({ t: "err", id, ...failure });
+    this.#send({ t: "err", id, ...failure }, session);
   }
 
-  #onControl(raw: RawData): void {
+  /** `session` is the socket the message arrived on: a stream is bound to it (see `#openStream`). */
+  #onControl(raw: RawData, session: WebSocket): void {
     let message: ControlMessage;
     try {
       message = parseControlMessage(raw.toString());
@@ -1115,7 +1145,8 @@ export class TunnelClient {
         this.#requestBodies.get(message.id)?.abort();
         this.#requestBodies.delete(message.id);
         // `cancel` can also arrive with a stream id (the id space is shared):
-        // cancelling a stream means closing its upstream socket.
+        // cancelling a stream means closing its upstream socket — or, if it is
+        // still resolving its credentials, never opening one.
         this.#closeStream(message.id, 1000, "cancelled");
         break;
       }
@@ -1124,13 +1155,26 @@ export class TunnelClient {
         // cancelled request must not open a new window. In v4 the same message
         // also arrives for the stdout/stderr direction of a stream — that it
         // does not state a direction is by design: credit is always granted by
-        // the **receiver**.
+        // the **receiver**. Looking the stream up by id alone is safe because
+        // `#streams` holds only this session's streams (see its comment).
         this.#inFlight.get(message.id)?.credit.grant(message.bytes);
         this.#streams.get(message.id)?.grantCredit(message.bytes);
         break;
       }
       case "stropen": {
-        void this.#openStream(message);
+        // Registered HERE, before the handler starts, for the same reason as
+        // `req` above: the handler's first await is `authHeaders()`, which an
+        // abort cannot interrupt, and a `cancel`/`strclose` arriving meanwhile
+        // must find something to abort — `#streams` has no entry until the
+        // upstream socket exists.
+        //
+        // A duplicate id is ignored, and the check covers a stream still
+        // opening as well as an open one: two handlers racing for one id would
+        // leave one upstream socket nobody can address.
+        if (this.#streams.has(message.id) || this.#openingStreams.has(message.id)) break;
+        const abort = new AbortController();
+        this.#openingStreams.set(message.id, abort);
+        void this.#openStream(message, abort, session);
         break;
       }
       case "strclose": {
@@ -1151,7 +1195,8 @@ export class TunnelClient {
     // If it is a stream id, the payload is written straight to the apiserver:
     // its first byte is k8s's channel byte and the agent does **not** interpret
     // it (the one exception being the half-close gate, see
-    // `UpstreamStream.write`).
+    // `UpstreamStream.write`). By id alone, as in the `credit` branch:
+    // `#streams` holds only this session's streams.
     const stream = this.#streams.get(decoded.requestId);
     if (stream) {
       stream.write(decoded.payload);
@@ -1173,86 +1218,152 @@ export class TunnelClient {
    * (the final say on authorization belongs to Kubernetes RBAC). Measured:
    * impersonation headers are both carried and enforced on the WS upgrade
    * request.
+   *
+   * A stream belongs to ONE session, the `session` its `stropen` arrived on,
+   * and every message it ever sends goes to that socket only. Stream ids are
+   * per session, exactly like request ids (the control plane allocates them
+   * from 1 again on every connection, in the same id space; see
+   * `#handleRequest`'s `finally`), and a stream can outlive its session in two
+   * ways:
+   *
+   *  - Still opening: `await target.authHeaders()` cannot be interrupted (an
+   *    exec plugin runs to completion), so the session may drop, and even the
+   *    next one connect, before it returns. Measured before this rule: the
+   *    stale handler then opened the exec upgrade on the apiserver, put the
+   *    stream into the next session's `#streams` and sent that session `strok`
+   *    (or `err`) for an id it had never allocated — a pty nobody reads.
+   *  - Open: `#abortAll` closes it, but the upstream close completes later, and
+   *    its `onClose`/`onError` run then. Deleting by id would remove the next
+   *    session's stream that reuses the id, and `this.#socket` would by then
+   *    be the next session's socket.
+   *
+   * The same holds within one session for the cancellation race: a
+   * `cancel`/`strclose` that arrives while the stream is still resolving its
+   * credentials aborts `abort` (registered by the `stropen` branch). After
+   * `authHeaders()` an aborted stream — or one whose session is no longer open
+   * — is NOT opened upstream, and no `err` is sent either: the control plane
+   * has already forgotten the id.
    */
-  async #openStream(message: StreamOpenMessage): Promise<void> {
-    const target = this.#target;
-    if (!target) {
-      this.#fail(message.id, { code: "NO_TARGET", params: {} });
-      return;
-    }
-    if (!isAllowedPath(message.path)) {
-      this.#fail(message.id, { code: "PATH_NOT_ALLOWED", params: { path: message.path } });
-      return;
-    }
-    if (message.protocols.length === 0) {
-      // The wire schema already rejects this (`z.array().min(1)`); the gate is
-      // here too because a stream opened with an empty list would fall back to
-      // the unversioned `channel.k8s.io` and the failure would surface months
-      // later as "exit codes are always 0".
-      this.#fail(message.id, { code: "STREAM_PROTOCOL_REQUIRED", params: {} });
-      return;
-    }
-    if (this.#streams.has(message.id)) return;
-
+  async #openStream(
+    message: StreamOpenMessage,
+    abort: AbortController,
+    session: WebSocket,
+  ): Promise<void> {
+    const { id } = message;
     try {
-      const headers: Record<string, string | string[]> = {};
-      if (message.impersonate) {
-        headers["Impersonate-User"] = message.impersonate.user;
-        if (message.impersonate.groups.length > 0) {
-          headers["Impersonate-Group"] = message.impersonate.groups;
-        }
+      const target = this.#target;
+      if (!target) {
+        this.#fail(id, { code: "NO_TARGET", params: {} }, session);
+        return;
       }
-      // The order is binding: `authHeaders()` can replace the TLS material
-      // during an exec refresh, so `tlsOptions()` is read AFTER it (the same
-      // rule as the dispatcher in `#handleRequest`).
-      Object.assign(headers, await target.authHeaders());
-      const tls = target.tlsOptions();
+      if (!isAllowedPath(message.path)) {
+        this.#fail(id, { code: "PATH_NOT_ALLOWED", params: { path: message.path } }, session);
+        return;
+      }
+      if (message.protocols.length === 0) {
+        // The wire schema already rejects this (`z.array().min(1)`); the gate is
+        // here too because a stream opened with an empty list would fall back to
+        // the unversioned `channel.k8s.io` and the failure would surface months
+        // later as "exit codes are always 0".
+        this.#fail(id, { code: "STREAM_PROTOCOL_REQUIRED", params: {} }, session);
+        return;
+      }
 
-      // `https:` → `wss:`. Rather than writing the scheme by hand we derive it
-      // from the target.
-      const base = target.baseUrl.replace(/^http/, "ws");
-      const url = `${base}${message.path}${message.query ? `?${message.query}` : ""}`;
+      try {
+        const headers: Record<string, string | string[]> = {};
+        if (message.impersonate) {
+          headers["Impersonate-User"] = message.impersonate.user;
+          if (message.impersonate.groups.length > 0) {
+            headers["Impersonate-Group"] = message.impersonate.groups;
+          }
+        }
+        // The order is binding: `authHeaders()` can replace the TLS material
+        // during an exec refresh, so `tlsOptions()` is read AFTER it (the same
+        // rule as the dispatcher in `#handleRequest`).
+        Object.assign(headers, await target.authHeaders());
+        // The one await is behind us; see the doc comment. From here to
+        // `#streams.set` everything is synchronous, so no `cancel` and no
+        // disconnect can slip in between this check and the registration.
+        if (abort.signal.aborted || session.readyState !== WebSocket.OPEN) return;
+        const tls = target.tlsOptions();
 
-      const stream = new UpstreamStream(
-        { url, protocols: [...message.protocols], headers, tls },
-        {
-          onOpen: (protocol) => this.#send({ t: "strok", id: message.id, protocol }),
-          onFrame: (frame) => this.#sendBody(message.id, frame),
-          onStdinDelivered: (bytes) => this.#send({ t: "credit", id: message.id, bytes }),
-          onClose: (code, reason) => {
-            this.#streams.delete(message.id);
-            this.#send({ t: "strclose", id: message.id, code, reason });
+        // `https:` → `wss:`. Rather than writing the scheme by hand we derive it
+        // from the target.
+        const base = target.baseUrl.replace(/^http/, "ws");
+        const url = `${base}${message.path}${message.query ? `?${message.query}` : ""}`;
+
+        // The hooks only ever run from the upstream socket's events, never
+        // during construction, so `stream` is assigned by the time they read it.
+        const stream: UpstreamStream = new UpstreamStream(
+          { url, protocols: [...message.protocols], headers, tls },
+          {
+            onOpen: (protocol) => this.#send({ t: "strok", id, protocol }, session),
+            onFrame: (frame) => this.#sendBody(id, frame, session),
+            onStdinDelivered: (bytes) => this.#send({ t: "credit", id, bytes }, session),
+            onClose: (code, reason) => {
+              this.#forgetStream(id, stream);
+              this.#send({ t: "strclose", id, code, reason }, session);
+            },
+            onError: (failure) => {
+              this.#forgetStream(id, stream);
+              this.#fail(id, failure, session);
+            },
           },
-          onError: (failure) => {
-            this.#streams.delete(message.id);
-            this.#fail(message.id, failure);
-          },
-        },
-      );
-      this.#streams.set(message.id, stream);
-    } catch (err) {
-      // The only way to land here is identity resolution and TLS material
-      // (`authHeaders`, `tlsOptions`): the socket does not exist yet. Identity
-      // failures arrive already typed as `AgentFailure` and pass through AS IS —
-      // the fallback branch is only for an unclassifiable error, and even then
-      // the `detail` is Node's text, not ours.
-      //
-      // `origin: "node"` is this very comment, except now it is IN THE SCHEMA:
-      // for one round it was only written here, and the user interface still
-      // printed "what the socket reported:" — while no socket had reported
-      // anything. The comment was right, nobody read it; a truth without a gate
-      // is violated sooner or later.
-      this.#fail(
-        message.id,
-        failureOf(err, (detail) => ({
-          code: "EXEC_UPGRADE_UNREACHABLE",
-          params: { origin: "node", detail },
-        })),
-      );
+        );
+        this.#streams.set(id, stream);
+      } catch (err) {
+        // Aborted: the control plane has forgotten this id (or its session is
+        // gone), so there is nobody to tell.
+        if (abort.signal.aborted) return;
+        // The only way to land here is identity resolution and TLS material
+        // (`authHeaders`, `tlsOptions`): the socket does not exist yet. Identity
+        // failures arrive already typed as `AgentFailure` and pass through AS IS —
+        // the fallback branch is only for an unclassifiable error, and even then
+        // the `detail` is Node's text, not ours.
+        //
+        // `origin: "node"` is this very comment, except now it is IN THE SCHEMA:
+        // for one round it was only written here, and the user interface still
+        // printed "what the socket reported:" — while no socket had reported
+        // anything. The comment was right, nobody read it; a truth without a gate
+        // is violated sooner or later.
+        this.#fail(
+          id,
+          failureOf(err, (detail) => ({
+            code: "EXEC_UPGRADE_UNREACHABLE",
+            params: { origin: "node", detail },
+          })),
+          session,
+        );
+      }
+    } finally {
+      // Only OUR registration: by now `#abortAll` may have cleared it and the
+      // next session's `stropen` may have registered the same id.
+      if (this.#openingStreams.get(id) === abort) this.#openingStreams.delete(id);
     }
   }
 
+  /**
+   * Removes `stream` from `#streams` only if the entry is still that stream: a
+   * late callback of a stream `#abortAll` already closed must not remove the
+   * next session's stream that reuses its id (see `#openStream`).
+   */
+  #forgetStream(id: number, stream: UpstreamStream): void {
+    if (this.#streams.get(id) === stream) this.#streams.delete(id);
+  }
+
+  /**
+   * The control plane closes (`strclose`) or cancels (`cancel`) a stream. The
+   * lookups by id are safe here: this runs on a message of the current
+   * session, and both maps hold only the current session's entries.
+   */
   #closeStream(id: number, code: number, reason?: string): void {
+    // Still resolving its credentials: there is no socket to close yet, so the
+    // abort is what keeps `#openStream` from opening one.
+    const opening = this.#openingStreams.get(id);
+    if (opening) {
+      opening.abort();
+      this.#openingStreams.delete(id);
+    }
     const stream = this.#streams.get(id);
     if (!stream) return;
     this.#streams.delete(id);
@@ -1408,6 +1519,7 @@ export class TunnelClient {
       // the NEXT session's request; deleting by id alone would erase that
       // request's entry (it drops out of `busy`/`inFlightCount`) and its body
       // buffer (its `reqend` lands nowhere and it never gets an answer).
+      // Streams share the id space and the same hazard; see `#openStream`.
       if (this.#inFlight.get(req.id)?.abort === abort) this.#inFlight.delete(req.id);
       if (this.#requestBodies.get(req.id) === ownBody) this.#requestBodies.delete(req.id);
     }
