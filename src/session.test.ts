@@ -114,6 +114,26 @@ test("a stopped record is silent: no message, no body frame, no `err`, and no lo
   assert.deepEqual(credits, [10], "credit is still handed to the upstream object; the lookup by id is what drops late credit");
 });
 
+test("a record that was never stopped, on a socket that is already closing: its failure is logged, and nothing is written to the socket", () => {
+  // Base (577c1c4): `fail` gated the log on `live` too, so a real upstream
+  // error in the window between the peer starting its close and the 'close'
+  // event left no line at all.
+  const socket = fakeSocket();
+  const session = sessionOn(socket);
+  const record = session.claim(6, (s) => new StreamRecord(s, 6))!;
+  socket.readyState = WebSocket.CLOSING;
+  const originalWarn = console.warn;
+  const lines: string[] = [];
+  console.warn = (...args: unknown[]) => void lines.push(args.join(" "));
+  try {
+    record.fail({ code: "STREAM_UPSTREAM_ERROR", params: { detail: "upstream reset" } });
+  } finally {
+    console.warn = originalWarn;
+  }
+  assert.deepEqual(lines, ["[agent] request 6 failed: STREAM_UPSTREAM_ERROR detail=upstream reset"]);
+  assert.deepEqual(socket.sent, [], "a failure went to a socket that can no longer carry it");
+});
+
 test("finish(): the record's own end releases it without touching what it held", () => {
   const session = sessionOn(fakeSocket());
   const record = session.claim(5, (s) => new StreamRecord(s, 5))!;
