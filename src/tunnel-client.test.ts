@@ -709,10 +709,12 @@ test("credit starvation holds a request in flight with no agent-side bound, with
 test("a request of the PREVIOUS session does not erase the next session's request that reuses its id (core restarts ids at 1 per session)", async () => {
   // A credential plugin that is slow on demand: its token is always already
   // expired, so EVERY request re-runs it, and while the marker file exists it
-  // takes two seconds. `authHeaders()` is the one await in `#handleRequest` that
-  // an abort cannot interrupt — so a handler parked in it outlives the session.
+  // parks until the test removes the marker (no fixed sleep: a clock-bound park
+  // lets a loaded machine outrun the window this test needs). `authHeaders()`
+  // is the one await in `#handleRequest` that an abort cannot interrupt — so a
+  // handler parked in it outlives the session.
   // Every run is recorded — `s` on entry, `e` on exit, and `w`/`W` around the
-  // slow sleep — so the test waits on what the plugin did, never on a clock.
+  // park — so the test waits on what the plugin did, never on a clock.
   const directory = await mkdtemp(join(tmpdir(), "yeke-agent-plugin-"));
   const marker = join(directory, "slow");
   const runs = join(directory, "runs");
@@ -723,7 +725,7 @@ test("a request of the PREVIOUS session does not erase the next session's reques
     [
       "#!/bin/sh",
       `printf s >> "${runs}"`,
-      `if [ -f "${marker}" ]; then printf w >> "${runs}"; sleep 2; printf W >> "${runs}"; fi`,
+      `if [ -f "${marker}" ]; then printf w >> "${runs}"; while [ -f "${marker}" ]; do sleep 0.05; done; printf W >> "${runs}"; fi`,
       `printf e >> "${runs}"`,
       `printf '%s' '{"apiVersion":"client.authentication.k8s.io/v1","kind":"ExecCredential","status":{"token":"t","expirationTimestamp":"2000-01-01T00:00:00Z"}}'`,
       "",
@@ -761,7 +763,6 @@ test("a request of the PREVIOUS session does not erase the next session's reques
     // the handler cannot see the abort until the plugin returns.
     h.core.drop();
     await until("the agent reconnected", () => h.core.sessions === 2 && h.sink!.ready);
-    await rm(marker);
 
     // Session 2 allocates from 1 again (`RequestIdAllocator` is per session in
     // core) — a PATCH with a body, its `reqend` not sent yet.
@@ -771,10 +772,14 @@ test("a request of the PREVIOUS session does not erase the next session's reques
     // parked HERE. If the machine was so slow that it already woke up, its
     // `finally` ran before the id was reused and the test would prove nothing
     // — so that is a failure, not a pass.
+    // The marker is still there, so parking holds for as long as it takes.
     assert.equal(parked(), true, "session 1's handler must still be parked when session 2 reuses id 1");
 
-    // Wait for the slow run to END (the plugin exited; session 2's /version
-    // read joined that same run), then give the stale handler its turns to
+    // Release the park only now. Every run that started while the marker
+    // existed (session 1's, and session 2's /version read, whether it joined
+    // that run or opened its own) ends when the marker goes.
+    await rm(marker);
+    // Wait for those runs to END, then give the stale handler its turns to
     // reach `finally`. Measured only once the stale `finally` has had its
     // chance, not after a fixed sleep that a loaded machine could outrun.
     await until("session 1's plugin run is over", () => count("W") >= 1 && pluginIdle());
