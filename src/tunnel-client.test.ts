@@ -21,6 +21,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { execFile, execFileSync } from "node:child_process";
 import { X509Certificate } from "node:crypto";
+import { readFileSync } from "node:fs";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { createServer as createHttpsServer, type Server as HttpsServer } from "node:https";
 import { tmpdir } from "node:os";
@@ -275,9 +276,11 @@ interface Harness {
 }
 
 async function harness(
-  options: { protocol?: number | undefined; metricsEnabled?: boolean } = {},
+  options: { protocol?: number | undefined; metricsEnabled?: boolean; kubeconfig?: string } = {},
 ): Promise<Harness> {
-  process.env.KUBECONFIG = await kubeconfig();
+  // `kubeconfig`: a test that needs a REAL (fake) apiserver or a credential
+  // plugin passes its own file; everything else keeps the unreachable one.
+  process.env.KUBECONFIG = options.kubeconfig ?? (await kubeconfig());
   const core = await fakeCore("protocol" in options ? options.protocol : 5);
   const config: AgentConfig = {
     coreUrl: core.url,
@@ -497,6 +500,150 @@ test("a user request in the queue makes the sink BUSY, and cancelling it frees t
     assert.equal(sink.busy, false);
   } finally {
     await h.close();
+  }
+});
+
+// ─── `#inFlight` bookkeeping across sessions ─────────────────────────────────
+
+/** A kubeconfig in its own directory, pointing at `server`, with the given user block. */
+async function kubeconfigFor(server: string, userLines: readonly string[]): Promise<{
+  readonly path: string;
+  readonly directory: string;
+}> {
+  const directory = await mkdtemp(join(tmpdir(), "yeke-agent-inflight-"));
+  const path = join(directory, "config");
+  await writeFile(
+    path,
+    [
+      "apiVersion: v1",
+      "kind: Config",
+      "clusters:",
+      "  - name: c",
+      "    cluster:",
+      `      server: ${server}`,
+      "contexts:",
+      "  - name: c",
+      "    context:",
+      "      cluster: c",
+      "      user: u",
+      "current-context: c",
+      "users:",
+      "  - name: u",
+      "    user:",
+      ...userLines,
+      "",
+    ].join("\n"),
+  );
+  return { path, directory };
+}
+
+test("a request of the PREVIOUS session does not erase the next session's request that reuses its id (core restarts ids at 1 per session)", async () => {
+  // A credential plugin that is slow on demand: its token is always already
+  // expired, so EVERY request re-runs it, and while the marker file exists it
+  // takes two seconds. `authHeaders()` is the one await in `#handleRequest` that
+  // an abort cannot interrupt — so a handler parked in it outlives the session.
+  // Every run is recorded — `s` on entry, `e` on exit, and `w`/`W` around the
+  // slow sleep — so the test waits on what the plugin did, never on a clock.
+  const directory = await mkdtemp(join(tmpdir(), "yeke-agent-plugin-"));
+  const marker = join(directory, "slow");
+  const runs = join(directory, "runs");
+  const plugin = join(directory, "plugin.sh");
+  await writeFile(runs, "");
+  await writeFile(
+    plugin,
+    [
+      "#!/bin/sh",
+      `printf s >> "${runs}"`,
+      `if [ -f "${marker}" ]; then printf w >> "${runs}"; sleep 2; printf W >> "${runs}"; fi`,
+      `printf e >> "${runs}"`,
+      `printf '%s' '{"apiVersion":"client.authentication.k8s.io/v1","kind":"ExecCredential","status":{"token":"t","expirationTimestamp":"2000-01-01T00:00:00Z"}}'`,
+      "",
+    ].join("\n"),
+    { mode: 0o755 },
+  );
+  // The agent reads /version on every connection, through the same plugin, and
+  // `CredentialCache` lets concurrent callers JOIN a run in progress. A request
+  // sent while that run is still going would join it — past the marker check,
+  // so fast — and be over (ECONNREFUSED) before a poll could see it in flight.
+  const count = (mark: string): number => readFileSync(runs, "utf8").split(mark).length - 1;
+  const pluginIdle = (): boolean => count("s") > 0 && count("s") === count("e");
+  /** The slow run is asleep: session 1's handler is parked in `authHeaders()`. */
+  const parked = (): boolean => count("w") > count("W");
+  // The apiserver stays unreachable: an `err` on the wire is an answer too,
+  // and an answer is what this test asks for.
+  const kc = await kubeconfigFor("https://127.0.0.1:1", [
+    "      exec:",
+    "        apiVersion: client.authentication.k8s.io/v1",
+    `        command: ${plugin}`,
+    "        interactiveMode: Never",
+  ]);
+  const h = await harness({ kubeconfig: kc.path });
+  try {
+    await until("the collector has started", () => h.starts === 1);
+    await until("the startup /version read's plugin run is over", pluginIdle);
+
+    // Session 1, request 1: parked inside the slow plugin.
+    await writeFile(marker, "");
+    h.core.send({ t: "req", id: 1, method: "GET", path: "/api/v1/pods", headers: {}, hasBody: false });
+    await until("request 1 is in flight", () => h.client.inFlightCount === 1);
+    await until("request 1 is parked in the slow plugin", parked);
+
+    // The session drops. `#abortAll` clears the map and aborts the handler, but
+    // the handler cannot see the abort until the plugin returns.
+    h.core.drop();
+    await until("the agent reconnected", () => h.core.sessions === 2 && h.sink!.ready);
+    await rm(marker);
+
+    // Session 2 allocates from 1 again (`RequestIdAllocator` is per session in
+    // core) — a PATCH with a body, its `reqend` not sent yet.
+    h.core.send({ t: "req", id: 1, method: "PATCH", path: "/api/v1/namespaces/default/configmaps/x", headers: {}, hasBody: true });
+    await until("session 2's request 1 is in flight", () => h.client.inFlightCount === 1);
+    // The collision this test is about needs the stale handler to be still
+    // parked HERE. If the machine was so slow that it already woke up, its
+    // `finally` ran before the id was reused and the test would prove nothing
+    // — so that is a failure, not a pass.
+    assert.equal(parked(), true, "session 1's handler must still be parked when session 2 reuses id 1");
+
+    // Wait for the slow run to END (the plugin exited; session 2's /version
+    // read joined that same run), then give the stale handler its turns to
+    // reach `finally`. Measured only once the stale `finally` has had its
+    // chance, not after a fixed sleep that a loaded machine could outrun.
+    await until("session 1's plugin run is over", () => count("W") >= 1 && pluginIdle());
+    await settle();
+    const countAfterStaleFinally = h.client.inFlightCount;
+
+    // Now session 2 finishes its body. If its buffer survived, the request is
+    // applied and SOME answer (`res` or `err`) comes back for id 1.
+    //
+    // The window starts HERE, after the stale `finally` had its time: everything
+    // the agent sends for id 1 from now on can only be session 2's answer.
+    // Session 1's handler cannot contribute to it — it was aborted, so its
+    // `catch` skips `#fail`, `end` is guarded by `!abort.signal.aborted`, and
+    // `res` is never reached because `request()` rejects on the aborted signal.
+    const mark = h.core.received.length;
+    h.core.send({ t: "reqend", id: 1 });
+    let answered = false;
+    try {
+      await until("session 2's request 1 got an answer", () =>
+        h.core.received.slice(mark).some((r) => {
+          const m = r.control;
+          return m !== undefined && "id" in m && m.id === 1 && (m.t === "res" || m.t === "err");
+        }),
+      );
+      answered = true;
+    } catch {
+      answered = false;
+    }
+
+    assert.deepEqual(
+      { countAfterStaleFinally, answered },
+      { countAfterStaleFinally: 1, answered: true },
+      "the previous session's late `finally` deleted the new session's `#inFlight` entry and body buffer",
+    );
+  } finally {
+    await h.close();
+    await rm(kc.directory, { recursive: true, force: true });
+    await rm(directory, { recursive: true, force: true });
   }
 });
 
