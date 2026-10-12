@@ -708,6 +708,24 @@ test("credit starvation holds a request in flight with no agent-side bound, with
   }
 });
 
+/**
+ * The session's `hello` is in: the /version read it carries has resolved its
+ * credential (`readKubernetesVersion` awaits `authHeaders()` and swallows the
+ * request's own failure, so this holds against an unreachable apiserver too)
+ * and `CredentialCache` has dropped the in-flight run, so the next
+ * `authHeaders()` starts a run of its own rather than joining that one.
+ *
+ * "The plugin's run is over" (`s` count equals `e` count) is not enough for
+ * this: the plugin writes `e` before it prints its credential and exits, and
+ * `CredentialCache` clears its in-flight promise only once the process has
+ * gone. A call landing in that gap joins the finishing run (fast, past the
+ * marker check) and never parks. Measured once in a full-suite run: "timed
+ * out waiting until stream 1 is parked".
+ */
+function helloSent(core: FakeCore): boolean {
+  return core.received.some((r) => r.control?.t === "hello");
+}
+
 test("a request of the PREVIOUS session does not erase the next session's request that reuses its id (core restarts ids at 1 per session)", async () => {
   // A credential plugin that is slow on demand: its token is always already
   // expired, so EVERY request re-runs it, and while the marker file exists it
@@ -738,6 +756,7 @@ test("a request of the PREVIOUS session does not erase the next session's reques
   // `CredentialCache` lets concurrent callers JOIN a run in progress. A request
   // sent while that run is still going would join it — past the marker check,
   // so fast — and be over (ECONNREFUSED) before a poll could see it in flight.
+  // So the start waits for `hello`, not for the run's `e` (see `helloSent`).
   const count = (mark: string): number => readFileSync(runs, "utf8").split(mark).length - 1;
   const pluginIdle = (): boolean => count("s") > 0 && count("s") === count("e");
   /** The slow run is asleep: session 1's handler is parked in `authHeaders()`. */
@@ -753,7 +772,7 @@ test("a request of the PREVIOUS session does not erase the next session's reques
   const h = await harness({ kubeconfig: kc.path });
   try {
     await until("the collector has started", () => h.starts === 1);
-    await until("the startup /version read's plugin run is over", pluginIdle);
+    await until("the startup /version read's credential is settled", () => helloSent(h.core));
 
     // Session 1, request 1: parked inside the slow plugin.
     await writeFile(marker, "");
@@ -953,20 +972,6 @@ async function slowPlugin(): Promise<{
     idle: () => count("s") > 0 && count("s") === count("e"),
     parked: () => count("w") > count("W"),
   };
-}
-
-/**
- * The session's `hello` is in: the /version read it carries has resolved its
- * credential and `CredentialCache` has dropped the in-flight run, so the next
- * `authHeaders()` starts a run of its own rather than joining that one.
- *
- * `plugin.idle()` is not enough for this: the plugin writes `e` before it
- * prints its credential and exits, and a call landing in that gap joins the
- * finishing run (fast, past the marker check) and never parks. Measured once
- * in a full-suite run: "timed out waiting until stream 1 is parked".
- */
-function helloSent(core: FakeCore): boolean {
-  return core.received.some((r) => r.control?.t === "hello");
 }
 
 const EXEC_PATH = "/api/v1/namespaces/default/pods/x/exec";
