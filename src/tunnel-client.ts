@@ -285,18 +285,16 @@ const inClusterCollector: CollectorFactory = async ({ target, sink, config }) =>
 };
 
 /**
- * What `SampleWire` needs from the tunnel client, as functions rather than a
- * back-reference: the sink asks its questions at the moment it is asked one,
- * and a captured socket or protocol number would answer for the session that
- * has already ended.
+ * What `SampleWire` needs from the tunnel client, as a function rather than a
+ * back-reference: the sink asks for the session at the moment it is asked a
+ * question, and a captured session would answer for one that has already
+ * ended. Unlike everything addressed by id, samples are not owned by a
+ * session — the collector and its ring outlive every reconnect — so "the
+ * session of the moment" is the right question HERE, and only here.
  */
 interface SampleWireHooks {
-  readonly isOpen: () => boolean;
-  readonly protocol: () => number;
-  /** At least one user request whose response has not started yet. */
-  readonly hasUserRequest: () => boolean;
-  readonly sendMessage: (message: ControlMessage) => void;
-  readonly sendFrame: (payload: Uint8Array) => void;
+  /** The client's current session, ended or not; `null` before the first connection attempt. */
+  readonly session: () => TunnelSession | null;
 }
 
 /**
@@ -304,12 +302,13 @@ interface SampleWireHooks {
  *
  * ─── The two flags, on this side of the seam ────────────────────────────────
  *
- *  · `ready` is "there is a socket AND its peer can read samples". Both halves
- *    matter: the protocol number is per SESSION, so it is cleared on every
- *    disconnect (`TunnelClient.#cleanupAfterDisconnect`). Without that clearing
- *    a reconnect to an OLDER control plane would keep the previous session's
- *    answer and the agent would send frames into a peer that drops them.
- *  · `busy` is "a user request in `#inFlight` has not started its response
+ *  · `ready` is "there is a live session AND its peer can read samples". Both
+ *    halves matter: the protocol number is per SESSION (`TunnelSession.protocol`,
+ *    0 until that session's own `welcome`). Were it the agent's, a reconnect to
+ *    an OLDER control plane would keep the previous session's answer and the
+ *    agent would send frames into a peer that drops them — or, before the new
+ *    peer's `welcome`, into one that has not negotiated anything yet.
+ *  · `busy` is "a request of the current session has not started its response
  *    yet" — the request is still in the queue K5 gives priority to: its body
  *    is arriving, its identity is being resolved, or the apiserver has not
  *    answered. Once `res` is sent the request is a flowing response, not a
@@ -334,6 +333,17 @@ interface SampleWireHooks {
  * the first frame after the reconnect: the two sample times would then straddle
  * the whole outage, and a receiver drawing a rate between them would draw a
  * number nobody measured.
+ *
+ * ─── Which session the dictionary belongs to ────────────────────────────────
+ *
+ * The encoder lives here, not on the session, because its `seq` must keep
+ * counting across reconnects (`wire.ts`); its alias dictionary, on the other
+ * hand, is connection-local. Until 12.10.2026 the client reset it from its
+ * disconnect cleanup — one more call that had to stay in step with the rest
+ * of that cleanup. Now the dictionary is tagged with the session it was built
+ * for, and the first frame offered for any other session resets it (and
+ * counts the half pair the old session never got): the reset follows from the
+ * identity of the session, not from remembering to call it.
  */
 class SampleWire implements SampleSink {
   // Default clock: `agentTimeMs` is stamped at encode (= send) time, see wire.ts.
@@ -341,6 +351,8 @@ class SampleWire implements SampleSink {
   readonly #hooks: SampleWireHooks;
   #pending: InternalFrame[] = [];
   #droppedBeforeWire = 0;
+  /** The session the encoder's dictionary and `#pending` belong to. */
+  #dictionarySession: TunnelSession | null = null;
   /** Wire frames written. A frame split by size counts as its parts. */
   framesSent = 0;
   /** Frames the encoder refused. A rising number is a shape bug, not a network one. */
@@ -350,36 +362,46 @@ class SampleWire implements SampleSink {
     this.#hooks = hooks;
   }
 
+  /** The session samples may go to right now, or `null`. */
+  #target(): TunnelSession | null {
+    const session = this.#hooks.session();
+    return session?.live && session.protocol >= SAMPLE_MIN_PROTOCOL_VERSION ? session : null;
+  }
+
   get ready(): boolean {
-    return this.#hooks.isOpen() && this.#hooks.protocol() >= SAMPLE_MIN_PROTOCOL_VERSION;
+    return this.#target() !== null;
   }
 
   get busy(): boolean {
-    return this.#hooks.hasUserRequest();
+    return this.#hooks.session()?.hasWaitingRequest() ?? false;
   }
 
   push(frame: InternalFrame): boolean {
-    if (!this.ready) return false;
+    const session = this.#target();
+    if (!session) return false;
+    if (session !== this.#dictionarySession) this.#beginSession(session);
     // Accepted, not yet sent: the collector drops it from the ring on `true`,
     // so from here on this class is responsible for it (see the header).
     this.#pending.push(frame);
     if (this.#pending.length < SAMPLES_PER_WIRE_FRAME) return true;
     const batch = this.#pending;
     this.#pending = [];
-    return this.#write(batch);
+    return this.#write(batch, session);
   }
 
   /**
-   * The session ended. The half-built pair is dropped and counted; the
-   * dictionary starts again at 1 for the next one.
+   * A frame for a session the dictionary was not built for. The half-built
+   * pair of the previous session is dropped and counted; the dictionary
+   * starts again at 1.
    */
-  sessionEnded(): void {
+  #beginSession(session: TunnelSession): void {
     this.#droppedBeforeWire += this.#pending.length;
     this.#pending = [];
     this.#encoder.reset();
+    this.#dictionarySession = session;
   }
 
-  #write(frames: readonly InternalFrame[]): boolean {
+  #write(frames: readonly InternalFrame[], session: TunnelSession): boolean {
     const dropped = this.#droppedBeforeWire;
     this.#droppedBeforeWire = 0;
     try {
@@ -389,8 +411,8 @@ class SampleWire implements SampleSink {
         // The order is the contract: the control message first, the binary
         // frame second. The receiver holds the message until the frame arrives
         // and pairs them by arrival order, because WebSocket preserves it.
-        this.#hooks.sendMessage(message);
-        this.#hooks.sendFrame(payload);
+        session.send(message);
+        session.sendBody(SAMPLE_FRAME_REQUEST_ID, payload);
         this.framesSent += 1;
       }
       return true;
@@ -536,13 +558,7 @@ export class TunnelClient {
     this.#config = config;
     this.#backoff = config.reconnectMinMs;
     this.#createCollector = hooks.createCollector ?? inClusterCollector;
-    this.#sampleWire = new SampleWire({
-      isOpen: () => this.#session?.live ?? false,
-      protocol: () => this.#session?.protocol ?? 0,
-      hasUserRequest: () => this.#session?.hasWaitingRequest() ?? false,
-      sendMessage: (message) => this.#session?.send(message),
-      sendFrame: (payload) => this.#session?.sendBody(SAMPLE_FRAME_REQUEST_ID, payload),
-    });
+    this.#sampleWire = new SampleWire({ session: () => this.#session });
   }
 
   /** How many of the current session's records satisfy `which`; 0 when there is no session. */
@@ -881,10 +897,9 @@ export class TunnelClient {
     // reconnects it re-establishes the watches from scratch, so stopping all of
     // them is the correct behaviour. The negotiated version goes with the
     // session object: the next session starts at 0 until its own `welcome`.
+    // The sample dictionary needs no call here: it follows the session's
+    // identity (see `SampleWire`).
     session.end();
-    // Aliases are connection-local (see `SampleEncoder`): the next session's
-    // first frame carries the dictionary in full.
-    this.#sampleWire.sessionEnded();
   }
 
   /**
