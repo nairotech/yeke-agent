@@ -930,8 +930,12 @@ async function fakeStreamApiserver(): Promise<FakeStreamApiserver> {
  * lets a loaded machine that needs longer for "drop, reconnect, collide" wake
  * the handler too early. The park lasts exactly until the test has built the
  * collision and removes the marker.
+ *
+ * `failAfterGate`: a run that waited at the gate then exits 1 instead of
+ * printing a credential, so the caller's `authHeaders()` REJECTS after the
+ * test released it.
  */
-async function slowPlugin(): Promise<{
+async function slowPlugin(options: { readonly failAfterGate?: boolean } = {}): Promise<{
   readonly directory: string;
   readonly marker: string;
   readonly userLines: readonly string[];
@@ -951,7 +955,9 @@ async function slowPlugin(): Promise<{
     [
       "#!/bin/sh",
       `printf s >> "${runs}"`,
-      `if [ -f "${marker}" ]; then printf w >> "${runs}"; while [ -f "${marker}" ]; do sleep 0.05; done; printf W >> "${runs}"; fi`,
+      `if [ -f "${marker}" ]; then printf w >> "${runs}"; while [ -f "${marker}" ]; do sleep 0.05; done; printf W >> "${runs}";${
+        options.failAfterGate ? ` printf e >> "${runs}"; echo "plugin refused" >&2; exit 1;` : ""
+      } fi`,
       `printf e >> "${runs}"`,
       `printf '%s' '{"apiVersion":"client.authentication.k8s.io/v1","kind":"ExecCredential","status":{"token":"t","expirationTimestamp":"2000-01-01T00:00:00Z"}}'`,
       "",
@@ -1098,6 +1104,58 @@ for (const kind of ["cancel", "strclose"] as const) {
     }
   });
 }
+
+test("a stream whose credential plugin FAILS after a `cancel` sends no `err` for the id the control plane has forgotten", async () => {
+  // The `catch` in `#openStream` starts with its own abort check, and this is
+  // the one path that reaches it with the signal aborted: `authHeaders()`
+  // REJECTS after the abort (the plugin fails or times out). Measured with the
+  // check removed: `err` (AUTH_PLUGIN_FAILED) went out for id 1 on the open
+  // session, to a control plane that had already dropped the id.
+  const plugin = await slowPlugin({ failAfterGate: true });
+  const api = await fakeStreamApiserver();
+  const kc = await kubeconfigFor(api.url, plugin.userLines);
+  const h = await harness({ kubeconfig: kc.path });
+  try {
+    await until("the collector has started", () => h.starts === 1);
+    await until("the startup /version read's credential is settled", () => helloSent(h.core));
+    const mark = h.core.received.length;
+
+    await writeFile(plugin.marker, "");
+    h.core.send({ t: "stropen", id: 1, path: EXEC_PATH, query: "command=sh&stdin=true", protocols: EXEC_PROTOCOLS });
+    await until("stream 1 is held at the plugin gate", plugin.parked);
+    h.core.send({ t: "cancel", id: 1 });
+    h.core.send({ t: "ping", ts: 7 });
+    await until("the agent answered the ping", () =>
+      h.core.received.slice(mark).some((r) => r.control?.t === "pong"),
+    );
+    assert.equal(plugin.parked(), true, "stream 1 must still be parked when `cancel` is handled");
+    await rm(plugin.marker);
+
+    // Barrier: stream 2 either joins the failing run (then it gets `err`
+    // itself) or starts a fresh one after the failing run settled; both ways
+    // its answer comes after stream 1's rejection was handled.
+    await until("the failing run is over", () => plugin.count("W") >= 1 && plugin.idle());
+    h.core.send({ t: "stropen", id: 2, path: EXEC_PATH, query: "command=true", protocols: EXEC_PROTOCOLS });
+    await until("stream 2 got an answer", () => {
+      const kinds = controlFor(h.core, 2, mark);
+      return kinds.includes("strok") || kinds.includes("err");
+    });
+    await settle();
+
+    assert.deepEqual(
+      { forId1: controlFor(h.core, 1, mark), upgradesForId1: api.upgrades.filter((u) => u.includes("command=sh")) },
+      { forId1: [], upgradesForId1: [] },
+      "a cancelled stream whose credential failed afterwards still answered with `err`",
+    );
+  } finally {
+    // Release a run still held at the gate, or its process outlives the test.
+    await rm(plugin.marker, { force: true });
+    await h.close();
+    await api.close();
+    await rm(kc.directory, { recursive: true, force: true });
+    await rm(plugin.directory, { recursive: true, force: true });
+  }
+});
 
 test("the late upstream close of a stream the PREVIOUS session left behind neither removes nor speaks for the next session's stream with the same id", async () => {
   // `#abortAll` closes the stream when the session drops, but the upstream
