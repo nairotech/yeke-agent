@@ -48,8 +48,8 @@
  * Measured, 09.09.2026, on a local k3s: the collector went silent and stayed
  * silent, with the pod healthy, no restart and NOT ONE line in `kubectl logs`.
  * The cause was not a crash. `#drain` refused to hand a frame to the wire while
- * `sink.busy`, `busy` is "the control plane has a request in flight", and the
- * control plane keeps long-lived resource WATCHES open through the tunnel as
+ * `sink.busy`, `busy` was then "the control plane has a request in flight", and
+ * the control plane keeps long-lived resource WATCHES open through the tunnel as
  * ordinary requests (CustomResourceDefinitions and APIServices are in the
  * agent's own ClusterRole for exactly that reason). So `busy` was true for
  * minutes at a stretch, the drain was attempted only once per 30-second tick,
@@ -63,7 +63,8 @@
  *     ring back for `BUSY_YIELD_TICKS` ticks and not one more. Because the wire
  *     pairs two internal frames into one message anyway, yielding a single tick
  *     costs no throughput at all — it costs the user's request nothing to wait
- *     for, and it costs the cluster's monitoring nothing to give.
+ *     for. It is not free in latency, though: see the 12.10.2026 section below
+ *     for what a sink that is busy on EVERY tick does to each frame's timing.
  *  2. Nothing in the tick chain may be able to stop it. `tick()` never rejects,
  *     a pass that hangs is abandoned after `TICK_STALL_TICKS` periods, and the
  *     timer is rescheduled from a chain that cannot reject.
@@ -72,6 +73,34 @@
  *     one line every ten minutes says what it has been doing when nothing is
  *     wrong. The failure above cost a morning because both of those lines were
  *     missing.
+ *
+ * ─── What `busy` counts, and the one-tick-late frames it cost ───────────────
+ *
+ * Measured, 12.10.2026, on production (read-only): the bound above held — no
+ * cluster went silent — but `busy` still meant "any request in flight", and a
+ * control plane always has some. Core's discovery watcher keeps two watches
+ * per cluster open (CRDs and APIServices, 300 s each, re-opened without a
+ * pause) from the first schema read of a tunnel session — any screen, MCP
+ * call, chat, operation or scan — until that session ends, and browser
+ * subscriptions and `logs -f` are the same kind of request. Before a core
+ * restart 14 of 14 clusters reported `sink=busy`, and 12 of 14 sent their
+ * frames one tick late; after it, with nothing touched, 13 of 14 were on time
+ * and `sink=ready`. One schema read on one of them turned the SAME session's
+ * next liveness line from `frames=59 pushed=59 … sink=ready` into
+ * `frames=79 pushed=78 … sink=busy`.
+ *
+ * The lateness is the yield rule meeting the pairing. A sink that is busy on
+ * every tick is drained every SECOND tick, two frames at a time. Whether those
+ * two leave together depends on the parity of the pair the wire is holding:
+ * in step, the pair is (previous, current) and goes out at once; one frame out
+ * of step, the current frame is held until the next drain and EVERY message
+ * leaves a full tick after its newest sample (30–60 s after its samples).
+ *
+ * So `busy` now counts only requests whose response has not STARTED
+ * (`SampleWire` in tunnel-client.ts): K5's rule is about a user request
+ * waiting in the queue, and a request whose answer is already flowing is not
+ * waiting for anything. The yield bound stays; it is what keeps a genuinely
+ * busy control plane from becoming an off switch again.
  */
 import { IoZeroProbe, podCpuLimit, readCadvisor } from "./cadvisor.js";
 import { CounterRates } from "./counters.js";
@@ -133,12 +162,16 @@ export const DEFAULT_LIVENESS_MS = 600_000;
 /**
  * How many ticks a queued user request may postpone the drain.
  *
- * One. K5 says a user request goes first, and one tick is the whole of what
- * that costs: the wire pairs two internal frames into one message
+ * One. K5 says a user request goes first, and one tick is what that costs in
+ * throughput: the wire pairs two internal frames into one message
  * (`SAMPLES_PER_WIRE_FRAME`), so a ring drained every second tick puts exactly
- * as many messages on the wire as one drained every tick. Beyond that the rule
- * stops being a priority and becomes an off switch — which is precisely the
- * failure this constant exists to make impossible.
+ * as many messages on the wire as one drained every tick. It is NOT free in
+ * latency: a sink that stays busy tick after tick, with the pairing one frame
+ * out of step, sends every message a tick late (header, 12.10.2026). That is
+ * why `busy` counts only requests that are still waiting for their response,
+ * so that a steadily busy sink is a rare state, not the normal one. Beyond one
+ * tick the rule stops being a priority and becomes an off switch — which is
+ * precisely the failure this constant exists to make impossible.
  */
 const BUSY_YIELD_TICKS = 1;
 
@@ -237,7 +270,7 @@ export interface CollectorStats {
   readonly tickStalls: number;
   /** Frames the ring has dropped over the collector's whole life (K5's gap count). */
   readonly droppedTotal: number;
-  /** What the wire can take right now: `ready`, `busy` (a user request is in flight) or `down`. */
+  /** What the wire can take right now: `ready`, `busy` (a user request is waiting for its response) or `down`. */
   readonly sinkState: SinkState;
 }
 
@@ -445,8 +478,9 @@ export class Collector {
    * the ring kept during the outage drains when the wire returns, and "on the
    * next tick, if the control plane happens to be idle at that instant" is not
    * what that sentence means. `force` because the control plane re-opens its
-   * watches within milliseconds of the handshake, so waiting for an unbusy
-   * moment here is waiting for one that does not come.
+   * watches within milliseconds of the handshake, and until each of them has
+   * its response headers it counts as a queued request: the moment right after
+   * a reconnect is the one moment `busy` is most likely to be true.
    */
   flush(): void {
     this.#drain(true);

@@ -210,9 +210,10 @@ export class SampleEncoder {
     // estimate — one tick plus a collection pass, just over the receiver's
     // 30 s threshold, which shifts the whole series by a slot and raises the
     // "clock skew" chip. That pattern fits the busy case above; why those
-    // sinks stay busy was not measured. Either way the core cannot tell a
-    // systematic send delay from a real skew; only the agent knows when it
-    // sent.
+    // sinks stayed busy was measured later (12.10.2026, collector.ts header:
+    // open watches counted as queued requests). Either way the core cannot
+    // tell a systematic send delay from a real skew; only the agent knows
+    // when it sent.
     //
     // Read ONCE per call: every part of a split frame carries the same value,
     // so the parts of one frame never disagree about the skew.

@@ -206,6 +206,12 @@ interface InFlight {
   abort: AbortController;
   /** Remaining credit for this request's response body. */
   credit: CreditWindow;
+  /**
+   * `res` has gone out: the apiserver answered and the body is flowing (or
+   * about to). From here on the request is no longer WAITING for anything the
+   * agent could give it sooner, which is what `SampleWire.busy` asks about.
+   */
+  responding: boolean;
 }
 
 /**
@@ -374,6 +380,7 @@ const inClusterCollector: CollectorFactory = async ({ target, sink, config }) =>
 interface SampleWireHooks {
   readonly isOpen: () => boolean;
   readonly protocol: () => number;
+  /** At least one user request whose response has not started yet. */
   readonly hasUserRequest: () => boolean;
   readonly sendMessage: (message: ControlMessage) => void;
   readonly sendFrame: (payload: Uint8Array) => void;
@@ -389,10 +396,20 @@ interface SampleWireHooks {
  *    disconnect (`TunnelClient.#cleanupAfterDisconnect`). Without that clearing
  *    a reconnect to an OLDER control plane would keep the previous session's
  *    answer and the agent would send frames into a peer that drops them.
- *  · `busy` is `#inFlight`, the user requests being applied. Streams are
- *    deliberately NOT counted: an open `kubectl exec` lives for minutes, and a
- *    shell left open in one browser tab would otherwise silence a cluster's
- *    monitoring for as long as it stays open.
+ *  · `busy` is "a user request in `#inFlight` has not started its response
+ *    yet" — the request is still in the queue K5 gives priority to: its body
+ *    is arriving, its identity is being resolved, or the apiserver has not
+ *    answered. Once `res` is sent the request is a flowing response, not a
+ *    queued one, and it stops counting. That matters because the control plane
+ *    keeps responses open for as long as a session lives: the discovery
+ *    watcher's two watches per cluster (CRDs, APIServices; re-opened every
+ *    300 s without a pause), browser subscriptions, `logs -f`. Counting every
+ *    entry made `busy` true on almost every tick (12.10.2026, production: 14 of
+ *    14 clusters `sink=busy` before a core restart; see `collector.ts`).
+ *    Streams are deliberately NOT counted either, for the same reason: an open
+ *    `kubectl exec` lives for minutes, and a shell left open in one browser tab
+ *    would otherwise hold the cluster's monitoring back for as long as it stays
+ *    open.
  *
  * ─── The one frame this class holds, and how its loss is counted ────────────
  *
@@ -609,7 +626,10 @@ export class TunnelClient {
     this.#sampleWire = new SampleWire({
       isOpen: () => this.#socket?.readyState === WebSocket.OPEN,
       protocol: () => this.#protocol,
-      hasUserRequest: () => this.#inFlight.size > 0,
+      hasUserRequest: () => {
+        for (const flight of this.#inFlight.values()) if (!flight.responding) return true;
+        return false;
+      },
       sendMessage: (message) => this.#send(message),
       sendFrame: (payload) => this.#sendBody(SAMPLE_FRAME_REQUEST_ID, payload),
     });
@@ -1073,12 +1093,15 @@ export class TunnelClient {
         // The window opens implicitly together with `req`: both ends know
         // RESPONSE_CREDIT_WINDOW_BYTES, so there is no opening round trip.
         const credit = new CreditWindow(RESPONSE_CREDIT_WINDOW_BYTES);
-        this.#inFlight.set(message.id, { abort, credit });
+        const flight: InFlight = { abort, credit, responding: false };
+        this.#inFlight.set(message.id, flight);
         if (message.hasBody) this.#requestBodies.set(message.id, new RequestBody());
-        // The window is passed to the handler as a parameter: even if `cancel`
-        // removes the map entry, the reference the handler holds stays valid, so
-        // an `undefined` check cannot silently degrade into an unbounded stream.
-        void this.#handleRequest(message, abort, credit);
+        // The entry itself is passed to the handler as a parameter: even if
+        // `cancel` removes it from the map, the reference the handler holds
+        // stays valid, so an `undefined` check cannot silently degrade into an
+        // unbounded stream — and `responding` is set on THIS request's entry,
+        // never on a later session's request that reuses the id.
+        void this.#handleRequest(message, flight);
         break;
       }
       case "reqend":
@@ -1238,9 +1261,9 @@ export class TunnelClient {
 
   async #handleRequest(
     req: RequestMessage,
-    abort: AbortController,
-    credit: CreditWindow,
+    flight: InFlight,
   ): Promise<void> {
+    const { abort, credit } = flight;
     // This handler's own body buffer, taken before the first await — the same
     // moment the `req` branch registered it. See the `finally` for why the
     // cleanup compares against it instead of deleting by id.
@@ -1341,6 +1364,9 @@ export class TunnelClient {
       }
 
       this.#send({ t: "res", id: req.id, status: response.statusCode, headers: responseHeaders });
+      // From here the request is a flowing response, not a queued one: it no
+      // longer makes the sample sink `busy` (see `SampleWire`).
+      flight.responding = true;
 
       // Response-body flow control is applied here. Because the `await` is
       // inside the loop, `for await` is suspended when credit runs out; undici
