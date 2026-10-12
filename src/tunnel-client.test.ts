@@ -3098,17 +3098,51 @@ test("`stop()` returns while a `/version` read is still waiting on the apiserver
   }
 });
 
-test("`stop()` is one shutdown: a second and a third call return the same promise and none of them throws", async () => {
+/**
+ * Calls `then` in a microtask right after the agent logs its "connection
+ * closed" line — i.e. right after its 'close' handler has run to its end and
+ * scheduled the reconnect, and before any timer (the backoff included) can
+ * fire. An event barrier, not a duration: the window it opens is exactly
+ * "the reconnect is pending".
+ */
+function onceConnectionClosed(then: () => void): { restore(): void } {
+  const original = console.warn;
+  let fired = false;
+  console.warn = (...args: unknown[]) => {
+    original(...args);
+    if (!fired && String(args[0]).startsWith("[agent] connection closed")) {
+      fired = true;
+      queueMicrotask(then);
+    }
+  };
+  return {
+    restore() {
+      console.warn = original;
+    },
+  };
+}
+
+test("`stop()` is one shutdown: a second and a third call return the same promise and none of them throws — and a stop during the reconnect backoff opens no further connection", async () => {
   // Base: each call ran the whole body again, and the second `target.close()`
   // is rejected by undici (`UND_ERR_DESTROYED`) — `index.ts` reaches it with
-  // SIGTERM followed by SIGINT. Also: a stop during the reconnect backoff opens
-  // no further connection.
+  // SIGTERM followed by SIGINT.
+  //
+  // The stop is made while the reconnect is PENDING: after the agent has seen
+  // the drop and scheduled its next attempt (corrected 12.10.2026 after the
+  // independent tester's review — the first version stopped right after
+  // `drop()`, before the agent had seen the close, so no reconnect was pending
+  // yet and the backoff path was never on trial; that ordering is the next
+  // test).
   const h = await harness();
+  let calls: [Promise<void>, Promise<void>] | undefined;
+  const barrier = onceConnectionClosed(() => {
+    calls = [h.client.stop(), h.client.stop()];
+  });
   try {
     await until("the collector has started", () => h.starts === 1);
     h.core.drop();
-    const first = h.client.stop();
-    const second = h.client.stop();
+    await until("stop() was called while the reconnect was pending", () => calls !== undefined);
+    const [first, second] = calls!;
     await Promise.all([first, second]);
     const third = h.client.stop();
     await third;
@@ -3118,7 +3152,68 @@ test("`stop()` is one shutdown: a second and a third call return the same promis
       { sameSecond: true, sameThird: true, sessions: 1, stops: 1 },
     );
   } finally {
+    barrier.restore();
     await h.core.close();
+  }
+});
+
+test("a stop made before the agent has even seen the drop opens no further connection either", async () => {
+  // The other ordering: `stop()` runs first, the socket's 'close' arrives
+  // after it, and the close handler must not schedule (or the scheduled
+  // attempt must not open) a connection for a client that has stopped.
+  const h = await harness();
+  try {
+    await until("the collector has started", () => h.starts === 1);
+    h.core.drop();
+    await h.client.stop();
+    await settle();
+    assert.equal(h.core.sessions, 1);
+  } finally {
+    await h.core.close();
+  }
+});
+
+test("`protocolVersion` is 0 between sessions: the number belongs to the session that negotiated it", async () => {
+  // Read in the gap between the old session's 'close' and the next
+  // connection, where the client's last session is the ended one.
+  const h = await harness();
+  let between: number | undefined;
+  const barrier = onceConnectionClosed(() => {
+    between = h.client.protocolVersion;
+  });
+  try {
+    await until("the collector has started", () => h.starts === 1);
+    assert.equal(h.client.protocolVersion, 5);
+    h.core.drop();
+    await until("the gap between sessions was observed", () => between !== undefined);
+    await until("the next session negotiated", () => h.core.sessions === 2 && h.client.protocolVersion === 5);
+    assert.equal(between, 0, "an ended session's negotiated version answered for the agent");
+  } finally {
+    barrier.restore();
+    await h.close();
+  }
+});
+
+test("a session that ends while its `hello` is still waiting on `/version` says so, and sends no `hello`", async () => {
+  const api = await silentVersionApiserver();
+  const kc = await kubeconfigFor(api.url, ["      token: t"]);
+  const warns = warnLines();
+  let h: Harness | undefined;
+  try {
+    h = await harness({ kubeconfig: kc.path, config: { versionReadTimeoutMs: 60_000 } });
+    const live = h;
+    await until("session 1's /version read is held", () => api.held === 1);
+    live.core.drop();
+    await until("the agent logged the hello it did not send", () =>
+      warns.lines.some((line) => line.includes("session closed before its hello was sent; not sending it")),
+    );
+    warns.restore();
+    assert.equal(helloSent(live.core), false);
+  } finally {
+    warns.restore();
+    await api.close();
+    await h?.close();
+    await rm(kc.directory, { recursive: true, force: true });
   }
 });
 
