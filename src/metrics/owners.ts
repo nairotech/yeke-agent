@@ -3,9 +3,10 @@
  *
  * The kubelet answers "how much", never "whose". A pod's series is only useful
  * once the control plane can roll it up into the Deployment it belongs to, and
- * that mapping lives in the apiserver. This file is the only part of the
- * collector that talks to the apiserver, and everything it asks for is bounded
- * by the closed list in `2026-09-09-yeke-izleme-kimlik-degismezi.md` K1.
+ * that mapping lives in the apiserver. This file and `pod-count.ts` are the
+ * only parts of the collector that talk to the apiserver, and everything they
+ * ask for is bounded by the closed list in
+ * `2026-09-09-yeke-izleme-kimlik-degismezi.md` K1.
  *
  * ─── Metadata only, and what that costs ─────────────────────────────────────
  *
@@ -23,6 +24,17 @@
  * third job's "pod/ReplicaSet metadata watch" to "pod/ReplicaSet/Job metadata
  * watch" — one more link of the same job, not a fourth job — and it asks for
  * exactly as little (see `resolveOwner` for why it was added).
+ *
+ * WIDENED (13.10.2026): the per-node pod-slot count, `pod-count.ts`. Same
+ * job, same identity, same `Accept` constants (exported below for it), still
+ * no body sent — but it is a NEW question, not just another link: it asks the
+ * apiserver to filter pods by two body fields, `spec.nodeName` and
+ * `status.phase`. Neither is sent back; membership in the answer tells the
+ * agent that a pod is bound to a node and has not terminated, and nothing
+ * else. The agent keeps pod UIDs per node and sends only their count. The
+ * revision is recorded in the README ("What the agent does under its own
+ * identity") and is not a precedent: another body field used as a predicate
+ * needs its own revision.
  *
  * Nodes ARE read in full, and K4 permits it explicitly: addresses,
  * `allocatable`, conditions and the kubelet version are all in the node object,

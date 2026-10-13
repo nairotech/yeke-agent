@@ -143,6 +143,48 @@ this is the complete list:
    those three keep retrying every few seconds, because their denial is shown
    to you as an unauthorized collector and should clear quickly.)
 
+   **Revision (13.10.2026): the per-node pod count.** The third job also
+   counts, for each node, the pods that hold one of its scheduler slots, so
+   the control plane can show `pods.count / pods.allocatable` and warn before
+   the scheduler starts answering "Too many pods". The kubelet's Summary cannot
+   give this number: it lists only pods whose containers are running, and on a
+   test node with 12 slots it listed 10 while the scheduler already refused
+   the next pod (the two it missed were waiting on an image and on a crash
+   back-off). This widens the third job; it is not a fourth job, but it IS a
+   new question, and it is written down here as one:
+
+   - *What is asked.* For each node, under the agent's own identity:
+     `GET /api/v1/pods?fieldSelector=spec.nodeName=<node>,status.phase!=Succeeded,status.phase!=Failed`,
+     first as a LIST (`resourceVersion=0`, answered from the apiserver's watch
+     cache, not from etcd) and then as a WATCH from that revision. Both ask for
+     `PartialObjectMetadata` — the same `Accept` values as the pod watch above
+     (`src/metrics/pod-count.ts`).
+   - *What does NOT come back.* No `spec`, no `env`, no `status`, no restart
+     count. The answer is metadata only, exactly like the cluster-wide pod
+     watch.
+   - *What the agent learns that it did not know before.* Two body fields,
+     `spec.nodeName` and `status.phase`, are used as a server-side PREDICATE.
+     They are never sent, but membership in the answer reveals their coarse
+     value: "this pod is bound to this node" and "this pod has not terminated".
+     The node binding of a RUNNING pod was already known (the kubelet's
+     Summary names its pods); what is new is the binding of a pod that is not
+     running yet, and the terminated / not-terminated distinction. The agent
+     keeps a set of pod UIDs per node and sends only its size, as the
+     `pods.count` series of the node.
+   - *Why a watch.* A LIST per node per minute was measured at ~2.2 KB per pod
+     (k3s v1.31, uncompressed), about 24 MB per minute at 100 nodes of 110
+     pods — more than half of what the kubelet reads already cost. A watch
+     costs that once, and then only the changes. Each node's stream is ended
+     by the server about once a minute and resumed from where it was; a stream
+     that fails, or shows no life for two minutes, makes the number disappear
+     (sent as "no reading"), never freeze.
+   - *What did not change.* The component, the identity and the ClusterRole:
+     `pods` already had `list, watch`, so no manifest re-apply is needed.
+     Still no bodies, no Secrets, no writes, and the same authorization check
+     before a user sees the number.
+   - *Not a precedent.* Any further request that makes another body field a
+     predicate needs its own revision, written here, before it ships.
+
    PersistentVolumeClaim fullness comes from this same read and adds nothing to
    the list: a kubelet's Summary reports the volumes of the pods on its node,
    and the ones bound to a claim carry that claim's name. The agent therefore
@@ -159,7 +201,11 @@ Properties that hold for all three, and that you can check in the source:
   full, because the collector needs each node's address and `allocatable`; a node
   object carries no Secret. This is also why the collector does not report a
   container restart count: that number lives in a pod's `status`, and `status` is
-  a body.
+  a body. One exception to "the agent learns nothing from a body", stated
+  plainly: the per-node pod count (revision above) uses `spec.nodeName` and
+  `status.phase` as a server-side field selector. Neither field is sent, but
+  which pods match tells the agent which node a pod is bound to and whether it
+  has terminated — nothing more.
 - **No Secrets, and no writes.** None of the three creates, updates, patches or
   deletes anything.
 - **Nothing bypasses your RBAC on the way out.** Numbers collected under the
