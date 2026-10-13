@@ -63,9 +63,10 @@
  *  2. undici's body timeout is that timeout + 30 s: a stream that goes silent
  *     past its own deadline is cut, counted as a failure, and the number is
  *     gone (NaN) until a fresh LIST.
- *  3. `read()` returns a number only if the stream showed life (LIST done,
- *     headers, an event or a bookmark) within `POD_COUNT_STALE_MS`. This holds
- *     even if 1 and 2 were somehow bypassed.
+ *  3. `read()` returns a number only if a complete LIST has been followed by
+ *     an ACCEPTED watch (2xx), and the stream showed life (headers, an event
+ *     or a bookmark) within `POD_COUNT_STALE_MS`. A LIST that succeeds while
+ *     its WATCH is refused publishes nothing (live round R2, 13.10.2026).
  *
  * ─── Failure means NO number ────────────────────────────────────────────────
  *
@@ -107,11 +108,25 @@ export const POD_COUNT_STALE_MS = 120_000;
 export const POD_COUNT_REQUEST_TIMEOUT_MS = 10_000;
 
 /**
- * Backoff after a failed LIST or WATCH. One collector period: a failed node
- * costs the apiserver one request per tick, not one every five seconds per
- * node.
+ * Backoff after the FIRST failed attempt (a LIST, or a WATCH that was not
+ * established). One collector period.
  */
 export const POD_COUNT_RETRY_MS = 30_000;
+
+/**
+ * Ceiling of the backoff, which doubles on each consecutive failure:
+ * 30 s, 60 s, 120 s, 240 s, then 300 s.
+ *
+ * Why it grows (live round R2, 13.10.2026): with only `watch` removed from the
+ * ClusterRole, every attempt is a LIST that SUCCEEDS followed by a WATCH that
+ * is refused. The LIST is the expensive half: ~2.2 KB per pod, so at 100
+ * nodes x 110 pods a flat 30 s retry would pull ~48 MB/min to produce
+ * nothing — twice the LIST-every-minute cost that ruled the LIST road out. At
+ * the 300 s ceiling the same stale ClusterRole costs ~4.8 MB/min and one
+ * refused watch per node per five minutes. The price is on recovery: after
+ * the manifest is re-applied, the count returns within at most five minutes.
+ */
+export const POD_COUNT_RETRY_MAX_MS = 300_000;
 
 /** Why a node has no count right now. Codes for the log line, never sent on the wire. */
 export type PodCountState = "ok" | "pending" | "stale" | "unauthorized" | "forbidden" | "unreachable";
@@ -125,6 +140,8 @@ export interface PodCounterOptions {
   /** The agent clock; staleness is measured on it. */
   readonly now?: () => number;
   readonly retryMs?: number;
+  /** Backoff ceiling; `POD_COUNT_RETRY_MAX_MS` by default. */
+  readonly retryMaxMs?: number;
   /** Overridden by the tests so a stream ends without waiting a minute. */
   readonly watchTimeoutSeconds?: (node: string) => number;
   /** `POD_COUNT_REQUEST_TIMEOUT_MS` unless a test needs a timeout it can wait for. */
@@ -152,6 +169,7 @@ export class NodePodWatch {
   readonly #options: PodCounterOptions;
   readonly #now: () => number;
   readonly #retryMs: number;
+  readonly #retryMaxMs: number;
   readonly #requestTimeoutMs: number;
   readonly #abort = new AbortController();
   #running = false;
@@ -159,8 +177,23 @@ export class NodePodWatch {
 
   /** UIDs only. The SIZE is the reading; the set exists so events are idempotent. */
   #uids = new Set<string>();
-  /** True between a complete LIST and the next failure. */
+  /** True between a complete LIST and the next failure: the set is whole. */
   #synced = false;
+  /**
+   * True once a WATCH from that LIST's revision has been ACCEPTED (2xx), until
+   * the next failure. A complete LIST alone is not a reading: without an
+   * established stream nothing will tell the agent when the set changes, so
+   * publishing it would be publishing a number that can only go stale (live
+   * round R2, 13.10.2026: LIST 200, WATCH 403). `read()` needs both flags,
+   * and "restored" is logged only when this one turns true.
+   *
+   * It stays true across a CLEAN end of the stream (the server's timeout):
+   * the set is complete up to the last revision and the resume continues from
+   * exactly there. If the resume is refused, the failure path clears it.
+   */
+  #live = false;
+  /** Failed attempts in a row; the backoff doubles with each. */
+  #consecutiveFailures = 0;
   #resourceVersion: string | undefined;
   #aliveAt = 0;
   /** Why there is no number; meaningful only while not synced. */
@@ -179,6 +212,7 @@ export class NodePodWatch {
     this.#options = options;
     this.#now = options.now ?? Date.now;
     this.#retryMs = options.retryMs ?? POD_COUNT_RETRY_MS;
+    this.#retryMaxMs = Math.max(this.#retryMs, options.retryMaxMs ?? POD_COUNT_RETRY_MAX_MS);
     this.#requestTimeoutMs = options.requestTimeoutMs ?? POD_COUNT_REQUEST_TIMEOUT_MS;
   }
 
@@ -196,7 +230,7 @@ export class NodePodWatch {
   }
 
   read(): PodCountReading {
-    if (!this.#synced) {
+    if (!this.#synced || !this.#live) {
       return this.#detail === undefined
         ? { ok: false, state: this.#state }
         : { ok: false, state: this.#state, detail: this.#detail };
@@ -223,21 +257,28 @@ export class NodePodWatch {
         this.#state = status === 401 ? "unauthorized" : status === 403 ? "forbidden" : "unreachable";
         this.#detail = err instanceof Error ? err.message : String(err);
         this.#log(this.#state, this.#detail);
-        await delay(this.#retryMs, this.#abort.signal);
+        this.#consecutiveFailures += 1;
+        await delay(this.#backoffMs(), this.#abort.signal);
       }
     }
+  }
+
+  #backoffMs(): number {
+    const doublings = Math.min(this.#consecutiveFailures - 1, 30);
+    return Math.min(this.#retryMs * 2 ** doublings, this.#retryMaxMs);
   }
 
   /** Every failure path ends here: the number is gone, not kept. */
   #unsync(): void {
     this.#synced = false;
+    this.#live = false;
     this.#resourceVersion = undefined;
     this.#uids = new Set();
   }
 
   #alive(): void {
     this.#aliveAt = this.#now();
-    if (this.#synced) {
+    if (this.#synced && this.#live) {
       this.#state = "pending";
       this.#detail = undefined;
       this.#log("ok");
@@ -280,7 +321,9 @@ export class NodePodWatch {
     this.#uids = uids;
     this.#resourceVersion = resourceVersion;
     this.#synced = true;
-    this.#alive();
+    // Not `#alive()`: a LIST is not a live view, and logging "restored" here
+    // is what made a refused WATCH flap restored/unavailable every attempt.
+    this.#aliveAt = this.#now();
   }
 
   async #watch(): Promise<void> {
@@ -299,6 +342,8 @@ export class NodePodWatch {
       throw new Relist();
     }
     await this.#check(response);
+    this.#live = true;
+    this.#consecutiveFailures = 0;
     this.#alive();
 
     for await (const line of ndjson(response.body)) {

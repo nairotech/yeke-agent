@@ -540,3 +540,123 @@ test("the counter follows the node list: a new node gets a watch, a removed node
     await api.close();
   }
 });
+
+/**
+ * ─── Live round R2 (13.10.2026): `list` granted, `watch` revoked ────────────
+ *
+ * Measured on k3s under the agent's own ServiceAccount: every 30 s the log
+ * said "restored (was forbidden)" and, 5 ms later, "unavailable: forbidden",
+ * because a successful LIST counted as a restoration. In the same window the
+ * count was readable. The fake below answers the LIST with 200 and refuses
+ * every WATCH with 403 — SLOWLY (`REFUSE_AFTER_MS`), so that the window
+ * between the two is wide enough that a poll lands in it every time.
+ */
+const REFUSE_AFTER_MS = 40;
+
+function refuseWatches(api: Awaited<ReturnType<typeof fakeApiserver>>): void {
+  for (let index = 0; index < 1000; index += 1) {
+    api.overrides.push((_req, res, query) => {
+      if (query.get("watch") !== "1") return false;
+      setTimeout(() => {
+        res.writeHead(403, { "content-type": "application/json" });
+        res.end(JSON.stringify({ kind: "Status", code: 403 }));
+      }, REFUSE_AFTER_MS);
+      return true;
+    });
+  }
+}
+
+function captureWarnings(): { lines: string[]; restore(): void } {
+  const lines: string[] = [];
+  const original = console.warn;
+  console.warn = (...args: unknown[]) => {
+    lines.push(args.map(String).join(" "));
+  };
+  return { lines, restore: () => (console.warn = original) };
+}
+
+test("R2: LIST 200 + WATCH 403 publishes NO number at any moment, logs ONE line and never 'restored'", async () => {
+  const api = await fakeApiserver({ pods: mixedPods() });
+  refuseWatches(api);
+  const warnings = captureWarnings();
+  // A real backoff ceiling but test-sized steps: 5, 10, 20, 20, 20 ms.
+  const watch = new NodePodWatch("node-a", { target: api.target, retryMs: 5, retryMaxMs: 20 });
+  const seen: number[] = [];
+  try {
+    watch.start();
+    const deadline = Date.now() + 5000;
+    while (watch.failures < 4 && Date.now() < deadline) {
+      const reading = watch.read();
+      if (reading.ok) seen.push(reading.count);
+      await new Promise((resolve) => setTimeout(resolve, 2));
+    }
+    assert.ok(watch.failures >= 4, `four refused attempts (got ${watch.failures})`);
+    // Every attempt WAS a successful LIST: the window existed each time.
+    assert.ok(watch.lists >= 4);
+    assert.deepEqual(seen, [], "a count was readable between the LIST and the refused WATCH");
+    const reading = watch.read();
+    assert.equal(reading.ok ? undefined : reading.state, "forbidden");
+
+    const mine = warnings.lines.filter((line) => line.includes("pod count for node node-a"));
+    assert.equal(mine.filter((line) => line.includes("restored")).length, 0, mine.join("\n"));
+    assert.equal(mine.filter((line) => line.includes("unavailable: forbidden")).length, 1, mine.join("\n"));
+  } finally {
+    warnings.restore();
+    await watch.stop();
+    await api.close();
+  }
+});
+
+test("R2: once the WATCH is granted again the count returns and 'restored' is logged once", async () => {
+  const api = await fakeApiserver({ pods: mixedPods() });
+  // Two refusals, then the ordinary handler.
+  api.overrides.push(() => false, (_req, res) => (res.writeHead(403).end(), true));
+  api.overrides.push(() => false, (_req, res) => (res.writeHead(403).end(), true));
+  const warnings = captureWarnings();
+  const watch = new NodePodWatch("node-a", { target: api.target, retryMs: 5, retryMaxMs: 20 });
+  try {
+    watch.start();
+    await waitFor("restored", () => watch.read().ok);
+    assert.equal(count(watch), 5);
+    const mine = warnings.lines.filter((line) => line.includes("pod count for node node-a"));
+    assert.deepEqual(
+      mine.map((line) => (line.includes("restored") ? "restored" : line.includes("forbidden") ? "forbidden" : line)),
+      ["forbidden", "restored"],
+    );
+  } finally {
+    warnings.restore();
+    await watch.stop();
+    await api.close();
+  }
+});
+
+test("the retry backs off: consecutive failures double the wait up to the ceiling", async () => {
+  const api = await fakeApiserver({ pods: mixedPods() });
+  for (let index = 0; index < 1000; index += 1) {
+    api.overrides.push((_req, res) => (res.writeHead(500).end(), true));
+  }
+  const times: number[] = [];
+  const server = api.requests;
+  const watch = new NodePodWatch("node-a", { target: api.target, retryMs: 20, retryMaxMs: 80 });
+  try {
+    watch.start();
+    const deadline = Date.now() + 5000;
+    let last = 0;
+    while (server.length < 6 && Date.now() < deadline) {
+      if (server.length !== last) {
+        last = server.length;
+        times.push(Date.now());
+      }
+      await new Promise((resolve) => setTimeout(resolve, 1));
+    }
+    const gaps = times.slice(1).map((time, index) => time - times[index]!);
+    // 20, 40, 80, 80, 80 ms — each gap at least its step (timers do not fire early).
+    for (const [index, minimum] of [20, 40, 80, 80].entries()) {
+      assert.ok(gaps[index]! >= minimum - 2, `gap ${index}: ${gaps[index]} ms < ${minimum}`);
+    }
+    assert.ok(gaps[3]! < 80 * 4, `the ceiling holds: ${gaps[3]} ms`);
+  } finally {
+    await watch.stop();
+    await api.close();
+  }
+});
