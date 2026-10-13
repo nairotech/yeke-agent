@@ -127,6 +127,8 @@ export interface PodCounterOptions {
   readonly retryMs?: number;
   /** Overridden by the tests so a stream ends without waiting a minute. */
   readonly watchTimeoutSeconds?: (node: string) => number;
+  /** `POD_COUNT_REQUEST_TIMEOUT_MS` unless a test needs a timeout it can wait for. */
+  readonly requestTimeoutMs?: number;
 }
 
 /** 60–74 s, fixed per node name: no randomness to test around, no reconnect herd. */
@@ -150,6 +152,7 @@ export class NodePodWatch {
   readonly #options: PodCounterOptions;
   readonly #now: () => number;
   readonly #retryMs: number;
+  readonly #requestTimeoutMs: number;
   readonly #abort = new AbortController();
   #running = false;
   #loop: Promise<void> | undefined;
@@ -176,6 +179,7 @@ export class NodePodWatch {
     this.#options = options;
     this.#now = options.now ?? Date.now;
     this.#retryMs = options.retryMs ?? POD_COUNT_RETRY_MS;
+    this.#requestTimeoutMs = options.requestTimeoutMs ?? POD_COUNT_REQUEST_TIMEOUT_MS;
   }
 
   start(): void {
@@ -329,7 +333,7 @@ export class NodePodWatch {
       dispatcher: target.dispatcher,
       headers: { ...(await target.authHeaders()), accept },
       signal: this.#abort.signal,
-      headersTimeout: POD_COUNT_REQUEST_TIMEOUT_MS,
+      headersTimeout: this.#requestTimeoutMs,
       bodyTimeout,
     });
   }
@@ -347,7 +351,7 @@ export class NodePodWatch {
   }
 
   async #json(path: string): Promise<unknown> {
-    const response = await this.#open(path, METADATA_LIST_ACCEPT, POD_COUNT_REQUEST_TIMEOUT_MS);
+    const response = await this.#open(path, METADATA_LIST_ACCEPT, this.#requestTimeoutMs);
     await this.#check(response);
     return response.body.json();
   }

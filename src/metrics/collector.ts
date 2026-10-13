@@ -36,6 +36,13 @@
  *  4. One frame goes into the ring. Then the ring drains, oldest first, for as
  *     long as the sink accepts.
  *
+ * Beside the two kubelet reads, each node with a successful Summary gets one
+ * more value, `pods.count`: the size of that node's pod-slot watch
+ * (`pod-count.ts`). It is not a request made by the tick — the per-node
+ * watches run on their own and the tick only reads their state — so it adds
+ * nothing to a tick's duration. The watches follow the node list: one is
+ * started for every node the node watch knows, stopped when the node goes.
+ *
  * ─── Why the frame is built before it is known whether it can be sent ───────
  *
  * The alternative — skip the work when the tunnel is down — saves CPU exactly
@@ -113,6 +120,7 @@ import {
   decodeNode,
   resolveOwner,
 } from "./owners.js";
+import { NodePodCounter } from "./pod-count.js";
 import { DEFAULT_RING_CAPACITY, SampleRing } from "./ring.js";
 import { type SummaryDocument, mergePvcReadings, readSummary } from "./summary.js";
 import {
@@ -123,6 +131,8 @@ import {
   type NodeStateCode,
   type Sample,
   type SampleSink,
+  NO_READING,
+  float32,
   packFrame,
 } from "./types.js";
 import type { KubeTarget } from "../kube.js";
@@ -299,6 +309,12 @@ export class Collector {
   #podWatch: ResourceWatch<MetaRecord> | undefined;
   #replicaSetWatch: ResourceWatch<MetaRecord> | undefined;
   #jobWatch: ResourceWatch<MetaRecord> | undefined;
+  /**
+   * One pod-slot watch per node (`pods.count`). Created by `start()` only:
+   * a collector driven by hand with a seeded index makes no apiserver
+   * request and emits no `pods.count` at all.
+   */
+  #podCounter: NodePodCounter | undefined;
 
   /**
    * The previous frame's layout, offered to `packFrame` for reuse.
@@ -422,6 +438,11 @@ export class Collector {
     this.#podWatch.start();
     this.#replicaSetWatch.start();
     this.#jobWatch.start();
+    this.#podCounter = new NodePodCounter({
+      target: this.#options.target,
+      now: this.#now,
+      ...(this.#options.watchRetryMs === undefined ? {} : { retryMs: this.#options.watchRetryMs }),
+    });
     this.#schedule();
     this.#startHealthTimer();
   }
@@ -437,6 +458,7 @@ export class Collector {
       this.#podWatch?.stop(),
       this.#replicaSetWatch?.stop(),
       this.#jobWatch?.stop(),
+      this.#podCounter?.stop(),
     ]);
   }
 
@@ -727,6 +749,10 @@ export class Collector {
     const nodeStates: NodeState[] = [];
     const liveRateKeys = new Set<string>();
 
+    // Watches follow the node list; a new node's count appears once its LIST
+    // has landed (NaN until then), a deleted node's watch is closed here.
+    this.#podCounter?.sync(this.#nodes.keys());
+
     const targets: KubeletTarget[] = [];
     for (const node of this.#nodes.values()) {
       // A node with no InternalIP cannot be dialled at all (K4). It is reported
@@ -830,8 +856,10 @@ export class Collector {
     const entities: Entity[] = [];
     const podIdByName = new Map<string, string>();
     const nodeRecord = this.#nodes.get(target.node);
+    let nodeEntityId: string | undefined;
     for (const entity of reading.entities) {
       if (entity.kind === "node") {
+        nodeEntityId = entity.id;
         entities.push({
           ...entity,
           uid: nodeRecord?.uid,
@@ -868,6 +896,18 @@ export class Collector {
 
     const rateKeys = new Set(reading.rateKeys);
     const samples: Sample[] = [...reading.samples];
+    // `pods.count`: only on a node whose Summary succeeded (no node entity,
+    // no row to put it on), and written as an explicit NaN when the node's
+    // watch holds no complete, live view — the series exists, this frame has
+    // no number for it (`types.ts`, the one exception to the NaN rule).
+    if (this.#podCounter && nodeEntityId) {
+      const count = this.#podCounter.read(target.node);
+      samples.push({
+        entity: nodeEntityId,
+        metric: "pods.count",
+        value: count.ok ? float32(count.count) : NO_READING,
+      });
+    }
     let ioUnmeasurable = probe.suppressing;
 
     if (cadvisorResult.state === "ok") {
