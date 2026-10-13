@@ -1358,7 +1358,12 @@ interface SeenRequest {
  * error status. Every request is recorded with its `Accept` header, which is
  * how "metadata only" is measured rather than asserted from the source.
  */
-async function routedApiserver(items: Record<string, unknown[]>, status: Record<string, number> = {}) {
+async function routedApiserver(
+  items: Record<string, unknown[]>,
+  status: Record<string, number> = {},
+  /** Refuse only the per-node pod-slot WATCH (it carries a `fieldSelector`), after a delay. */
+  scopedWatch?: { readonly status: number; readonly delayMs: number },
+) {
   const requests: SeenRequest[] = [];
   const watches = new Map<string, Set<import("node:http").ServerResponse>>();
   const server = createHttpServer((req, res) => {
@@ -1371,6 +1376,13 @@ async function routedApiserver(items: Record<string, unknown[]>, status: Record<
       watch,
       ...(fieldSelector === undefined ? {} : { fieldSelector }),
     });
+    if (scopedWatch && watch && fieldSelector !== undefined) {
+      setTimeout(() => {
+        res.writeHead(scopedWatch.status, { "content-type": "application/json" });
+        res.end(JSON.stringify({ kind: "Status", status: "Failure", code: scopedWatch.status }));
+      }, scopedWatch.delayMs);
+      return;
+    }
     const code = status[url.pathname];
     if (code !== undefined) {
       res.writeHead(code, { "content-type": "application/json" });
@@ -1798,5 +1810,42 @@ test("pods.count: a collector driven by hand (never started) makes no pod-slot r
     assert.deepEqual(samplesOf(frame!).filter((sample) => sample.metric === "pods.count"), []);
   } finally {
     await h.close();
+  }
+});
+
+test("pods.count R2: LIST 200 + WATCH 403 — NO tick ever carries a number", async () => {
+  const api = await routedApiserver(
+    {
+      [PATHS.nodes]: [NODE_OBJECT],
+      [PATHS.pods]: [POD_META],
+      [PATHS.replicasets]: [],
+      [PATHS.jobs]: [],
+    },
+    {},
+    { status: 403, delayMs: 40 },
+  );
+  const h = collectorOn(api.target, { watchRetryMs: 5 });
+  const refused = () =>
+    api.requests.filter((item) => item.watch && item.fieldSelector === POD_COUNT_SELECTOR).length;
+  try {
+    h.collector.start();
+    await waitFor("the node watch", () => api.watchesSeen(PATHS.nodes) >= 1);
+    const values: number[] = [];
+    let ticks = 0;
+    const deadline = Date.now() + 5000;
+    while (refused() < 3 && Date.now() < deadline) {
+      const frame = await h.tick();
+      ticks += 1;
+      const value = frame ? frameValue(frame, "node/node-a", "pods.count") : undefined;
+      if (value !== undefined && !Number.isNaN(value)) values.push(value);
+      await new Promise((resolve) => setTimeout(resolve, 2));
+    }
+    assert.ok(refused() >= 3, `three refused watches (got ${refused()})`);
+    // Each refused watch followed a successful LIST of the same selector.
+    assert.ok(api.requests.filter((item) => !item.watch && item.fieldSelector === POD_COUNT_SELECTOR).length >= 3);
+    assert.deepEqual(values, [], `a number reached the frame in ${ticks} ticks`);
+  } finally {
+    await h.collector.stop();
+    await api.close();
   }
 });
