@@ -1348,6 +1348,8 @@ interface SeenRequest {
   readonly path: string;
   readonly accept: string;
   readonly watch: boolean;
+  /** Present only on the per-node pod-slot requests (`pod-count.ts`). */
+  readonly fieldSelector?: string;
 }
 
 /**
@@ -1362,7 +1364,13 @@ async function routedApiserver(items: Record<string, unknown[]>, status: Record<
   const server = createHttpServer((req, res) => {
     const url = new URL(req.url ?? "/", "http://fake");
     const watch = url.searchParams.get("watch") === "1";
-    requests.push({ path: url.pathname, accept: String(req.headers.accept ?? ""), watch });
+    const fieldSelector = url.searchParams.get("fieldSelector") ?? undefined;
+    requests.push({
+      path: url.pathname,
+      accept: String(req.headers.accept ?? ""),
+      watch,
+      ...(fieldSelector === undefined ? {} : { fieldSelector }),
+    });
     const code = status[url.pathname];
     if (code !== undefined) {
       res.writeHead(code, { "content-type": "application/json" });
@@ -1673,5 +1681,122 @@ test("the jobs watch retries a 403 once a minute; pods keeps the short retry", a
   } finally {
     await h.collector.stop();
     await api.close();
+  }
+});
+
+/**
+ * ─── `pods.count`: the node's slot-holding pods, through `start()` ──────────
+ *
+ * `pod-count.test.ts` measures the per-node watch against a fake apiserver
+ * that evaluates the selector. These gates check the collector's half: the
+ * watches are started by `start()` for the nodes the node watch knows, the
+ * value lands on the NODE row and nowhere else, and only for a node whose
+ * Summary succeeded. The routed fake below does not evaluate selectors, so
+ * the count is simply the one pod it lists.
+ */
+const POD_COUNT_SELECTOR = "spec.nodeName=node-a,status.phase!=Succeeded,status.phase!=Failed";
+
+test("pods.count: produced through start(), on the node entity ONLY, from a selector-scoped metadata read", async () => {
+  const api = await routedApiserver({
+    [PATHS.nodes]: [NODE_OBJECT],
+    [PATHS.pods]: [POD_META],
+    [PATHS.replicasets]: [],
+    [PATHS.jobs]: [],
+  });
+  const h = collectorOn(api.target);
+  const encoder = new SampleEncoder();
+  try {
+    h.collector.start();
+    for (const path of Object.values(PATHS)) {
+      await waitFor(`the ${path} watch to open`, () => api.watchesSeen(path) >= 1);
+    }
+    // The first tick is what starts the node's watch (the counter follows the
+    // node list); until its LIST lands the value is an explicit NaN.
+    const first = await h.tick();
+    const early = frameValue(first!, "node/node-a", "pods.count");
+    assert.ok(early === undefined || Number.isNaN(early), `not a number before the LIST: ${early}`);
+    await waitFor("the node's pod-slot watch to open", () =>
+      api.requests.some((item) => item.watch && item.fieldSelector === POD_COUNT_SELECTOR),
+    );
+
+    const frame = await h.tick();
+    assert.equal(frameValue(frame!, "node/node-a", "pods.count"), 1);
+    const carriers = samplesOf(frame!)
+      .filter((sample) => sample.metric === "pods.count")
+      .map((sample) => sample.entity);
+    assert.deepEqual(carriers, ["node/node-a"], "only the node row carries pods.count");
+
+    // The request, as the apiserver saw it: the scheduler's selector, metadata only.
+    const scoped = api.requests.filter((item) => item.fieldSelector !== undefined);
+    assert.ok(scoped.length >= 2);
+    for (const item of scoped) {
+      assert.equal(item.path, PATHS.pods);
+      assert.equal(item.fieldSelector, POD_COUNT_SELECTOR);
+      assert.equal(
+        item.accept,
+        item.watch
+          ? "application/json;as=PartialObjectMetadata;g=meta.k8s.io;v=v1"
+          : "application/json;as=PartialObjectMetadataList;g=meta.k8s.io;v=v1",
+      );
+    }
+
+    // ...and it reaches the wire: the encoder keeps only `METRIC_NAMES` columns.
+    const decoded = encoder.encode([frame!]).map(({ message, payload }) => decodeSampleFrame(message, payload))[0]!;
+    assert.ok(decoded.metrics.includes("pods.count"));
+    assert.equal(decoded.metrics.at(-1), "pods.count", "new name at the END of the vocabulary");
+  } finally {
+    await h.collector.stop();
+    await api.close();
+  }
+});
+
+test("pods.count: a node whose Summary failed gets NO pods.count sample (no row to put it on)", async () => {
+  const api = await routedApiserver({
+    [PATHS.nodes]: [NODE_OBJECT],
+    [PATHS.pods]: [POD_META],
+    [PATHS.replicasets]: [],
+    [PATHS.jobs]: [],
+  });
+  const kubelet: KubeletReader = {
+    async summary<T>(): Promise<KubeletResult<T>> {
+      return { state: "unreachable", detail: "connect ECONNREFUSED" };
+    },
+    async cadvisor<T>(): Promise<KubeletResult<T>> {
+      return { state: "unreachable", detail: "connect ECONNREFUSED" };
+    },
+  };
+  let clock = START_MS;
+  const collector = new Collector({
+    target: api.target,
+    kubelet,
+    sink: new RecordingSink(),
+    periodMs: PERIOD_MS,
+    now: () => clock,
+  });
+  try {
+    collector.start();
+    await waitFor("the node watch", () => api.watchesSeen(PATHS.nodes) >= 1);
+    await collector.tick();
+    clock += PERIOD_MS;
+    await waitFor("the node's pod-slot watch to open", () =>
+      api.requests.some((item) => item.watch && item.fieldSelector === POD_COUNT_SELECTOR),
+    );
+    const frame = await collector.tick();
+    assert.deepEqual(frame!.nodes.map((node) => node.state), ["unreachable"]);
+    assert.deepEqual(samplesOf(frame!).filter((sample) => sample.metric === "pods.count"), []);
+  } finally {
+    await collector.stop();
+    await api.close();
+  }
+});
+
+test("pods.count: a collector driven by hand (never started) makes no pod-slot request and emits none", async () => {
+  const h = await harness({ pods: 3 });
+  try {
+    await h.advance();
+    const frame = await h.advance();
+    assert.deepEqual(samplesOf(frame!).filter((sample) => sample.metric === "pods.count"), []);
+  } finally {
+    await h.close();
   }
 });
