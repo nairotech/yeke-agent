@@ -82,14 +82,14 @@ import type { KubeTarget } from "../kube.js";
 import type { AttributeName, EntityOwner } from "./types.js";
 
 /** How the apiserver is asked for metadata instead of an object. */
-const METADATA_LIST_ACCEPT = "application/json;as=PartialObjectMetadataList;g=meta.k8s.io;v=v1";
+export const METADATA_LIST_ACCEPT = "application/json;as=PartialObjectMetadataList;g=meta.k8s.io;v=v1";
 /**
  * A watch stream carries single objects, so it negotiates the singular kind.
  * This is the pair client-go's metadata client uses; sending the list form on a
  * watch is answered with full objects by some server versions, which would
  * defeat the entire point without any visible symptom.
  */
-const METADATA_WATCH_ACCEPT = "application/json;as=PartialObjectMetadata;g=meta.k8s.io;v=v1";
+export const METADATA_WATCH_ACCEPT = "application/json;as=PartialObjectMetadata;g=meta.k8s.io;v=v1";
 
 /** Page size for the initial LIST. Large enough for one round trip per 500 pods. */
 const LIST_LIMIT = 500;
@@ -392,7 +392,7 @@ export interface ResourceWatchOptions<T> {
  * that simply timed out. A bare `Error` with the code baked into the message
  * would make that distinction a string parse; this makes it a field.
  */
-class ApiserverHttpError extends Error {
+export class ApiserverHttpError extends Error {
   constructor(readonly statusCode: number) {
     super(`HTTP ${statusCode}`);
   }
@@ -627,7 +627,7 @@ export class ResourceWatch<T> {
   }
 }
 
-async function* ndjson(body: AsyncIterable<Buffer | string>): AsyncIterable<string> {
+export async function* ndjson(body: AsyncIterable<Buffer | string>): AsyncIterable<string> {
   let carry = "";
   for await (const chunk of body) {
     const text = carry + (typeof chunk === "string" ? chunk : chunk.toString("utf8"));
@@ -651,7 +651,7 @@ async function* ndjson(body: AsyncIterable<Buffer | string>): AsyncIterable<stri
  * at 60 seconds, the agent's shutdown would wait a minute on a cluster whose
  * ClusterRole lacks `jobs`, so the abort signal now ends the wait too.
  */
-function delay(ms: number, signal?: AbortSignal): Promise<void> {
+export function delay(ms: number, signal?: AbortSignal): Promise<void> {
   return new Promise((resolve) => {
     if (signal?.aborted) {
       resolve();

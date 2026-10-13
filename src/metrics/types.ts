@@ -40,6 +40,16 @@
  * tell apart: the field is absent, the counter reset inside the interval, or
  * the IO zero probe fired. What the screen needs in order to say WHY is carried
  * beside the values, in `NodeState`, and not inside the number.
+ *
+ * ONE exception, and only one: `pods.count` (13.10.2026). It is not read
+ * inside the interval; it is the size of a per-node apiserver WATCH state
+ * (`pod-count.ts`). Its number is therefore "the count as of the newest event
+ * the watch applied", and it is sent only while that watch holds a COMPLETE
+ * view that showed life within `POD_COUNT_STALE_MS` (two minutes). Its NaN
+ * means "the agent holds no complete, live view of this node's pods right now"
+ * — a failed or half-delivered LIST, a 401/403/5xx, a broken or silent stream,
+ * a 410 being re-listed. Never 0 and never a partial size in its place.
+ * `pod-count.test.ts` asserts each of those roads.
  */
 
 /**
@@ -84,6 +94,12 @@ export type EntityKind = "node" | "pod" | "pvc";
  *  · `cpu.throttledWall` share of wall time in [0,1], DERIVED from a counter
  *                       and the CFS period; the pod's worst container
  *  · `restarts`         count — DECLARED, NOT PRODUCED IN PHASE 1, see below
+ *  · `pods.count`       count, gauge — node only: pods bound to the node and not
+ *                       terminated (phase not Succeeded/Failed), i.e. the pods
+ *                       that hold a scheduler slot. From an apiserver metadata
+ *                       WATCH with a field selector (`pod-count.ts`), NOT from
+ *                       the kubelet. Denominator: the `pods.allocatable`
+ *                       attribute. The one exception to the NaN rule above.
  *
  * `fs.used` is the PVC's used bytes and it is deliberately NOT `fs.rootUsed`,
  * which already means something else (a node's root filesystem). One name for
@@ -113,11 +129,24 @@ export type EntityKind = "node" | "pod" | "pvc";
  * count lives in a pod's `status`, `status` is part of the object body, and the
  * identity invariant says these jobs read no object bodies
  * (`2026-09-09-yeke-izleme-kimlik-degismezi.md` K1). The name stays in the
- * vocabulary because the wire dictionary is versioned and a later phase that
- * finds a body-free road must not need a protocol bump to use it; that it is
- * never emitted today is asserted mechanically in `collector.test.ts` rather
- * than left to this comment. The full reasoning, including the two roads that
- * were measured and rejected, is in `owners.ts`.
+ * vocabulary so that a later phase that finds a body-free road needs no
+ * coordinated vocabulary change to use it; that it is never emitted today is
+ * asserted mechanically in `collector.test.ts` rather than left to this
+ * comment. The full reasoning, including the two roads that were measured and
+ * rejected, is in `owners.ts`.
+ *
+ * ─── What a new name costs on the wire (and what it does not) ───────────────
+ *
+ * The wire dictionary has NO version number. Column names travel as free
+ * strings in every frame (`@nairotech/yeke-tunnel`, `metrics.ts`); the
+ * encoding version (`enc`) covers only the matrix layout, and the tunnel
+ * protocol version only the handshake. A new name therefore needs no protocol,
+ * `enc` or tunnel-package bump. What it does need: an entry HERE, because the
+ * encoder keeps only the columns this list names (`wire.ts`), and an entry in
+ * the control plane's closed `METRIC_KEYS`, which refuses names it does not
+ * know. The two lists are kept equal by releasing agent and control plane in
+ * LOCKSTEP. New names go at the END: the order is the column order, and the
+ * screen iterates its own list in the same order.
  */
 export const METRIC_NAMES = [
   "cpu.cores",
@@ -140,6 +169,7 @@ export const METRIC_NAMES = [
   "cpu.throttled",
   "cpu.throttledWall",
   "restarts",
+  "pods.count",
 ] as const;
 
 export type MetricName = (typeof METRIC_NAMES)[number];
