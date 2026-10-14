@@ -4,8 +4,12 @@ The cluster-side component of YEKE. It runs inside your Kubernetes cluster,
 opens a single **outbound** WebSocket tunnel to the YEKE control plane, and
 applies the requests that arrive over it to your cluster's own apiserver.
 
+The control plane can be hosted by Nairotech or run in your own
+infrastructure. The agent is the same image in both cases; `YEKE_CORE_URL`
+tells it where the control plane is.
+
 There is no inbound connection. The agent does not listen on a port, and the
-control plane never dials into your network.
+control plane never dials into the cluster.
 
 ---
 
@@ -18,9 +22,14 @@ Software with that position has to be readable by the people who install it. You
 should be able to check what it connects to, what it forwards, and what it
 refuses, without taking anyone's word for it.
 
-The management application runs on our side and holds no privileges inside your
-cluster; keeping it closed changes nothing you can verify. Keeping this closed
-would.
+Wherever the management application runs, hosted by Nairotech or in your own
+infrastructure, it holds no privileges inside a cluster connected through this
+agent. It has no credentials for that cluster, because they stay with the agent.
+It never opens a connection into the cluster, because the agent opens the tunnel
+from the inside. Every request it sends goes through this agent's path
+allowlist and your RBAC. Keeping the management application closed therefore
+changes nothing you can verify about what can happen in your cluster. Keeping
+this component closed would.
 
 The wire contract is open for the same reason and lives in its own package:
 [`@nairotech/yeke-tunnel`](https://www.npmjs.com/package/@nairotech/yeke-tunnel)
@@ -48,7 +57,7 @@ on both paths that can reach the network — plain requests (`#handleRequest`) a
 stream upgrades such as `exec` (`#openStream`) — and it rejects `..` outright.
 
 This is defense in depth, and the threat it addresses is specific. A tunnel agent
-is, structurally, a hole punched outward through your network perimeter; whoever
+is, structurally, a hole punched outward from the cluster's network; whoever
 is on the other end can ask it to dial. If the set of reachable addresses were
 open-ended, a compromised control plane could reach anything the pod's network
 namespace can reach — other services, the container runtime socket, cloud
@@ -69,7 +78,7 @@ cluster. Leaving the credentials where they already are means the blast radius o
 a control-plane compromise is bounded by what each agent's own ServiceAccount can
 do — which you granted, and can revoke, per cluster.
 
-**Authorization is decided by your cluster, not by us.** When the control plane
+**Authorization is decided by your cluster's RBAC.** When the control plane
 supplies an identity, requests carry `Impersonate-User` / `Impersonate-Group`,
 so the effective decision belongs to Kubernetes RBAC and the real user appears in
 your audit log. The agent implements no authorization logic of its own. Its
@@ -96,8 +105,13 @@ own owner. See `src/failure.ts` and the `AUTH_PLUGIN_FAILED` branch in
 `src/kube.ts`.
 
 What the agent does **not** do: it does not write to your cluster on its own
-initiative, it does not phone home to anything other than the `YEKE_CORE_URL` you
-configure, and it does not update itself.
+initiative, and it does not update itself. Apart from your cluster's apiserver
+and kubelets, the only address it connects to is the `YEKE_CORE_URL` you
+configure. It has no built-in address of its own, Nairotech's or anyone else's,
+so when the control plane runs in your own infrastructure, nothing the agent
+sends leaves that infrastructure. (In `kubeconfig` mode, meant for local
+development, an `exec` credential plugin named in your kubeconfig runs as its
+own process and makes its own connections.)
 
 ---
 
