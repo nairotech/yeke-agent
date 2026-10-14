@@ -35,10 +35,32 @@ where to look.
 
 **Outbound only, no listening socket.** The single connection is created in
 `TunnelClient.#connect` (`src/tunnel-client.ts`) with `new WebSocket(coreUrl)`.
-The agent never constructs a server. Verifiable in one line:
+The agent never constructs a server. Verifiable with one command:
 
 ```bash
-grep -rn "createServer\|\.listen(" src/    # no results
+grep -rn "Server(\|\.listen(" src/ |
+  grep -Ev '\.test\.ts:|^src/(core-ca-fixture|metrics/measure)\.ts:'  # no results
+```
+
+The pattern is `Server(` rather than `createServer` so that it also catches
+`new WebSocketServer(`: given a `port`, `ws` binds the socket internally and
+neither `createServer` nor `.listen(` appears at the call site. `ws` is already
+a dependency, so that is the likeliest way a listener would arrive.
+
+The filter removes the only files in `src/` that do serve, and none of them
+runs in the agent. The tests put a fake core, apiserver and kubelet on
+127.0.0.1. `src/metrics/measure.ts` is a development harness, started by hand
+with `pnpm exec tsx`, that forks fake kubelets on the loopback interface to
+measure the collector's CPU and memory. `src/core-ca-fixture.ts` is a test
+fixture whose one match is a comment. `tsconfig.json` compiles all of `src/`,
+so the image does carry their `.js` output under `dist/`; what keeps it out of
+the process is that no file outside the tests imports any of them, so
+`node dist/index.js` never reaches them. A filter is a claim of its own, so
+that half is checkable too:
+
+```bash
+grep -rl "\.test\.js\|core-ca-fixture\.js\|measure\.js" src/ |
+  grep -v '\.test\.ts$'                                               # no results
 ```
 
 **The apiserver is the only reachable target, and only on allowlisted paths.**
