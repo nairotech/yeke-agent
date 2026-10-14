@@ -53,7 +53,54 @@ RUN pnpm build
 # The build needs `typescript`/`tsx`; the running agent needs neither.
 RUN pnpm prune --prod
 
-FROM node:24-alpine
+# ─── Runtime stage ────────────────────────────────────────────────────────────
+#
+# The stage name `runtime` is a target, not a label: the product's release
+# script rebuilds this stage without cache on every release
+# (`--no-cache-filter runtime`, together with `--pull`) so that the image
+# carries the Alpine patches of release day, while the build stage above keeps
+# its cache. BuildKit silently ignores a `--no-cache-filter` naming a stage that
+# does not exist (measured 2026-10-14), so the release script checks that the
+# last `FROM` here is `AS runtime` and refuses to build otherwise.
+FROM node:24-alpine AS runtime
+
+# ─── Alpine patches up, package managers out (2026-10-14) ────────────────────
+#
+# Measured on the pre-release image scan (Trivy 0.76.0, 2026-10-14):
+#
+# - `apk upgrade --no-cache`: the image carried libssl3/libcrypto3 3.5.7-r0
+#   (HIGH, fixed in 3.5.8-r0) because the cached `node:24-alpine` base was
+#   built on 2026-09-09. Even the current Docker Hub tag is frozen at its own
+#   build date, while the Alpine 3.24 repository already offered newer
+#   libssl3/zlib on 2026-10-14. Pulling the base closes part of that gap;
+#   upgrading here closes the rest. `node` itself is not an apk package in
+#   the official image (it is `/usr/local/bin/node`), so this does not touch it.
+# - npm, npx, corepack and yarn are removed: 8 HIGH findings sat under
+#   `/usr/local/lib/node_modules/npm/node_modules/` (one of them,
+#   http-cache-semantics, with no fixed version). That is the npm CLI bundled
+#   by the base image; the agent never runs it — the entrypoint is
+#   `node dist/index.js` and nothing at runtime spawns npm/npx/corepack/yarn.
+#   The bytes stay in the base layer (layers only add); what goes away is the
+#   files in the container's filesystem and the ability to run them. The
+#   base's `YARN_VERSION` env var remains as a harmless leftover.
+#
+# The step stops loudly if `node` resolves into one of the deleted paths, then
+# checks that no package manager is left on PATH and that `node --version`
+# still works.
+RUN set -eu; \
+    apk upgrade --no-cache; \
+    node_bin="$(readlink -f "$(command -v node)")"; \
+    case "$node_bin" in \
+      /usr/local/lib/node_modules/* | /opt/yarn-v*) \
+        echo "node ($node_bin) lives under a path about to be deleted; refusing" >&2; exit 1 ;; \
+    esac; \
+    rm -rf /usr/local/lib/node_modules/npm /usr/local/lib/node_modules/corepack /opt/yarn-v* \
+      /usr/local/bin/npm /usr/local/bin/npx /usr/local/bin/corepack /usr/local/bin/yarn /usr/local/bin/yarnpkg; \
+    for b in npm npx corepack yarn yarnpkg; do \
+      if command -v "$b" >/dev/null 2>&1; then echo "$b is still on PATH: $(command -v "$b")" >&2; exit 1; fi; \
+    done; \
+    node --version
+
 WORKDIR /app
 COPY --from=build /app/package.json ./package.json
 COPY --from=build /app/dist ./dist
